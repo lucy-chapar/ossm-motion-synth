@@ -21,7 +21,8 @@
   const HOME_SEEK_SECONDS = 30, HOME_TOTAL_SECONDS = 360, COUNTS_PER_MM = 32768 / 40;
   const HOME_SEARCH_COUNTS = 409600, HOME_MIN_SPAN = 16384, HOME_INSET = 1638;
   const HOME_RETOUCH_OVERTRAVEL = 819;
-  const HOME_COUNTS_PER_SECOND = 32768 * 7 / 60;
+  const HOME_SPEED_RPM = 35, HOME_ACCEL_RPM_S = 75;
+  const HOME_COUNTS_PER_SECOND = 32768 * HOME_SPEED_RPM / 60;
   const CONTACT_PWM = 1966, CONTACT_ERROR = 512, CONTACT_SECONDS = .5, CONTACT_REPEAT_TOLERANCE = 128;
   const CONTACT_RELEASE_TOLERANCE = 512;
   const PARK_STOP_TOLERANCE = 128, STOP_PENDING_TOLERANCE = 2;
@@ -235,7 +236,7 @@
       this._home_actions = actions.slice(); this._home_following = following; this._home_stage(actions[0][0], progress);
     }
     async _write_home_setting(register, value) {
-      const permitted = { 0: [0, 1], 2: [7, 80], 3: [15], 9: [0, 1], 10: [0], 24: [89, this._home_reference[24]], 25: [0, 1] };
+      const permitted = { 0: [0, 1], 2: [7, HOME_SPEED_RPM, 80], 3: [15, HOME_ACCEL_RPM_S], 9: [0, 1], 10: [0], 24: [89, this._home_reference[24]], 25: [0, 1] };
       if (!permitted[register]?.includes(value)) throw new TransportError("Setting is outside the fixed native homing profile");
       const tx = io.configRequest(register, value), rx = await this._exchange(tx, IO_TIMEOUT);
       if (!equalPrefix(rx, tx, 6)) throw new TransportError("Homing setting acknowledgement mismatch; no retry");
@@ -314,7 +315,7 @@
     _begin_home_move(phase, target, position, enable = false) {
       target = this._nonzero_target(target, -(2 ** 31), 2 ** 31 - 1);
       this._home_move_phase = phase; this._home_move_from = position; this._home_move_target = target;
-      this._home_motion_timeout = Math.abs(target - position) / HOME_COUNTS_PER_SECOND + 7 / 15 + 5;
+      this._home_motion_timeout = Math.abs(target - position) / HOME_COUNTS_PER_SECOND + HOME_SPEED_RPM / HOME_ACCEL_RPM_S + 5;
       const progress = { first_contact: .63, first_retreat: .67, first_retouch: .7,
         second_contact: .73, second_retreat: .8, second_retouch: .84, centering: .88 }[phase];
       if (enable) { this._home_hold_position = position; this._home_queue([["clearing_probe_hold", "clear", 0], ["enabling_probe", "enable", 1]], "move_hold", progress); }
@@ -422,7 +423,7 @@
             this._home_queue([["inhibiting_after_home", "inhibit", 0], ["restoring_modbus", 0, 1], ["inhibiting_after_mode", "inhibit", 0]], "mode_settle", .6);
           }
         } else if (phase === "mode_settle") {
-          if (now - this._home_phase_started >= .8) this._home_queue([["restoring_position_mode", 25, 0], ["restoring_speed", 2, 7], ["restoring_acceleration", 3, 15], ["restoring_gear", 10, 0], ["limiting_park_output", 24, 89], ["clearing_before_park", "clear", 0]], "verify_restore", .65);
+          if (now - this._home_phase_started >= .8) this._home_queue([["restoring_position_mode", 25, 0], ["setting_probe_speed", 2, HOME_SPEED_RPM], ["setting_probe_acceleration", 3, HOME_ACCEL_RPM_S], ["restoring_gear", 10, 0], ["limiting_park_output", 24, 89], ["clearing_before_park", "clear", 0]], "verify_restore", .65);
         } else if (phase === "verify_restore") {
           const v = await this._home_read(false), position = io.signedPosition(v);
           if (Math.abs(position - this._home_origin) > 32 || !this._inhibited_feedback(v)) throw new TransportError("Home restoration did not remain stationary at the captured origin");
@@ -463,7 +464,7 @@
         } else if (phase === "verify_stop") {
           const v = await this._home_read(false);
           if (Math.abs(io.signedPosition(v) - this._home_park) > PARK_STOP_TOLERANCE) throw new TransportError("Encoder drifted after centering");
-          if (this._home_stationary(v, STOP_PENDING_TOLERANCE, true)) this._home_queue([["restoring_output", 24, this._home_reference[24]]], "verify_complete", .95);
+          if (this._home_stationary(v, STOP_PENDING_TOLERANCE, true)) this._home_queue([["restoring_run_speed", 2, 7], ["restoring_run_acceleration", 3, 15], ["restoring_output", 24, this._home_reference[24]]], "verify_complete", .95);
         } else if (phase === "verify_complete") {
           const v = await this._home_read(false), position = io.signedPosition(v);
           if (Math.abs(position - this._home_park) > PARK_STOP_TOLERANCE || !this._inhibited_feedback(v)) throw new TransportError("Final homing stop was not confirmed");

@@ -108,7 +108,7 @@ The initial reference uses the native command from
 [OSSM ALT's linked OSSM-RS firmware](https://github.com/ossm-rs/ossm-rs/blob/5f4edbd085da07e18f628b88cbad0caa96db269a/ossm-rs/src/motion/mod.rs#L28-L67):
 80 RPM, output/stall setting 89, and special function `0x19 = 1`. The vendor
 describes a 36-degree retreat and coordinate reset. The browser then restores
-Modbus position control at 7 RPM / 15 RPM/s and measures both contacts in that
+Modbus position control at 35 RPM / 75 RPM/s and measures both contacts in that
 same coordinate system. It does not assume the native reference lies within
 a fixed distance of the first endpoint: each search is bounded to 500 nominal
 mm. Two native homes alone would erase the reference needed to measure the
@@ -131,6 +131,7 @@ at the midpoint of the two contacts, verifies arrival, then inhibits output
 and restores the previous output/stall setting. The waveform planner uses
 this measured working span, keeping its existing physical velocity and
 acceleration limits when converting normalized positions to encoder counts.
+After parking, Home restores the waveform profile of 7 RPM / 15 RPM/s.
 A successful Home does not start waveform motion.
 
 The bridge never transmits an absolute position target of zero because that
@@ -161,7 +162,7 @@ acknowledgments are never automatically retried.
 
 The browser accepts at most two counts of disabled feedback quantization,
 with zero PWM and three stable encoder readings. A connected-motor check on
-2026-09-30 measured approximately 180 mm of travel and parked within 0.1 mm
+2026-09-30 at the earlier 7 RPM probe speed measured approximately 180 mm of travel and parked within 0.1 mm
 of the measured center with output inhibited. Two successive published-version
 Home checks agreed within one encoder count of travel (147216 and 147215
 counts). A slow sine run completed its timer without a fault; a separate

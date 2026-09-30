@@ -613,7 +613,7 @@ test("both native directions measure repeatable endpoints and center in one coor
     assert.deepEqual(motor.values.slice(0, 4), [1, 0, 7, 15]);
     assert.equal(motor.values[24], 0); assert.equal(motor.values[25], 0);
     for (const state of motor.absoluteStates) {
-      assert.deepEqual(state.slice(0, 4), [1, 1, 7, 15]);
+      assert.deepEqual(state.slice(0, 4), [1, 1, 35, 75]);
       assert.equal(state[24], 89); assert.equal(state[25], 0);
     }
     await transport.close(); assert.equal(transport.status().homed, false);
@@ -892,7 +892,7 @@ test("center travel uses a distance deadline and never reissues a timed-out targ
       motor.position(motor.target); motor.remaining(0); motor.values[19] = 0;
       assert.equal((await advance(context)).homed, true);
     } else {
-      const timeout = Math.abs(motor.target + 160563) / (32768 * 7 / 60) + 7 / 15 + 5;
+      const timeout = Math.abs(motor.target + 160563) / (32768 * 35 / 60) + 35 / 75 + 5;
       await clock.wait(timeout - 9 + .1); await homeFault(context);
     }
     assert.deepEqual(motor.destinations, targets); await transport.close();
@@ -1118,7 +1118,7 @@ test("first endpoint search starts at the captured position and reaches beyond t
     assert.equal(motor.destinations[0], before.position_raw + sign * 409600);
     const contacted = motor.values[22] | motor.values[23] << 16;
     assert.ok(Math.abs(contacted - before.position_raw) > 8192);
-    assert.deepEqual(motor.absoluteStates[0].slice(0, 4), [1, 1, 7, 15]);
+    assert.deepEqual(motor.absoluteStates[0].slice(0, 4), [1, 1, 35, 75]);
     assert.equal(motor.absoluteStates[0][24], 89);
     const result = await advance(context);
     assert.equal(result.homed, true); assert.deepEqual(result.measured_endpoints_raw, motor.contacts);
@@ -1133,7 +1133,7 @@ test("first search has a full-distance deadline and never reissues a freely reac
   await advance(context, "first_contact");
   assert.deepEqual(motor.destinations, [409600]); assert.equal(transport.status().pending_raw, 0);
   await clock.wait(12); assert.equal((await transport.poll_home()).home_phase, "first_contact");
-  const deadline = 409600 / (32768 * 7 / 60) + 7 / 15 + 5;
+  const deadline = 409600 / (32768 * 35 / 60) + 35 / 75 + 5;
   await clock.wait(deadline - 12 + .1);
   await assert.rejects(transport.poll_home(), /timed out during first_contact/);
   assert.deepEqual(motor.destinations, [409600]); assert.equal(transport.status().homed, false);
