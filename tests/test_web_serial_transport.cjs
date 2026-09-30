@@ -206,7 +206,7 @@ test("normal motion matches Python transport status and exact control-frame trac
 
 test("arming gates reject changed configuration before any write", async () => {
   for (const [register, value] of [[0, 0], [1, 1], [1, 4], [2, 3], [3, 10], [10, 1],
-    [14, 1], [20, 1], [21, 2], [25, 8], [12, 1], [19, 1]]) {
+    [14, 1], [20, 1], [21, 2], [25, 8], [12, 3], [19, 1]]) {
     const {transport, motor} = make(); motor.values[register] = value;
     await transport.connect(); await assert.rejects(transport.arm());
     assert.deepEqual(motor.commands, []); assert.deepEqual(motor.settings, []);
@@ -281,13 +281,92 @@ test("ignored enable or drift during hold prevents every target", async () => {
       if (operation === "enable") {
         if (scenario === "ignored") motor.values[1] = 0;
         if (scenario === "drift") motor.position(20017);
-        if (scenario === "pending") motor.remaining(1);
+        if (scenario === "pending") motor.remaining(17);
       }
     };
     await assert.rejects(transport.start());
     assert.deepEqual(motor.destinations, []);
     assert.deepEqual(motor.commands, ["clear", "enable", "clear", "inhibit"]);
     await transport.close();
+  }
+});
+
+test("enabled run hold accepts persistent signed residuals within sixteen counts", async () => {
+  for (const pending of [1, -1, 16, -16]) {
+    const {transport, motor} = make();
+    await transport.connect(); await transport.arm();
+    let holdReads = 0;
+    motor.onCommand = (_, operation) => {
+      if (operation === "enable") { motor.remaining(pending); motor.values[19] = 29; }
+    };
+    motor.onRead = m => { if (m.values[1] === 1) { holdReads++; m.values[16] = holdReads % 2 ? 1 : 65535; } };
+    assert.equal((await transport.start()).running, true);
+    assert.ok(holdReads >= 3); assert.equal(transport.status().pending_raw, pending);
+    assert.deepEqual(motor.destinations, []);
+    await transport.stop(); await transport.close();
+  }
+});
+
+test("enabled run hold rejects signed speed beyond jitter tolerance", async () => {
+  for (const speed of [2, 65534]) {
+    const {transport, motor} = make();
+    await transport.connect(); await transport.arm();
+    motor.onCommand = (_, operation) => { if (operation === "enable") motor.values[16] = speed; };
+    await assert.rejects(transport.start());
+    assert.deepEqual(motor.destinations, []); assert.equal(transport.status().running, false);
+    await transport.close();
+  }
+});
+
+test("disabled run hold rejects three-count demand and any nonzero PWM", async () => {
+  for (const field of [12, 19]) {
+    const {transport, motor} = make(); let first = true;
+    await transport.connect(); await transport.arm();
+    motor.onCommand = (_, operation) => {
+      if (operation === "clear" && first) { first = false; motor.values[field] = field === 12 ? 3 : 1; }
+    };
+    await assert.rejects(transport.start());
+    assert.ok(!motor.commands.includes("enable")); assert.deepEqual(motor.destinations, []);
+    await transport.close();
+  }
+});
+
+test("Home accepts persistent one-count holding error before native and calibration motion", async () => {
+  for (const pending of [1, -1]) {
+    const motor = new FakeConnection({native: true}); motor.position(8113);
+    const context = await homing(false, motor), reads = {enabled_hold: 0, move_hold: 0};
+    motor.onRead = m => {
+      const phase = context.transport.status().home_phase;
+      if (m.values[1] === 1 && Object.hasOwn(reads, phase)) {
+        reads[phase]++; m.remaining(pending); m.values[19] = 29; m.values[16] = 0;
+      }
+    };
+    assert.equal((await advance(context)).homed, true);
+    assert.ok(reads.enabled_hold >= 3); assert.ok(reads.move_hold >= 3);
+    assert.equal(context.transport.status().stop_confirmed, true);
+    await context.transport.close();
+  }
+});
+
+test("Home holds reject excessive residual, signed speed and encoder drift", async () => {
+  for (const phase of ["enabled_hold", "move_hold"]) {
+    for (const failure of ["pending17", "pending-17", "speed2", "speed-2", "drift"]) {
+      const context = await homing(), {transport, motor} = context;
+      await advance(context, phase);
+      const targets = motor.destinations.slice(), held = transport.status().position_raw;
+      motor.onRead = m => {
+        if (m.values[1] !== 1) { m.values[16] = 0; return; }
+        if (transport.status().home_phase !== phase) return;
+        if (failure.startsWith("pending")) m.remaining(failure === "pending17" ? 17 : -17);
+        if (failure.startsWith("speed")) m.values[16] = failure === "speed2" ? 2 : 65534;
+        if (failure === "drift") m.position(held + 17);
+      };
+      await assert.rejects(advance(context));
+      assert.equal(transport.status().homed, false); assert.equal(transport.status().stop_confirmed, true);
+      assert.deepEqual(motor.destinations, targets);
+      if (phase === "enabled_hold") assert.ok(!motor.settings.some(([r, v]) => r === 25 && v === 1));
+      await transport.close();
+    }
   }
 });
 
@@ -328,16 +407,147 @@ test("failed clear acknowledgement never suppresses the independent inhibit atte
 });
 
 test("fresh contradictory or missing readback invalidates a previously confirmed stop", async () => {
-  for (const change of ["drift", "pending", "pwm", "read_error"]) {
+  for (const change of ["drift", "pending", "negative_pending", "pwm", "speed", "negative_speed", "read_error"]) {
     const {transport, motor} = await running();
     assert.equal((await transport.stop()).stop_confirmed, true);
     if (change === "drift") motor.position(20005);
-    if (change === "pending") motor.remaining(1);
+    if (change === "pending") motor.remaining(3);
+    if (change === "negative_pending") motor.remaining(-3);
     if (change === "pwm") motor.values[19] = 1;
+    if (change === "speed") motor.values[16] = 2;
+    if (change === "negative_speed") motor.values[16] = 65534;
     if (change === "read_error") motor.onRead = () => new Uint8Array();
     await assert.rejects(transport.snapshot());
     assert.equal(transport.status().stop_confirmed, false);
     assert.ok(transport.status().fault); await transport.close();
+  }
+});
+
+test("Stop waits for transient coast feedback before confirming three stable inhibited reads", async () => {
+  const motor = new FakeConnection(); motor.position(-72147);
+  const context = await running({motor}), {transport, clock} = context;
+  let inhibited = false, reads = 0;
+  motor.onCommand = (_, operation) => { if (operation === "inhibit") inhibited = true; };
+  motor.onRead = m => {
+    if (!inhibited) return;
+    reads++;
+    if (reads === 1) { m.remaining(3); m.values[16] = 65504; m.position(-72147); }
+    else if (reads === 2) { m.remaining(2); m.values[16] = 65534; m.position(-72151); }
+    else { m.remaining(0); m.values[16] = 0; m.position(-72153 + reads % 2); }
+    m.values[19] = 0;
+  };
+  const before = motor.commands.length, started = clock.now();
+  const stopped = await transport.stop();
+  assert.equal(stopped.stop_confirmed, true); assert.equal(stopped.fault, null);
+  assert.ok(reads >= 5); assert.ok(clock.now() - started <= 1.51);
+  assert.deepEqual(motor.commands.slice(before), ["clear", "inhibit"]);
+  assert.ok([-72153, -72152].includes(stopped.position_raw));
+  assert.equal((await transport.snapshot()).stop_confirmed, true);
+  await transport.close();
+});
+
+test("Stop never confirms persistent demand, speed, enabled output or encoder drift", async () => {
+  for (const failure of ["pending", "speed", "output", "drift", "pwm"]) {
+    const {transport, motor, clock} = await running();
+    let inhibited = false, reads = 0;
+    motor.onCommand = (_, operation) => { if (operation === "inhibit") inhibited = true; };
+    motor.onRead = m => {
+      if (!inhibited) return;
+      reads++;
+      if (failure === "pending") m.remaining(3);
+      if (failure === "speed") m.values[16] = 65504;
+      if (failure === "output") m.values[1] = 1;
+      if (failure === "drift") m.position(20000 + 3 * reads);
+      if (failure === "pwm") m.values[19] = 1;
+    };
+    const before = motor.commands.length, started = clock.now();
+    await assert.rejects(transport.stop());
+    assert.ok(clock.now() - started <= 1.51, `unbounded stop for ${failure}`);
+    assert.equal(transport.status().stop_confirmed, false); assert.ok(transport.status().fault);
+    assert.deepEqual(motor.commands.slice(before), ["clear", "inhibit"]);
+    assert.ok(reads >= 1);
+    await transport.close();
+  }
+});
+
+test("Stop aborts on missing or corrupt readback without retransmitting control commands", async () => {
+  for (const failure of ["missing", "crc"]) {
+    const {transport, motor} = await running();
+    let inhibited = false, reads = 0;
+    motor.onCommand = (_, operation) => { if (operation === "inhibit") inhibited = true; };
+    motor.onRead = m => {
+      if (!inhibited) return;
+      reads++;
+      if (failure === "missing") return new Uint8Array();
+      const invalid = frame([1, 3, 52, ...m.values.flatMap(value => [value >>> 8, value & 255])]);
+      invalid[invalid.length - 1] ^= 1; return invalid;
+    };
+    const before = motor.commands.length;
+    await assert.rejects(transport.stop());
+    assert.equal(transport.status().stop_confirmed, false); assert.ok(transport.status().fault);
+    assert.equal(reads, 1); assert.deepEqual(motor.commands.slice(before), ["clear", "inhibit"]);
+    await transport.close();
+  }
+});
+
+function disabledEncoderJitter(motor) {
+  let base = motor.values[22] | motor.values[23] << 16, reads = 0;
+  const observed = new Set(), priorCommand = motor.onCommand;
+  motor.onCommand = (m, operation, ...details) => {
+    const result = priorCommand?.(m, operation, ...details);
+    if (operation === "inhibit" || operation === "absolute") base = m.values[22] | m.values[23] << 16;
+    return result;
+  };
+  motor.onRead = m => {
+    if (m.values[1] & 1) return;
+    const pending = [1, -1, 2, -2][reads++ % 4];
+    m.remaining(pending); m.position(base + reads % 2);
+    m.values[19] = 0; m.values[16] = reads % 2 ? 1 : 65535;
+    observed.add(pending);
+  };
+  return observed;
+}
+
+test("disabled encoder quantization permits Home, arm, run and confirmed stop across fresh reads", async () => {
+  const motor = new FakeConnection({native: true}); motor.position(262);
+  const observed = disabledEncoderJitter(motor), context = await homing(false, motor), {transport} = context;
+  const homed = await advance(context);
+  assert.equal(homed.homed, true); assert.equal(homed.stop_confirmed, true);
+  assert.equal((await transport.snapshot()).stop_confirmed, true);
+  assert.equal((await transport.arm()).armed, true);
+  assert.equal((await transport.start()).running, true);
+  await transport.command(.5);
+  assert.equal((await transport.stop()).stop_confirmed, true);
+  for (let read = 0; read < 4; read++) {
+    const stopped = await transport.snapshot();
+    assert.equal(stopped.stop_confirmed, true); assert.ok(Math.abs(stopped.pending_raw) <= 2);
+    assert.equal(stopped.pwm_raw, 0);
+  }
+  assert.deepEqual([...observed].sort((a, b) => a - b), [-2, -1, 1, 2]);
+  await transport.close();
+});
+
+test("Home cancellation confirms inhibition with two-count encoder quantization", async () => {
+  const motor = new FakeConnection({native: true}); disabledEncoderJitter(motor);
+  const context = await homing(false, motor), {transport} = context;
+  await advance(context, "seeking");
+  const stopped = await transport.stop();
+  assert.equal(stopped.stop_confirmed, true); assert.equal(stopped.homed, false);
+  assert.equal(stopped.pwm_raw, 0); assert.ok(Math.abs(stopped.pending_raw) <= 2);
+  assert.equal((await transport.snapshot()).stop_confirmed, true);
+  await transport.close();
+});
+
+test("arming rejects disabled demand beyond two counts, output, speed and encoder movement", async () => {
+  for (const failure of ["pending3", "pending-3", "pwm", "speed", "drift"]) {
+    const {motor, transport} = make(); await transport.connect();
+    if (failure.startsWith("pending")) motor.remaining(failure === "pending3" ? 3 : -3);
+    if (failure === "pwm") motor.values[19] = 1;
+    if (failure === "speed") motor.values[16] = 2;
+    if (failure === "drift") { let read = 0; motor.onRead = m => m.position(20000 + 5 * read++); }
+    await assert.rejects(transport.arm());
+    assert.equal(transport.status().armed, false); assert.deepEqual(motor.commands, []);
+    await transport.close();
   }
 });
 
@@ -396,7 +606,7 @@ test("both native directions measure repeatable endpoints and center in one coor
     assert.equal(status.position_normalized, .5); assert.equal(status.position_raw, center);
     assert.equal(status.homed, true); assert.equal(status.homing, false);
     assert.equal(status.stop_confirmed, true); assert.equal(status.owned, false);
-    assert.deepEqual(motor.destinations, [sign * 8192, sign * 1639, sign * 4096,
+    assert.deepEqual(motor.destinations, [sign * 409600, sign * 1639, sign * 4096,
       sign * (3277 - 409600 - 819), sign * -158925, sign * -161382, center]);
     assert.equal(motor.settings.filter(([r, v]) => r === 25 && v === 1).length, 1);
     assert.ok(motor.settings.every(([r]) => r !== 20 && r !== 21));
@@ -480,7 +690,7 @@ test("contact requires sustained stasis, pending error and signed PWM load toget
         if (failure === "low_pending") motor.remaining(511);
         if (failure === "creep") {
           const position = 3277 + (++reads % 2 ? 8 : 0);
-          motor.position(position); motor.remaining(8192 - position);
+          motor.position(position); motor.remaining(409600 - position);
         }
       }
     };
@@ -496,8 +706,75 @@ test("contact needs at least half a second of fresh qualifying observations", as
     assert.equal(context.transport.status().home_phase, "first_contact");
   }
   await advance(context, "commanding_first_retreat");
-  assert.deepEqual(context.motor.destinations, [8192]);
+  assert.deepEqual(context.motor.destinations, [409600]);
   await context.transport.stop(); await context.transport.close();
+});
+
+function contactSpringback(context, amount = 180) {
+  const {motor, transport} = context, releases = [];
+  let staleHold = false;
+  motor.onCommand = (m, operation) => {
+    if (operation === "clear" && m.values[1] === 0) staleHold = false;
+    if (operation === "enable") assert.equal(staleHold, false, "clear inhibited demand before reenabling after springback");
+    if (operation !== "inhibit" || transport.status().home_phase !== "inhibiting_contact") return;
+    const loaded = m.values[22] | m.values[23] << 16;
+    const [low] = m.contacts ?? (m.values[9] ? [-3277, 160563] : [-160563, 3277]);
+    const inward = loaded === low ? 1 : -1;
+    m.position(loaded + inward * amount); m.remaining(0);
+    releases.push({loaded, released: loaded + inward * amount}); staleHold = true;
+  };
+  return releases;
+}
+
+test("180-count inward springback preserves loaded endpoints and clears before reenabling", async () => {
+  for (const reverse of [false, true]) {
+    const motor = new FakeConnection({native: true});
+    motor.contacts = reverse ? [-110243, 53597] : [-53597, 110243];
+    const context = await homing(reverse, motor), releases = contactSpringback(context);
+    const result = await advance(context);
+    assert.equal(releases.length, 4);
+    assert.ok(releases.every(({loaded, released}) => Math.abs(loaded - released) === 180));
+    assert.deepEqual(result.measured_endpoints_raw, motor.contacts);
+    assert.equal(result.measured_travel_raw, 163840); assert.equal(result.position_normalized, .5);
+    assert.equal(result.homed, true); assert.equal(result.stop_confirmed, true);
+    await context.transport.close();
+  }
+});
+
+test("contact inhibition rejects inward release beyond512 and outward movement beyond128", async () => {
+  for (const reverse of [false, true]) {
+    for (const side of ["first", "second"]) {
+      for (const amount of [513, -129]) {
+        const context = await homing(reverse), {motor, transport} = context;
+        await advance(context, `${side}_contact`);
+        await advance(context, "inhibiting_contact");
+        const targets = motor.destinations.slice();
+        const releases = contactSpringback(context, amount);
+        await assert.rejects(advance(context), TransportError);
+        assert.equal(releases.length, 1); assert.equal(transport.status().homed, false);
+        assert.equal(transport.status().stop_confirmed, true);
+        assert.deepEqual(motor.destinations, targets);
+        await transport.close();
+      }
+    }
+  }
+});
+
+test("springback allowance never widens the128-count loaded contact repeat tolerance", async () => {
+  for (const reverse of [false, true]) {
+    for (const side of ["first", "second"]) {
+      const motor = new FakeConnection({native: true});
+      motor.contacts = reverse ? [-3277, 160563] : [-160563, 3277];
+      const context = await homing(reverse, motor); contactSpringback(context);
+      await advance(context, `commanding_${side}_retouch`);
+      const positiveEnd = side === "first" ? !reverse : reverse;
+      motor.contacts[positiveEnd ? 1 : 0] += positiveEnd ? 129 : -129;
+      await assert.rejects(advance(context), /Repeated endpoint contact.*128/);
+      assert.equal(context.transport.status().homed, false);
+      assert.equal(context.transport.status().measured_endpoints_raw, null);
+      await context.transport.close();
+    }
+  }
 });
 
 test("release requires two millimeters of movement and a fall in load", async () => {
@@ -565,6 +842,41 @@ test("homing publishes measurement only after centered and inhibited verificatio
   assert.equal((await advance(context)).homed, true); await context.transport.close();
 });
 
+test("center inhibition accepts53-count relaxation and retains the actual confirmed stop", async () => {
+  for (const reverse of [false, true]) {
+    const context = await homing(reverse), {transport, motor} = context;
+    await advance(context, "inhibiting_center");
+    const commanded = motor.target, settled = commanded + (reverse ? 53 : -53);
+    motor.onCommand = (m, operation) => {
+      if (operation === "inhibit" && transport.status().home_phase === "inhibiting_center") m.position(settled);
+    };
+    const result = await advance(context);
+    assert.equal(result.homed, true); assert.equal(result.stop_confirmed, true);
+    assert.equal(result.position_raw, settled); assert.equal(result.target_raw, commanded);
+    assert.equal(result.position_normalized, (settled - result.raw_bounds[0]) / (result.raw_bounds[1] - result.raw_bounds[0]));
+    assert.equal((await transport.snapshot()).stop_confirmed, true);
+    const rearmed = await transport.arm();
+    assert.equal(rearmed.armed, true); assert.equal(rearmed.target_raw, settled);
+    await transport.stop(); await transport.close();
+  }
+});
+
+test("center inhibition beyond128 counts never publishes a homed range", async () => {
+  for (const reverse of [false, true]) {
+    const context = await homing(reverse), {transport, motor} = context;
+    await advance(context, "inhibiting_center");
+    const settled = motor.target + (reverse ? 129 : -129);
+    motor.onCommand = (m, operation) => {
+      if (operation === "inhibit" && transport.status().home_phase === "inhibiting_center") m.position(settled);
+    };
+    await assert.rejects(advance(context), /drifted after centering/);
+    assert.equal(transport.status().homed, false); assert.equal(transport.status().raw_bounds, null);
+    assert.equal(transport.status().measured_endpoints_raw, null);
+    assert.equal(transport.status().stop_confirmed, true);
+    await transport.close();
+  }
+});
+
 test("center travel uses a distance deadline and never reissues a timed-out target", async () => {
   for (const finishes of [true, false]) {
     const context = await homing(), {transport, motor, clock} = context;
@@ -587,18 +899,355 @@ test("center travel uses a distance deadline and never reissues a timed-out targ
   }
 });
 
-test("known disabled mode zero can home but enabled or unknown output cannot", async () => {
-  for (const flags of [0, 2, 6]) {
+test("known position-mode startup states can home while unknown output stays rejected", async () => {
+  for (const flags of [0, 2, 3, 6, 7, 10, 11, 14, 15]) {
     const motor = new FakeConnection({native: true}); motor.values[0] = 0; motor.values[1] = flags;
     const context = await homing(false, motor);
     assert.equal((await advance(context)).homed, true); await context.transport.close();
   }
-  for (const [mode, flags] of [[0, 1], [0, 3], [0, 7], [0, 4], [1, 2], [1, 6]]) {
+  for (const [mode, flags] of [[0, 1], [0, 4], [1, 2], [1, 6]]) {
     const {transport, motor} = make({motor: new FakeConnection({native: true})});
     motor.values[0] = mode; motor.values[1] = flags;
     await transport.connect(); await assert.rejects(transport.begin_home(false));
     assert.deepEqual(motor.commands, []); assert.deepEqual(motor.settings, []); await transport.close();
   }
+});
+
+test("retained native status at startup still requires special mode cleared", async () => {
+  for (const flags of [10, 11, 14, 15]) {
+    const motor = new FakeConnection({native: true});
+    motor.values[0] = 0; motor.values[1] = flags; motor.values[25] = 1;
+    const {transport} = make({motor}); await transport.connect();
+    await assert.rejects(transport.begin_home(), /special function/);
+    assert.deepEqual(motor.commands, []); assert.deepEqual(motor.settings, []);
+    await transport.close();
+  }
+});
+
+function observedStartupMotor() {
+  const motor = new FakeConnection({native: true});
+  motor.values = [0, 7, 1500, 50000, 495, 3000, 10, 3000, 3900, 1, 32768, 800,
+    9, 0, 0, 8, 0, 7725, 28, 64915, 0, 1, 2030, 0, 540, 0];
+  // Observed firmware clears residual demand when entering Modbus. In pulse
+  // mode the PWM register can retain stale holding output after inhibition.
+  motor.onSetting = (m, register, value) => {
+    if (register === 0 && value === 1) m.remaining(0);
+  };
+  motor.onCommand = (m, operation) => {
+    if (m.values[0] === 0 && ["inhibit", "clear"].includes(operation)) m.values[19] = 65502;
+  };
+  return motor;
+}
+
+test("observed enabled pulse-mode drive is explicitly prepared before Home enables it", async () => {
+  const motor = observedStartupMotor(), context = make({motor}), {transport} = context;
+  assert.equal((await transport.connect()).output_enabled, true);
+  assert.deepEqual(motor.settings, []); assert.deepEqual(motor.commands, []);
+  await transport.begin_home(); await advance(context, "selecting_modbus");
+  assert.deepEqual(motor.settings, []); assert.deepEqual(motor.commands, []);
+  await advance(context, "setting_home_gear");
+  assert.deepEqual(motor.settings, [[0, 1]]); assert.deepEqual(motor.commands, ["inhibit"]);
+  assert.equal(motor.values[1], 0); assert.equal(motor.values[10], 32768);
+  await advance(context, "enabling_home");
+  assert.equal(motor.values[10], 0); assert.equal(motor.values[19], 0);
+  assert.ok(!motor.commands.includes("enable"));
+  assert.deepEqual(motor.values.slice(0, 4), [1, 0, 80, 15]);
+  assert.equal((await advance(context)).homed, true);
+  await transport.close();
+});
+
+test("Modbus startup normalizes nonzero gearing before its first demand clear", async () => {
+  const motor = observedStartupMotor(), command = motor.onCommand;
+  motor.values[0] = 1; motor.values[1] = 0; motor.values[19] = 0;
+  motor.onCommand = (m, operation) => {
+    if (operation === "clear") assert.equal(m.values[10], 0, "FC16 clear requires gear0");
+    return command(m, operation);
+  };
+  const context = await homing(false, motor);
+  await advance(context, "setting_home_gear");
+  assert.deepEqual(motor.commands, ["inhibit"]); assert.equal(motor.values[12], 9);
+  assert.equal(motor.values[10], 32768);
+  assert.equal((await advance(context)).homed, true);
+  await context.transport.close();
+});
+
+test("Home rejects moving feedback and excessive holding error before claiming output", async () => {
+  for (const [register, value, message] of [[16, 2, /actual speed/], [16, 65534, /actual speed/], [12, 17, /holding error/], [14, 2, /alarm 0.*2/]]) {
+    const motor = observedStartupMotor(); motor.values[register] = value;
+    const {transport} = make({motor}); await transport.connect();
+    await assert.rejects(transport.begin_home(), message);
+    assert.deepEqual(motor.settings, []); assert.deepEqual(motor.commands, []);
+    await transport.close();
+  }
+});
+
+test("ineffective takeover inhibit never reaches gear configuration or Home enable", async () => {
+  const motor = observedStartupMotor();
+  motor.onCommand = (m, operation) => { if (operation === "inhibit") m.values[1] = 1; };
+  const context = await homing(false, motor);
+  await assert.rejects(advance(context), /could not inhibit/);
+  assert.ok(!motor.commands.includes("enable"));
+  assert.ok(!motor.settings.some(([r, v]) => r === 10 || (r === 25 && v === 1)));
+  assert.equal(context.transport.status().stop_confirmed, false);
+  await context.transport.close();
+});
+
+test("Stop during pulse-mode preflight normalizes stale PWM without triggering Home", async () => {
+  const motor = observedStartupMotor(), context = await homing(false, motor);
+  const stopped = await context.transport.stop();
+  assert.equal(stopped.stop_confirmed, true); assert.equal(stopped.homing, false);
+  assert.equal(stopped.output_enabled, false); assert.equal(stopped.pwm_raw, 0);
+  assert.ok(!motor.settings.some(([r, v]) => r === 25 && v === 1));
+  assert.ok(!motor.commands.includes("enable")); assert.deepEqual(motor.destinations, []);
+  await context.transport.close();
+});
+
+test("Stop during a blocked startup read fences takeover and queued polls", async () => {
+  const motor = observedStartupMotor(), context = await homing(false, motor);
+  const entered = deferred(), release = deferred();
+  motor.onRead = async () => { motor.onRead = null; entered.resolve(); await release.promise; };
+  const polling = assert.rejects(context.transport.poll_home(), /cancel/i);
+  await entered.promise;
+  const queued = assert.rejects(context.transport.poll_home(), /cancel/i);
+  const stopping = context.transport.stop(); release.resolve();
+  await Promise.all([polling, queued, stopping]);
+  assert.ok(!motor.commands.includes("enable")); assert.deepEqual(motor.destinations, []);
+  assert.equal(context.transport.status().stop_confirmed, true);
+  assert.equal(context.transport.status().home_phase, "cancelled");
+  await context.transport.close();
+});
+
+function nativeResetMotor() {
+  const motor = observedStartupMotor();
+  motor.onNative = m => {
+    if (m.nativeReads === 1) {
+      m.values[0] = 1; m.values[1] = 1; m.values[16] = 80;
+    } else {
+      m.values[0] = 0; m.values[1] = 11; m.values[10] = 32768;
+      m.values[16] = 0; m.values[19] = 0; m.values[24] = 540;
+      m.position(m.nativeReads % 2 ? 42 : 43); m.remaining(0);
+    }
+  };
+  return motor;
+}
+
+const MIXED_NATIVE_RETREAT = [1, 1, 80, 15, 495, 3000, 10, 3000, 3900, 0,
+  32768, 800, 65123, 65535, 0, 8, 65217, 7725, 32, 64111, 0, 1, 62369, 65535, 540, 1];
+
+test("mixed native transition snapshots keep seeking until explicit completion settles", async () => {
+  const motor = nativeResetMotor(), native = motor.onNative;
+  motor.onNative = m => {
+    native(m);
+    if (m.nativeReads === 2) m.values = MIXED_NATIVE_RETREAT.slice();
+    else if (m.nativeReads >= 3 && m.nativeReads <= 5) {
+      m.values = MIXED_NATIVE_RETREAT.slice();
+      m.remaining(0); m.position(0); m.values[16] = 0; m.values[19] = 0;
+    } else if (m.nativeReads >= 6) m.position(43);
+  };
+  const context = await homing(false, motor), {transport, clock} = context;
+  await advance(context, "seeking");
+  for (let read = 1; read <= 8; read++) {
+    await clock.wait(.1); const status = await transport.poll_home();
+    assert.equal(motor.nativeReads, read);
+    assert.equal(status.home_phase, read < 8 ? "seeking" : "inhibiting_after_home");
+  }
+  assert.equal(transport.status().home_origin_raw, 43);
+  assert.equal((await advance(context)).homed, true);
+  await transport.close();
+});
+
+test("Home inhibit accepts a known transitioned ACK but rejects unknown flags", async () => {
+  for (const acknowledged of [10, 8]) {
+    const motor = nativeResetMotor();
+    motor.onNative = m => { m.values = MIXED_NATIVE_RETREAT.slice(); };
+    const context = await homing(false, motor), {transport, clock} = context;
+    await advance(context, "seeking"); await clock.wait(.1); await transport.poll_home();
+    assert.equal(transport.status().output_raw, 1);
+    let firstInhibit = true;
+    motor.onCommand = (m, operation) => {
+      if (operation !== "inhibit" || !firstInhibit) return;
+      firstInhibit = false; m.values[0] = 0; m.values[1] = 10;
+      m.values[16] = 0; m.values[19] = 0;
+      return frame([1, 6, 0, 1, 0, acknowledged]);
+    };
+    if (acknowledged === 10) {
+      const stopped = await transport.stop();
+      assert.equal(stopped.stop_confirmed, true); assert.equal(stopped.output_enabled, false);
+      assert.equal(stopped.fault, null);
+    } else {
+      await assert.rejects(transport.stop()); assert.equal(transport.status().stop_confirmed, false);
+      assert.ok(transport.status().fault);
+    }
+    assert.deepEqual(motor.destinations, []);
+    await transport.close();
+  }
+});
+
+test("normal motion does not accept Home-specific transitioned output ACKs", async () => {
+  const {transport, motor} = await running();
+  motor.onCommand = (_, operation) => operation === "inhibit" ? frame([1, 6, 0, 1, 0, 10]) : undefined;
+  await assert.rejects(transport.stop());
+  assert.equal(transport.status().stop_confirmed, false); assert.ok(transport.status().fault);
+  await transport.close();
+});
+
+test("observed native completion restores pulse gearing and captures a near-zero origin", async () => {
+  for (const flags of [10, 11, 14, 15]) {
+    const motor = nativeResetMotor(), native = motor.onNative;
+    motor.onNative = m => { native(m); if (m.nativeReads > 1) m.values[1] = flags; };
+    const context = await homing(false, motor);
+    const captured = await advance(context, "inhibiting_after_home");
+    assert.ok([42, 43].includes(captured.home_origin_raw));
+    assert.equal(captured.output_enabled, Boolean(flags & 1));
+    assert.equal(motor.values[10], 32768);
+    const result = await advance(context);
+    assert.equal(result.homed, true); assert.equal(result.position_normalized, .5);
+    assert.equal(result.output_enabled, false); assert.equal(motor.values[10], 0);
+    await context.transport.close();
+  }
+});
+
+test("first endpoint search starts at the captured position and reaches beyond ten millimeters", async () => {
+  for (const reverse of [false, true]) {
+    const motor = nativeResetMotor();
+    motor.contacts = reverse ? [-24576, 139264] : [-139264, 24576];
+    const context = await homing(reverse, motor);
+    const before = await advance(context, "commanding_first_contact");
+    const sign = reverse ? -1 : 1;
+    await advance(context, "first_contact");
+    assert.equal(motor.destinations[0], before.position_raw + sign * 409600);
+    const contacted = motor.values[22] | motor.values[23] << 16;
+    assert.ok(Math.abs(contacted - before.position_raw) > 8192);
+    assert.deepEqual(motor.absoluteStates[0].slice(0, 4), [1, 1, 7, 15]);
+    assert.equal(motor.absoluteStates[0][24], 89);
+    const result = await advance(context);
+    assert.equal(result.homed, true); assert.deepEqual(result.measured_endpoints_raw, motor.contacts);
+    assert.equal(result.measured_travel_raw, 163840); assert.equal(result.position_normalized, .5);
+    await context.transport.close();
+  }
+});
+
+test("first search has a full-distance deadline and never reissues a freely reached target", async () => {
+  const motor = new FakeConnection({native: true}); motor.contacts = [-1000000, 1000000];
+  const context = await homing(false, motor), {transport, clock} = context;
+  await advance(context, "first_contact");
+  assert.deepEqual(motor.destinations, [409600]); assert.equal(transport.status().pending_raw, 0);
+  await clock.wait(12); assert.equal((await transport.poll_home()).home_phase, "first_contact");
+  const deadline = 409600 / (32768 * 7 / 60) + 7 / 15 + 5;
+  await clock.wait(deadline - 12 + .1);
+  await assert.rejects(transport.poll_home(), /timed out during first_contact/);
+  assert.deepEqual(motor.destinations, [409600]); assert.equal(transport.status().homed, false);
+  assert.equal(transport.status().stop_confirmed, true);
+  await transport.close();
+});
+
+test("native completion rejects mismatched reset configuration and unknown flags", async () => {
+  for (const [register, value] of [[10, 32767], [1, 13], [25, 0], [24, 539], [2, 81], [3, 16], [4, 496]]) {
+    const motor = nativeResetMotor(), native = motor.onNative;
+    motor.onNative = m => { native(m); if (m.nativeReads > 1) m.values[register] = value; };
+    const context = await homing(false, motor);
+    await assert.rejects(advance(context), /Native|Unexpected/);
+    assert.equal(context.transport.status().homed, false);
+    assert.deepEqual(motor.destinations, []);
+    await context.transport.close();
+  }
+});
+
+test("native reset flags and defaults may settle before three stationary completion reads", async () => {
+  const motor = nativeResetMotor(), native = motor.onNative;
+  motor.onNative = m => {
+    native(m);
+    if (m.nativeReads < 2) return;
+    m.values[1] = [15, 14, 15, 11, 10][Math.min(4, m.nativeReads - 2)];
+    m.values[2] = 1500; m.values[3] = 50000;
+    m.values[16] = [3, 2, 1, 65535, 0][Math.min(4, m.nativeReads - 2)];
+    m.position(m.nativeReads === 2 ? 0 : m.nativeReads === 3 ? -10 : -18);
+  };
+  const context = await homing(false, motor), {transport, clock} = context;
+  await advance(context, "seeking");
+  for (let read = 1; read <= 6; read++) {
+    await clock.wait(.1); const status = await transport.poll_home();
+    assert.equal(motor.nativeReads, read);
+    assert.equal(status.home_phase, read < 6 ? "seeking" : "inhibiting_after_home");
+  }
+  assert.equal(transport.status().home_origin_raw, -18);
+  assert.equal((await advance(context)).homed, true);
+  assert.deepEqual(motor.values.slice(0, 4), [1, 0, 7, 15]);
+  await transport.close();
+});
+
+test("native completion still rejects motion and residual demand; legacy completion stays near zero", async () => {
+  for (const failure of ["speed", "outside", "drift", "pending", "negative_pending"]) {
+    const motor = nativeResetMotor(), native = motor.onNative;
+    motor.onNative = m => {
+      native(m);
+      if (m.nativeReads > 1) {
+        if (failure === "speed") m.values[16] = 2;
+        if (failure === "outside") { m.values[1] = 3; m.values[10] = 0; m.position(129); }
+        if (failure === "drift") m.position(m.nativeReads % 2 ? 43 : 50);
+        if (failure === "pending") m.remaining(15);
+        if (failure === "negative_pending") m.remaining(-15);
+      }
+    };
+    const context = await homing(false, motor);
+    await assert.rejects(advance(context), /timed out during seeking/);
+    assert.equal(context.transport.status().homed, false);
+    assert.deepEqual(motor.destinations, []);
+    await context.transport.close();
+  }
+});
+
+test("explicit native completion captures its actual stable coordinate without assuming zero", async () => {
+  for (const origin of [266, 200000, -200000]) {
+    const motor = nativeResetMotor(), native = motor.onNative;
+    motor.contacts = [origin - 160563, origin + 3277];
+    motor.onNative = m => { native(m); if (m.nativeReads > 1) m.position(origin + m.nativeReads % 2); };
+    const context = await homing(false, motor);
+    const captured = await advance(context, "inhibiting_after_home");
+    assert.ok([origin, origin + 1].includes(captured.home_origin_raw));
+    const restored = await advance(context, "commanding_first_contact");
+    await advance(context, "first_contact");
+    assert.equal(motor.destinations[0], restored.position_raw + 409600);
+    const result = await advance(context);
+    assert.equal(result.homed, true); assert.deepEqual(result.measured_endpoints_raw, motor.contacts);
+    assert.equal(result.position_normalized, .5); assert.equal(result.stop_confirmed, true);
+    await context.transport.close();
+  }
+});
+
+test("native-reset cancellation clears special mode and gearing before any FC16 clear", async () => {
+  const motor = nativeResetMotor(), context = await homing(false, motor);
+  await advance(context, "inhibiting_after_home");
+  const start = motor.transmissions.length;
+  const stopped = await context.transport.stop();
+  assert.equal(stopped.stop_confirmed, true); assert.equal(stopped.homed, false);
+  assert.equal(stopped.output_enabled, false); assert.equal(stopped.pending_raw, 0);
+  assert.equal(stopped.pwm_raw, 0); assert.equal(motor.values[25], 0);
+  const writes = motor.transmissions.slice(start).filter(tx => tx[1] !== 3).map(tx => [tx[1], tx[3], tx[4] << 8 | tx[5]]);
+  assert.deepEqual(writes.slice(0, 7), [[6, 1, 0], [6, 0, 0], [6, 25, 0], [6, 0, 1], [6, 1, 0], [6, 10, 0], [16, 12, 2]]);
+  assert.deepEqual(motor.destinations, []);
+  assert.equal(motor.settings.filter(([r, v]) => r === 25 && v === 1).length, 1);
+  await context.transport.close();
+});
+
+test("signed one-unit speed jitter is accepted only with stable encoder samples", async () => {
+  for (const speed of [1, 65535]) {
+    const motor = nativeResetMotor(), native = motor.onNative;
+    motor.values[16] = speed;
+    motor.onNative = m => { native(m); if (m.nativeReads > 1) m.values[16] = speed; };
+    const context = await homing(false, motor);
+    await advance(context, "inhibiting_after_home");
+    const stopped = await context.transport.stop();
+    assert.equal(stopped.stop_confirmed, true); assert.equal(stopped.output_enabled, false);
+    assert.equal(motor.values[16], speed);
+    await context.transport.close();
+  }
+  const motor = observedStartupMotor(); motor.values[16] = 65535;
+  const context = await homing(false, motor);
+  motor.onRead = m => { if (m.values[0] === 0) m.position(2040); };
+  await assert.rejects(context.transport.poll_home(), /Encoder moved/);
+  assert.ok(!motor.commands.includes("enable")); assert.deepEqual(motor.destinations, []);
+  await context.transport.close();
 });
 
 test("rail span limit accepts exactly 500mm and rejects shorter or excessive rails", async () => {

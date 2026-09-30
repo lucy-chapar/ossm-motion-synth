@@ -4,8 +4,9 @@ The [website edition](https://lucychapar.com/ossm-motion-synth/) runs the engine
 audio and USB–RS485 control directly in the browser using Web Serial. In desktop
 Chrome or Edge, expand **Motor connection** and click **Connect**. The browser
 asks you to choose your USB–RS485 adapter, then connects to it.
-No adapter opens automatically. The controls and homing sequence below are
-shared with the optional Python edition.
+No adapter opens automatically. The controls and rail measurement sequence
+are shared with the optional Python edition; drive startup handling differs
+as noted below.
 
 **Wiring:** With power off, disconnect the 4-pin signal cable that runs to the
 OSSM motherboard. This setup only needs 24 V power and USB–RS485 wired directly
@@ -105,11 +106,13 @@ moving to center.
 
 The initial reference uses the native command from
 [OSSM ALT's linked OSSM-RS firmware](https://github.com/ossm-rs/ossm-rs/blob/5f4edbd085da07e18f628b88cbad0caa96db269a/ossm-rs/src/motion/mod.rs#L28-L67):
-80 RPM, output/stall setting 89, and special function `0x19 = 1`. The drive
-finds one end, retreats 36 degrees and resets its coordinate. The bridge then
-switches to 7 RPM / 15 RPM/s to measure both contacts in that same coordinate
-system. Two native homes alone would erase the reference needed to measure
-the distance between the ends.
+80 RPM, output/stall setting 89, and special function `0x19 = 1`. The vendor
+describes a 36-degree retreat and coordinate reset. The browser then restores
+Modbus position control at 7 RPM / 15 RPM/s and measures both contacts in that
+same coordinate system. It does not assume the native reference lies within
+a fixed distance of the first endpoint: each search is bounded to 500 nominal
+mm. Two native homes alone would erase the reference needed to measure the
+distance between the ends.
 
 Each measured contact requires at least half a second of stationary encoder
 readings within four counts, substantial pending motion, and elevated output
@@ -118,6 +121,10 @@ the repeated contact must agree within 128 counts. The second end is measured
 the same way. The measured interval must be at least 20 mm and no more than
 500 mm under the configured gearing assumption. Time and distance limits stop
 a search that does not find an end.
+
+After inhibition, the browser allows up to 512 counts of inward springback
+before the 2 mm retreat. The loaded contact repeat tolerance remains 128
+counts. It clears pending demand while inhibited before enabling each stage.
 
 The working window is inset 2 mm from each measured endpoint. The motor parks
 at the midpoint of the two contacts, verifies arrival, then inhibits output
@@ -139,14 +146,23 @@ The register meanings are documented in the
 [vendor manual](https://www.robotanno.com/web/userfiles/download/ACCESSORIES/IntegratedServoMotor/YZ-AIMManual_v2_55.pdf),
 physical pages 9, 12–13 and 17.
 
-Home requires a stationary drive with output disabled, no alarm, slave 1 and
-gear numerator 0. It accepts Modbus mode 1 or known disabled mode-0 status
-values and selects Modbus itself after fresh stationary readings. It does not
-change baud or save EEPROM settings. Reconnecting requires Home again. Lost
-feedback, missed deadlines, failed release or inconsistent contacts cancel the
-sequence; ambiguous motion acknowledgments are never automatically retried.
-Both Python and Web Serial implementations are tested with a fake serial rail;
-physical testing remains outstanding.
+In the browser edition, Home accepts a stationary drive in Modbus mode or a
+recognized step/direction position mode, including the normal enabled startup
+state. It checks fresh encoder and speed readings, inhibits the drive, selects
+Modbus, and sets gear numerator 0 before applying the homing profile. Connect
+alone only reads status. An alarm, unknown operating mode or moving encoder
+prevents Home from starting.
+
+The optional Python bridge still requires output disabled and gear numerator 0
+before Home. Neither edition changes baud or saves EEPROM settings.
+Reconnecting requires Home again. Lost feedback, missed deadlines, failed
+release or inconsistent contacts cancel the sequence; ambiguous motion
+acknowledgments are never automatically retried.
+
+The browser accepts at most two counts of disabled feedback quantization,
+with zero PWM and three stable encoder readings. A connected-motor check on
+2026-09-30 measured approximately 180 mm of travel and parked within 0.1 mm
+of the measured center with output inhibited.
 
 ## USB–RS485 connection
 
@@ -199,16 +215,17 @@ armed a run may keep it alive or change its controls; another authenticated
 local tab may request a stop. Backgrounding the control tab stops its heartbeat.
 
 STOP, a fault, or normal run completion independently attempts clear and inhibit,
-then checks three stationary disabled readbacks. A failed clear acknowledgment
+then allows up to 1.5 seconds to settle and checks three stationary disabled
+readbacks. Normal browser runs stop just before the independent 20-second
+transport deadline. A failed clear acknowledgment
 does not prevent an inhibit attempt. Failure remains **stop unconfirmed**;
 disconnecting or clicking reset must not relabel it as a confirmed stop. A new
-explicit connection with fresh disabled/zero-pending/zero-PWM readback is needed
+explicit connection with fresh stationary disabled/zero-PWM readback is needed
 to resolve that uncertainty in the application.
 
 A USB disconnection, sleeping laptop, crashed process or lost motor bus can
 prevent software cleanup. The browser's STOP is a software command; physical
-stop/power isolation remains independent. No flashing or real motor commands
-were performed while implementing this application.
+stop/power isolation remains independent.
 
 ## Local bridge and development
 

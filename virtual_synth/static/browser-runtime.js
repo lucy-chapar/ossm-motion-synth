@@ -10,6 +10,9 @@
   else root.MotionBrowserRuntime = exported.createRuntime();
 })(globalThis, (engineAPI) => {
   const copy = (value) => structuredClone(value);
+  // Stop normally before another request can hit the transport's independent
+  // 20-second limit. The countdown uses this same usable run deadline.
+  const HARDWARE_RUN_SECONDS = 20 - .3;
   const spanOf = (hw) => {
     const bounds = hw.raw_bounds;
     if (!Array.isArray(bounds) || bounds.length !== 2 || bounds.some((v) => !Number.isInteger(v) || v < -(2 ** 31) || v >= 2 ** 31) || bounds[0] >= bounds[1]) {
@@ -53,7 +56,7 @@
     };
     function state() {
       return copy({ mode, armed, running, gate, fault, params: engine.params, signal, history,
-        hardware: hardware(), allow_motion: supported, run_remaining_s: mode === "hardware" && running ? Math.max(0, 20 - (clock() - started)) : null,
+        hardware: hardware(), allow_motion: supported, run_remaining_s: mode === "hardware" && running ? Math.max(0, HARDWARE_RUN_SECONDS - (clock() - started)) : null,
         unconfirmed_stop: unconfirmedStop, stopping: stoppingCount > 0, control_revision: revision, homing: homing(), web_serial_supported: supported });
     }
     function fence() {
@@ -99,7 +102,7 @@
       const activeHome = homing().active;
       if ((armed || activeHome) && now - lastHeartbeat > 1.5) await fail("Control tab heartbeat expired. Output stopped; rearm explicitly.");
       else if ((running && dt > 0.25) || (activeHome && dt > 1)) await fail("Motion scheduling deadline missed. No catch-up targets were sent.");
-      if (mode === "hardware" && running && now - started >= 20) { fence(); await stopTransport(); }
+      if (mode === "hardware" && running && now - started >= HARDWARE_RUN_SECONDS) { fence(); await stopTransport(); }
       signal = engine.step(Math.min(dt, 0.25), { gate, running });
       if (transport && now - lastIO >= (running || homing().active ? 0.1 : 0.5)) {
         lastIO = now;
@@ -180,13 +183,17 @@
         armed = true; gate = false; lastHeartbeat = lastTick = clock();
       } else if (name === "run") {
         if (!armed || running || fault) throw new Error("Arm a stopped, healthy synth before running.");
+        let enabledAt = clock();
         if (transport) {
           try {
-            const hw = await transport.start(); await assertCurrent();
+            const hw = await transport.start(), observedAt = clock(); await assertCurrent();
+            // Start verifies an enabled hold before returning. Count that
+            // elapsed time as part of the run, matching the transport clock.
+            if (Number.isFinite(hw.run_seconds) && hw.run_seconds >= 0) enabledAt = observedAt - hw.run_seconds;
             engine.reset({ position: hw.position_normalized }); signal = engine.step(0, { running: false });
           } catch (error) { await motionError("Cannot start", error); }
         }
-        running = true; started = lastTick = lastIO = lastHeartbeat = clock();
+        running = true; started = enabledAt; lastTick = lastIO = lastHeartbeat = clock();
       } else if (name === "gate") {
         if (typeof payload.value !== "boolean") throw new Error("Gate must be true or false.");
         if (payload.value && (!armed || !running || fault)) throw new Error("Start the armed synth before opening the envelope gate.");
@@ -212,7 +219,7 @@
         await assertCurrent();
         lastIO = lastTick = clock();
         const hw = hardware();
-        if (!unconfirmedStop || (hw.mode === 1 && hw.output_enabled === false && hw.pending_raw === 0 && hw.pwm_raw === 0)) {
+        if (!unconfirmedStop || (hw.mode === 1 && hw.output_enabled === false && Number.isInteger(hw.pending_raw) && Math.abs(hw.pending_raw) <= 2 && hw.pwm_raw === 0)) {
           unconfirmedStop = false; fault = null;
         }
       } else if (name === "disconnect") {

@@ -134,6 +134,7 @@
         if (["arm", "run", "home_start", "connect"].includes(name) && epoch !== motionEpoch) return;
         const result = await api("/api/action", { action: name, ...details });
         if (!acceptState(result)) await poll();
+        if (["connect", "disconnect", "reset", "home_start"].includes(name) && state && !state.fault && !state.unconfirmed_stop) $("notice").hidden = true;
         return result;
       } catch (error) {
         if (!quiet) report(error.name === "AbortError" ? "The local app did not respond. Output state is unknown until feedback returns." : error.message, true);

@@ -11,7 +11,7 @@ function setup({ supported = true, factory } = {}) {
   const runtime = createRuntime({ serial, clock: () => now, autoStart: false,
     transportFactory: (selected) => { assert.equal(selected, port); opens++; return factory(); } });
   const action = (name, details = {}) => runtime.request("/api/action", { action: name, ...details });
-  return { runtime, action, advance: (dt) => { now += dt; }, port,
+  return { runtime, action, advance: (dt) => { now += dt; }, time: () => now, port,
     counts: () => ({ choices, opens }), async connect() { const chosen = await runtime.choosePort(); return action("connect", { port: chosen }); } };
 }
 function fakeMotor({ stopConfirmed = true } = {}) {
@@ -110,6 +110,29 @@ test("uncertain stop survives disconnect/reset and only fresh clean reconnect re
   motor = fakeMotor(); await env.connect();
   assert.equal(env.runtime.state().unconfirmed_stop, false);
 });
+test("reconnect clears stop uncertainty only for inhibited output with bounded integer pending jitter", async () => {
+  const cases = [
+    ...[-2, -1, 1, 2].map(pending_raw => ({ label: `pending ${pending_raw}`, feedback: { pending_raw }, resolves: true })),
+    ...[-3, 3, null, undefined, .5, "0"].map(pending_raw => ({ label: `pending ${String(pending_raw)}`, feedback: { pending_raw }, resolves: false })),
+    { label: "nonzero PWM", feedback: { pending_raw: 1, pwm_raw: 1 }, resolves: false },
+    { label: "pulse mode", feedback: { pending_raw: 1, mode: 0 }, resolves: false },
+    { label: "enabled output", feedback: { pending_raw: 1, output_enabled: true }, resolves: false },
+  ];
+  for (const { label, feedback, resolves } of cases) {
+    let motor = fakeMotor({ stopConfirmed: false }); motor.hw.homed = true;
+    const env = setup({ factory: () => motor });
+    await env.connect(); await env.action("arm"); await env.action("run"); await env.action("stop");
+    assert.equal(env.runtime.state().unconfirmed_stop, true, label);
+    await env.action("disconnect");
+    motor = fakeMotor(); Object.assign(motor.hw, feedback);
+    await env.connect();
+    const state = env.runtime.state();
+    assert.equal(state.unconfirmed_stop, !resolves, label);
+    assert.equal(state.fault === null, resolves, label);
+    assert.deepEqual(motor.calls, ["connect"], "recovery connection must remain read-only");
+    if (!resolves) await assert.rejects(env.action("reset"), /unconfirmed/, label);
+  }
+});
 test("hardware duration limit stops without a late command", async () => {
   const motor = fakeMotor(); motor.hw.homed = true;
   const env = setup({ factory: () => motor });
@@ -120,6 +143,59 @@ test("hardware duration limit stops without a late command", async () => {
   assert.equal(env.runtime.state().running, false);
   assert.ok(motor.calls.includes("stop"));
   assert.equal(env.runtime.state().fault, null);
+});
+
+test("normal run deadline includes the enabled hold and stops before the transport budget guard", async () => {
+  const motor = fakeMotor(); motor.hw.homed = true;
+  const env = setup({ factory: () => motor });
+  let enabledAt, stoppedAt;
+  const commandsAt = [], originalStop = motor.stop;
+  motor.start = async function () {
+    this.calls.push("start");
+    env.advance(.4); // Readback and disabled hold happen before output enables.
+    enabledAt = env.time();
+    this.hw.running = this.hw.owned = true; this.hw.stop_confirmed = false;
+    env.advance(.45); // Three enabled hold observations precede Start's return.
+    this.hw.run_seconds = env.time() - enabledAt;
+    return this.status();
+  };
+  motor.command = async function (position) {
+    const elapsed = env.time() - enabledAt;
+    if (20 - elapsed <= .155) throw new Error("20-second hardware run limit reached");
+    commandsAt.push(elapsed); this.calls.push(["command", position]);
+    env.advance(.07); // Model the read and write time of a hardware target.
+    return this.status();
+  };
+  motor.stop = async function () { stoppedAt = env.time() - enabledAt; return originalStop.call(this); };
+  await env.connect(); await env.action("arm"); await env.action("run");
+  assert.ok(Math.abs(env.runtime.state().run_remaining_s - 19.25) < 1e-9);
+  for (let i = 0; i < 250 && env.runtime.state().running; i++) {
+    env.advance(.1); await env.action("heartbeat"); await env.runtime.tick();
+  }
+  const state = env.runtime.state();
+  assert.equal(state.running, false); assert.equal(state.armed, false);
+  assert.equal(state.fault, null); assert.equal(state.unconfirmed_stop, false);
+  assert.equal(state.run_remaining_s, null);
+  assert.ok(stoppedAt >= 19.7 && stoppedAt < 20);
+  assert.ok(commandsAt.length > 0 && commandsAt.every(time => time < 19.7));
+  assert.equal(motor.calls.filter(call => call === "stop").length, 1);
+});
+
+test("scheduling and heartbeat failures remain faults when they cross the normal run deadline", async () => {
+  for (const [delay, message] of [[.3, /scheduling deadline/], [1.6, /heartbeat/]]) {
+    const motor = fakeMotor(); motor.hw.homed = true;
+    const env = setup({ factory: () => motor });
+    await env.connect(); await env.action("arm"); await env.action("run");
+    for (let i = 0; i < 78; i++) {
+      env.advance(.25); await env.action("heartbeat"); await env.runtime.tick();
+    }
+    assert.equal(env.runtime.state().running, true);
+    const commands = motor.calls.filter(Array.isArray).length;
+    env.advance(delay); await env.runtime.tick();
+    assert.equal(env.runtime.state().running, false);
+    assert.match(env.runtime.state().fault, message);
+    assert.equal(motor.calls.filter(Array.isArray).length, commands);
+  }
 });
 
 test("Stop during connection preflight closes the candidate without installing it", async () => {

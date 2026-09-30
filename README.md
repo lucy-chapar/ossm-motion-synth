@@ -28,8 +28,9 @@ use those controls, with motor connection unavailable.
 
 Motor commands run in the browser. Leaving the tab requests a stop; a closed,
 suspended or crashed browser cannot guarantee delivery of a software stop.
-Physical stop/power isolation remains independent. No motor was driven while
-porting or testing this browser edition.
+Physical stop/power isolation remains independent. The browser edition has
+been tested with a connected OSSM; see the [guide](docs/GUIDE.md) for the
+measured rail check and drive compatibility details.
 
 ## Optional Python bridge
 

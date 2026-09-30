@@ -155,6 +155,64 @@ test("response timeout permits one later clear and inhibit, without automatic re
   await connection.close();
 });
 
+test("wrong-function reply is discarded through its deadline before independent inhibit", async () => {
+  const oldAck = ack(configRequest(0, 0));
+  let tailSent = false;
+  const port = new FakePort((tx, port) => {
+    if (port.writes.length === 1) {
+      port.emit(oldAck.slice(0, 3));
+      setTimeout(() => { tailSent = true; port.emit(oldAck.slice(3)); }, 25);
+    } else {
+      assert.equal(tailSent, true, "cleanup must not race the delayed reply tail");
+      port.emit(tx[1] === 3 ? snapshot() : ack(tx));
+    }
+  });
+  const connection = new WebSerialConnection(port); await connection.open();
+  await assert.rejects(connection.exchange(outputRequest("clear"), .05), /Response function mismatch/);
+  await connection.exchange(outputRequest("inhibit"));
+  assert.deepEqual(await connection.exchange(snapshotRequest()), snapshot());
+  assert.deepEqual(port.writes.map(tx => [tx[1], tx[3]]), [[16, 12], [6, 1], [3, 0]]);
+  assert.equal(connection.poisoned, false);
+  await connection.close();
+});
+
+test("timed-out reply fragments arriving during recovery do not corrupt cleanup", async () => {
+  const response = snapshot();
+  const port = new FakePort((tx, port) => {
+    if (port.writes.length === 1) {
+      port.emit(response.slice(0, 3));
+      setTimeout(() => port.emit(response.slice(3, 25)), 20);
+      setTimeout(() => port.emit(response.slice(25)), 26);
+    } else port.emit(ack(tx));
+  });
+  const connection = new WebSerialConnection(port); await connection.open();
+  await assert.rejects(connection.exchange(snapshotRequest(), .015), /Response timeout/);
+  await connection.exchange(outputRequest("inhibit"));
+  assert.deepEqual(port.writes.map(tx => [tx[1], tx[3]]), [[3, 0], [6, 1]]);
+  assert.equal(connection._buffer.length, 0);
+  await connection.close();
+});
+
+test("continuous response noise bounds recovery and prevents another write", async () => {
+  let noise;
+  const port = new FakePort((_, port) => {
+    port.emit([1, 6, 0]);
+    noise = setInterval(() => port.emit([99]), 2);
+  });
+  const connection = new WebSerialConnection(port); await connection.open();
+  try {
+    await assert.rejects(connection.exchange(snapshotRequest(), .015), /Response function mismatch/);
+    const start = performance.now();
+    await assert.rejects(connection.exchange(outputRequest("inhibit")), /did not become quiet.*no new request/);
+    assert.ok(performance.now() - start < 500, "resynchronization must be bounded");
+    assert.equal(port.writes.length, 1);
+    assert.equal(connection.poisoned, false);
+  } finally {
+    clearInterval(noise);
+    await connection.close();
+  }
+});
+
 test("read and write share the same response deadline", async () => {
   const port = new FakePort(async (tx, port) => {
     await sleep(45);

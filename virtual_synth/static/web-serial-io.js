@@ -116,6 +116,8 @@
       this._opened = this._opening = this._closing = false;
       this._reader = this._writer = null;
       this._buffer = [];
+      this._resyncAfter = null;
+      this._lastReceiveAt = null;
       this._receiveError = null;
       this._wake = null;
       this._queue = Promise.resolve();
@@ -147,7 +149,10 @@
             if (!this._closing) throw new TransportError("Serial input closed.");
             break;
           }
-          if (value) this._buffer.push(...bytes(value));
+          if (value && value.length) {
+            this._buffer.push(...bytes(value));
+            this._lastReceiveAt = now();
+          }
           if (this._buffer.length > 256) throw new TransportError("Unexpected serial input exceeded the response buffer.");
           this._wake?.();
         }
@@ -170,6 +175,31 @@
       if (now() >= deadline) throw new TransportError("Response timeout; no retry was sent.");
       return Uint8Array.from(this._buffer.splice(0, count));
     }
+    async _resync() {
+      if (this._resyncAfter === null) return;
+      // A rejected header or a timeout can leave a partial reply in flight.
+      // Discard that reply through its original response window, then require
+      // silence before allowing an independent cleanup request onto the wire.
+      const notBefore = this._resyncAfter;
+      const deadline = Math.max(now(), notBefore) + 250;
+      let quietSince = Math.max(now(), notBefore);
+      while (true) {
+        this._requireOpen();
+        if (this._receiveError) throw this._receiveError;
+        this._buffer.length = 0;
+        quietSince = Math.max(quietSince, this._lastReceiveAt ?? quietSince);
+        const time = now();
+        if (time >= notBefore && time - quietSince >= 10) {
+          this._resyncAfter = null;
+          return;
+        }
+        if (time >= deadline) throw new TransportError("Serial input did not become quiet after a response error; no new request was sent.");
+        const wakeAt = Math.min(deadline, Math.max(notBefore, quietSince + 10));
+        // A timed poll also handles a quiet receive stream without installing
+        // another read or changing the sole reader pump's ownership.
+        await delay(Math.max(1, Math.min(10, wakeAt - time)));
+      }
+    }
     async exchange(value, timeoutSeconds = 0.15) {
       const tx = validateRequest(value);
       if (!Number.isFinite(timeoutSeconds) || timeoutSeconds <= 0 || timeoutSeconds > 10) throw new TransportError("Invalid exchange timeout.");
@@ -183,6 +213,7 @@
     async _exchange(tx, timeoutSeconds) {
       this._requireOpen();
       await delay(5); // Fixed RTU inter-frame gap, as in the Python transport.
+      await this._resync();
       this._requireOpen();
       const deadline = now() + timeoutSeconds * 1000;
       let writeSettled = false;
@@ -202,18 +233,23 @@
         }
         throw error instanceof TransportError ? error : new TransportError(`Serial write failed: ${error.message || error}`);
       } finally { if (writeSettled) this._writePromise = null; }
-      const head = await this._readExactly(3, deadline);
-      let length;
-      if (head[0] !== tx[0]) throw new TransportError("Response slave mismatch.");
-      if (head[1] === (tx[1] | 0x80)) length = 5;
-      else if (head[1] !== tx[1]) throw new TransportError("Response function mismatch.");
-      else if (tx[1] === 3) {
-        if (head[2] !== 52) throw new TransportError("Snapshot byte count mismatch.");
-        length = 57;
-      } else length = 8;
-      const tail = await this._readExactly(length - 3, deadline);
-      if (this._buffer.length) throw new TransportError("Unexpected trailing response bytes.");
-      return validateResponse(tx, Uint8Array.from([...head, ...tail]));
+      try {
+        const head = await this._readExactly(3, deadline);
+        let length;
+        if (head[0] !== tx[0]) throw new TransportError("Response slave mismatch.");
+        if (head[1] === (tx[1] | 0x80)) length = 5;
+        else if (head[1] !== tx[1]) throw new TransportError("Response function mismatch.");
+        else if (tx[1] === 3) {
+          if (head[2] !== 52) throw new TransportError("Snapshot byte count mismatch.");
+          length = 57;
+        } else length = 8;
+        const tail = await this._readExactly(length - 3, deadline);
+        if (this._buffer.length) throw new TransportError("Unexpected trailing response bytes.");
+        return validateResponse(tx, Uint8Array.from([...head, ...tail]));
+      } catch (error) {
+        this._resyncAfter = deadline;
+        throw error;
+      }
     }
     async close() {
       if (this._closePromise) return this._closePromise;

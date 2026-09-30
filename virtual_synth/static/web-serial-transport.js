@@ -20,9 +20,12 @@
   const CONFIG = [0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 20, 21, 24, 25];
   const HOME_SEEK_SECONDS = 30, HOME_TOTAL_SECONDS = 360, COUNTS_PER_MM = 32768 / 40;
   const HOME_SEARCH_COUNTS = 409600, HOME_MIN_SPAN = 16384, HOME_INSET = 1638;
-  const HOME_RETOUCH_OVERTRAVEL = 819, HOME_FIRST_SEARCH = 8192;
+  const HOME_RETOUCH_OVERTRAVEL = 819;
   const HOME_COUNTS_PER_SECOND = 32768 * 7 / 60;
   const CONTACT_PWM = 1966, CONTACT_ERROR = 512, CONTACT_SECONDS = .5, CONTACT_REPEAT_TOLERANCE = 128;
+  const CONTACT_RELEASE_TOLERANCE = 512;
+  const PARK_STOP_TOLERANCE = 128, STOP_PENDING_TOLERANCE = 2;
+  const OUTPUT_STATUSES = [0, 1, 2, 3, 6, 7, 10, 11, 14, 15];
   const clock = () => performance.now() / 1000;
   const wait = seconds => new Promise(resolve => setTimeout(resolve, seconds * 1000));
   const spread = values => Math.max(...values) - Math.min(...values);
@@ -70,7 +73,7 @@
         home_origin_raw: this._home_origin, measured_endpoints_raw: this._measured_endpoints?.slice() ?? null,
         measured_travel_raw: this._measured_travel, nominal_counts_per_mm: COUNTS_PER_MM,
         position_raw: position, pending_raw: v ? io.pending(v) : null, output_raw: output,
-        output_enabled: [0, 1].includes(output) ? Boolean(output) : null,
+        output_enabled: v && ((v[0] === 1 && [0, 1].includes(output)) || (v[0] === 0 && [0, 2, 3, 6, 7, 10, 11, 14, 15].includes(output))) ? Boolean(output & 1) : null,
         alarm: v?.[14] ?? null, mode: v?.[0] ?? null, speed_rpm: v?.[2] ?? null,
         acceleration_rpm_s: v?.[3] ?? null, current_raw: v?.[15] ?? null,
         output_limit_stall_raw: v?.[24] ?? null, pwm_raw: v?.[19] ?? null,
@@ -104,20 +107,22 @@
           let position;
           if (this._origin === null) { this._configuration(this._values, false, this._baseline); position = io.signedPosition(this._values); }
           else position = this._check_active(this._values, false);
-          if (io.pending(this._values) !== 0 || this._values[19] !== 0 || Math.abs(position - this._stop_position) > 4) throw new TransportError("Fresh readback contradicts the confirmed stationary stop");
+          if (!this._inhibited_feedback(this._values) || Math.abs(position - this._stop_position) > 4) throw new TransportError("Fresh readback contradicts the confirmed stationary stop");
         }
         return this._values;
       } catch (error) { this._stop_confirmed = false; throw error; }
     }
     async _write(operation, budget = null) {
       if (!["clear", "enable", "inhibit"].includes(operation)) throw new TransportError("Unsupported transport operation");
-      const previous = this._values?.[1] ?? 0, tx = io.outputRequest(operation);
+      const tx = io.outputRequest(operation);
       const rx = await this._exchange(tx, budget ?? this._budget());
       if (tx[1] === 16) { if (!equalPrefix(rx, tx, 6)) throw new TransportError("Clear acknowledgement address/count mismatch"); }
       else {
         if (!equalPrefix(rx, tx, 4)) throw new TransportError("Output acknowledgement address mismatch");
         const echoed = (rx[4] << 8) | rx[5];
-        if (echoed !== Number(operation === "enable") && ((echoed ^ previous) & ~5)) throw new TransportError("Output acknowledgement status/value mismatch");
+        // Firmware can finish native Home between the preceding snapshot and
+        // this acknowledgement. Readback, not a stale mode word, proves output.
+        if (!(this._homing ? OUTPUT_STATUSES : [0, 1]).includes(echoed)) throw new TransportError("Output acknowledgement status/value mismatch");
       }
     }
     async _absolute(target, budget = IO_TIMEOUT) {
@@ -174,7 +179,7 @@
         for (let i = 0; i < 3; i++) {
           if (i) await this._wait(.1);
           const v = await this._read(IO_TIMEOUT); this._configuration(v, false, baseline);
-          if (io.pending(v) !== 0 || v[19] !== 0) throw new TransportError("Arming requires zero pending motion and zero output PWM");
+          if (!this._inhibited_feedback(v)) throw new TransportError("Arming requires stationary inhibited feedback with at most two counts of encoder noise");
           baseline ||= v.slice(); positions.push(io.signedPosition(v));
         }
         if (spread(positions) > 4) throw new TransportError("Encoder was not stable across three fresh arming reads");
@@ -194,7 +199,7 @@
       const positions = [];
       for (let i = 0; i < 3; i++) {
         await this._wait(.1); const v = await this._read(); positions.push(this._check_active(v, enabled, true));
-        if (io.pending(v) !== 0 || (!enabled && v[19] !== 0)) throw new TransportError("Pending motion or output PWM present during hold verification");
+        if (Math.abs(io.pending(v)) > (enabled ? 16 : STOP_PENDING_TOLERANCE) || Math.abs(this._signed_speed(v)) > 1 || (!enabled && v[19] !== 0)) throw new TransportError("Pending motion, speed or output PWM exceeded hold verification limits");
       }
       if (spread(positions) > 4) throw new TransportError("Encoder was not stable during hold verification");
     }
@@ -203,7 +208,7 @@
       if (!this.allow_motion || !this._armed || this._running) throw new TransportError("An explicitly armed, stopped transport is required");
       try {
         const v = await this._read(IO_TIMEOUT); this._check_active(v, false, true);
-        if (io.pending(v) !== 0 || v[19] !== 0) throw new TransportError("Motor is no longer stationary and inhibited");
+        if (!this._inhibited_feedback(v)) throw new TransportError("Motor is no longer stationary and inhibited");
         this._owned = true; await this._write("clear"); await this._stable_hold(false);
         this._enabled_at = this._clock(); await this._write("enable"); await this._stable_hold(true); this._running = true;
       } catch (error) { await this._fault_and_cleanup(error); }
@@ -236,26 +241,58 @@
       if (!equalPrefix(rx, tx, 6)) throw new TransportError("Homing setting acknowledgement mismatch; no retry");
       this._home_expected[register] = value;
     }
+    _native_reset(v) {
+      return v[0] === 0 && [10, 11, 14, 15].includes(v[1]) && v[10] === 32768 && v[25] === 1;
+    }
     async _home_read(enabled = null, native = false) {
       const v = await this._read(IO_TIMEOUT);
-      if (v[14] !== 0 || v[20] !== 0 || v[21] !== 1 || v[10] !== 0) throw new TransportError("Native homing requires alarm0, save0, address1 and gear0");
+      if (v[14] !== 0 || v[20] !== 0 || v[21] !== 1 || !(native ? [0, 32768] : [0]).includes(v[10])) throw new TransportError("Native homing requires alarm0, save0, address1 and a recognized gear state");
       let indices = CONFIG;
       if (native) {
-        if (![0, 1].includes(v[0]) || ![0, 1].includes(v[25]) || ![0, 1, 2, 3, 6, 7].includes(v[1])) throw new TransportError("Unexpected drive state during native homing");
-        indices = [4, 5, 6, 7, 8, 9, 10, 11, 20, 21];
+        // Register snapshots can straddle the firmware's mode/gear restoration.
+        // Accept only known transition values, then require stable completion.
+        if (![0, 1].includes(v[0]) || ![0, 1].includes(v[25]) || !OUTPUT_STATUSES.includes(v[1])) throw new TransportError("Unexpected drive state during native homing");
+        if (![89, this._home_reference[24]].includes(v[24])) throw new TransportError("Native completion restored an unexpected output limit");
+        if (![80, 1500].includes(v[2]) || ![15, 50000].includes(v[3])) throw new TransportError("Unexpected native completion speed or acceleration configuration");
+        indices = [4, 5, 6, 7, 8, 9, 11, 20, 21];
       } else if (enabled !== null && v[1] !== Number(enabled)) throw new TransportError("Unexpected output state during native homing");
       if (indices.some(i => v[i] !== this._home_expected[i])) throw new TransportError("Unexpected configuration change during native homing");
       return v;
     }
     _home_stationary(v, pendingTolerance = 0, disabled = false) {
-      if (Math.abs(io.pending(v)) > pendingTolerance || (disabled && v[19] !== 0)) { this._home_samples = []; return false; }
+      if (Math.abs(io.pending(v)) > pendingTolerance || Math.abs(this._signed_speed(v)) > 1 || (disabled && v[19] !== 0)) { this._home_samples = []; return false; }
       const now = this._clock();
       if (this._home_samples.length && now - this._home_samples.at(-1)[0] < .075) return false;
       this._home_samples.push([now, io.signedPosition(v)]); this._home_samples = this._home_samples.slice(-3);
       return this._home_samples.length === 3 && spread(this._home_samples.map(s => s[1])) <= 4;
     }
+    _validate_home_start(v) {
+      const known = (v[0] === 0 && [0, 2, 3, 6, 7, 10, 11, 14, 15].includes(v[1])) || (v[0] === 1 && [0, 1].includes(v[1]));
+      if (!known) throw new TransportError(`Home does not recognize drive mode ${v[0]} / output status ${v[1]}`);
+      for (const [register, expected, label] of [[14, 0, "alarm"], [20, 0, "save"], [21, 1, "address"], [25, 0, "special function"]]) {
+        if (v[register] !== expected) throw new TransportError(`Home requires ${label} ${expected}; drive reports ${v[register]}`);
+      }
+      if (v[24] > 609) throw new TransportError(`Home does not recognize output/stall setting ${v[24]}`);
+      if (!this._stationary_speed(v)) throw new TransportError(`Home requires a stationary motor; actual speed is ${this._signed_speed(v)}`);
+      if (Math.abs(io.pending(v)) > 16) throw new TransportError(`Home requires at most 16 counts of holding error; drive reports ${io.pending(v)}`);
+    }
+    async _home_startup_read(afterMode = false) {
+      const v = await this._read(IO_TIMEOUT);
+      this._validate_home_start(v);
+      // Mode selection can reset the speed, acceleration and output limit.
+      // These settings are reapplied while inhibited before Home enables output.
+      const indices = afterMode ? CONFIG.filter(i => ![2, 3, 24].includes(i)) : CONFIG;
+      if (indices.some(i => v[i] !== this._home_expected[i])) throw new TransportError("Unexpected configuration change during Home preparation");
+      if (Math.abs(io.signedPosition(v) - this._home_initial) > 4) throw new TransportError("Encoder moved during homing preflight");
+      if (afterMode) {
+        if (v[0] !== 1 || v[1] !== 0) throw new TransportError(`Home could not inhibit Modbus output; mode ${v[0]}, output ${v[1]}`);
+        if (v[19] !== 0) throw new TransportError(`Home takeover did not settle; pending ${io.pending(v)}, PWM ${this._signed_pwm(v)}`);
+        for (const i of [2, 3, 24]) this._home_expected[i] = v[i];
+      } else if (v[1] !== this._home_reference[1]) throw new TransportError("Output status changed during homing preflight");
+      return v;
+    }
     _prepare_home() {
-      this._home_queue([["clearing", "clear", 0], ["setting_home_speed", 2, 80],
+      this._home_queue([["setting_home_gear", 10, 0], ["clearing", "clear", 0], ["setting_home_speed", 2, 80],
         ["setting_home_acceleration", 3, 15], ["setting_home_output", 24, 89],
         ["setting_home_direction", 9, Number(this._home_direction === "reverse")]], "verify_preparation", .1);
     }
@@ -265,14 +302,22 @@
       if (target === 0) throw new TransportError("Absolute zero cannot be sent to this drive");
       return target;
     }
+    _signed_speed(v) { return v[16] & 32768 ? v[16] - 65536 : v[16]; }
+    // Register16 is signed tenths of an RPM. Observed inhibited readback
+    // jitters by one unit; encoder samples still independently prove stasis.
+    _stationary_speed(v) { return Math.abs(this._signed_speed(v)) <= 1; }
+    _inhibited_feedback(v) {
+      return v[0] === 1 && v[1] === 0 && Math.abs(io.pending(v)) <= STOP_PENDING_TOLERANCE && v[19] === 0 && this._stationary_speed(v);
+    }
     _signed_pwm(v) { return v[19] & 32768 ? v[19] - 65536 : v[19]; }
+    _home_inward() { return this._home_direction === "reverse" ? 1 : -1; }
     _begin_home_move(phase, target, position, enable = false) {
       target = this._nonzero_target(target, -(2 ** 31), 2 ** 31 - 1);
       this._home_move_phase = phase; this._home_move_from = position; this._home_move_target = target;
       this._home_motion_timeout = Math.abs(target - position) / HOME_COUNTS_PER_SECOND + 7 / 15 + 5;
       const progress = { first_contact: .63, first_retreat: .67, first_retouch: .7,
         second_contact: .73, second_retreat: .8, second_retouch: .84, centering: .88 }[phase];
-      if (enable) { this._home_hold_position = position; this._home_queue([["enabling_probe", "enable", 1]], "move_hold", progress); }
+      if (enable) { this._home_hold_position = position; this._home_queue([["clearing_probe_hold", "clear", 0], ["enabling_probe", "enable", 1]], "move_hold", progress); }
       else this._home_stage("commanding_" + phase, progress);
     }
     _contact_detected(v) {
@@ -298,7 +343,7 @@
       this._home_queue([["clearing_contact", "clear", 0], ["inhibiting_contact", "inhibit", 0]], "verify_contact_stop", this._home_progress);
     }
     _after_contact_stop(position) {
-      const phase = this._home_contact_phase, inward = this._home_direction === "reverse" ? 1 : -1;
+      const phase = this._home_contact_phase, inward = this._home_inward();
       if (["first_contact", "second_contact"].includes(phase)) {
         const direction = phase === "first_contact" ? inward : -inward;
         this._begin_home_move(phase.replace("contact", "retreat"), this._home_contact_position + direction * HOME_INSET, position, true);
@@ -319,8 +364,8 @@
       if (this._armed || this._running || this._owned || this._homing) throw new TransportError("Stop and disarm before homing");
       this._stop_confirmed = this._homed = false;
       try {
-        const v = await this._read(IO_TIMEOUT), disabled = (v[0] === 1 && v[1] === 0) || (v[0] === 0 && [0, 2, 6].includes(v[1]));
-        if (!disabled || v[10] !== 0 || v[14] !== 0 || v[20] !== 0 || v[21] !== 1 || v[25] !== 0 || v[24] < 0 || v[24] > 609 || io.pending(v) !== 0 || v[19] !== 0) throw new TransportError("Home requires known disabled mode0/1, gear0, alarm/save/special0, address1, zero pending/PWM");
+        const v = await this._read(IO_TIMEOUT);
+        this._validate_home_start(v);
         this._home_reference = v.slice(); this._home_expected = v.slice(); this._home_initial = io.signedPosition(v);
         this._home_park = null; this._home_direction = reverse ? "reverse" : "normal"; this._home_origin = null;
         this._home_activity = false; this._home_actions = []; this._home_candidates = {}; this._home_contacts = {};
@@ -344,28 +389,34 @@
           return this.status();
         }
         if (phase === "preflight") {
-          const v = await this._home_read();
-          if (!((v[0] === 1 && v[1] === 0) || (v[0] === 0 && [0, 2, 6].includes(v[1])))) throw new TransportError("Output became enabled during homing preflight");
-          if (Math.abs(io.signedPosition(v) - this._home_initial) > 4) throw new TransportError("Encoder moved during homing preflight");
-          if (this._home_stationary(v, 0, true)) { if (v[0] === 0) this._home_stage("selecting_modbus", .05); else this._prepare_home(); }
+          const v = await this._home_startup_read();
+          // Tiny servo holding corrections are normal before explicit takeover.
+          // Actual speed and three encoder samples establish stationarity here.
+          if (this._home_stationary(v, 16)) {
+            if (v[0] === 0) this._home_stage("selecting_modbus", .05);
+            else this._home_queue([["inhibiting_before_home", "inhibit", 0]], "preparation_mode_settle", .05);
+          }
         } else if (phase === "selecting_modbus") {
           try { await this._write_home_setting(0, 1); } finally { await this._write("inhibit", IO_TIMEOUT); }
           this._home_stage("preparation_mode_settle", .05);
         } else if (phase === "preparation_mode_settle") {
-          if (now - this._home_phase_started >= .8) this._prepare_home();
+          if (now - this._home_phase_started >= .8) {
+            const v = await this._home_startup_read(true);
+            if (this._home_stationary(v, 16, true)) this._prepare_home();
+          }
         } else if (phase === "verify_preparation") {
           const v = await this._home_read(false);
-          if (io.pending(v) !== 0 || v[19] !== 0 || Math.abs(io.signedPosition(v) - this._home_initial) > 4) throw new TransportError("Homing preparation did not remain stationary and inhibited");
-          this._home_queue([["enabling_home", "enable", 1]], "enabled_hold", .2);
+          if (!this._inhibited_feedback(v) || Math.abs(io.signedPosition(v) - this._home_initial) > 4) throw new TransportError("Homing preparation did not remain stationary and inhibited");
+          if (this._home_stationary(v, STOP_PENDING_TOLERANCE, true)) this._home_queue([["enabling_home", "enable", 1]], "enabled_hold", .2);
         } else if (phase === "enabled_hold") {
           const v = await this._home_read(true);
           if (Math.abs(io.signedPosition(v) - this._home_initial) > 16) throw new TransportError("Encoder drifted before native homing trigger");
-          if (this._home_stationary(v)) this._home_queue([["triggering_home", 25, 1]], "seeking", .3);
+          if (this._home_stationary(v, 16)) this._home_queue([["triggering_home", 25, 1]], "seeking", .3);
         } else if (phase === "seeking") {
           const v = await this._home_read(null, true), position = io.signedPosition(v);
           this._home_activity ||= Math.abs(position - this._home_initial) > 16 || Math.abs(io.pending(v)) >= 15;
           this._home_progress = Math.min(.55, .3 + .25 * (now - this._home_phase_started) / HOME_SEEK_SECONDS);
-          if (!this._home_activity || Math.abs(position) > 16) this._home_samples = [];
+          if (!this._home_activity || (!this._native_reset(v) && (v[10] !== 0 || Math.abs(position) > 128)) || !this._stationary_speed(v)) this._home_samples = [];
           else if (this._home_stationary(v, 14)) {
             this._home_origin = position;
             this._home_queue([["inhibiting_after_home", "inhibit", 0], ["restoring_modbus", 0, 1], ["inhibiting_after_mode", "inhibit", 0]], "mode_settle", .6);
@@ -374,12 +425,14 @@
           if (now - this._home_phase_started >= .8) this._home_queue([["restoring_position_mode", 25, 0], ["restoring_speed", 2, 7], ["restoring_acceleration", 3, 15], ["restoring_gear", 10, 0], ["limiting_park_output", 24, 89], ["clearing_before_park", "clear", 0]], "verify_restore", .65);
         } else if (phase === "verify_restore") {
           const v = await this._home_read(false), position = io.signedPosition(v);
-          if (Math.abs(position) > 32 || io.pending(v) !== 0 || v[19] !== 0) throw new TransportError("Home restoration did not remain stationary at the origin");
-          this._begin_home_move("first_contact", (this._home_direction === "reverse" ? -1 : 1) * HOME_FIRST_SEARCH, position, true);
+          if (Math.abs(position - this._home_origin) > 32 || !this._inhibited_feedback(v)) throw new TransportError("Home restoration did not remain stationary at the captured origin");
+          // Native home establishes a coordinate, not a measured distance to
+          // the rail end. Probe from that coordinate within the same 500mm cap.
+          this._begin_home_move("first_contact", position - this._home_inward() * HOME_SEARCH_COUNTS, position, true);
         } else if (phase === "move_hold") {
           const v = await this._home_read(true);
           if (Math.abs(io.signedPosition(v) - this._home_hold_position) > 16) throw new TransportError("Encoder drifted before calibration move");
-          if (this._home_stationary(v)) this._home_stage("commanding_" + this._home_move_phase, this._home_progress);
+          if (this._home_stationary(v, 16)) this._home_stage("commanding_" + this._home_move_phase, this._home_progress);
         } else if (phase === "commanding_" + this._home_move_phase) {
           await this._absolute(this._home_move_target); this._target = this._home_move_target;
           this._home_stage(this._home_move_phase, this._home_progress);
@@ -396,22 +449,24 @@
             else if (this._home_stationary(v, 16)) {
               if (phase === "centering") this._home_queue([["clearing_center", "clear", 0], ["inhibiting_center", "inhibit", 0]], "verify_stop", .94);
               else {
-                const side = phase === "first_retreat" ? "first" : "second", inward = this._home_direction === "reverse" ? 1 : -1;
+                const side = phase === "first_retreat" ? "first" : "second", inward = this._home_inward();
                 this._begin_home_move(side + "_retouch", this._home_candidates[side] - (side === "first" ? inward : -inward) * HOME_RETOUCH_OVERTRAVEL, position);
               }
             }
           }
         } else if (phase === "verify_contact_stop") {
           const v = await this._home_read(false), position = io.signedPosition(v);
-          if (Math.abs(position - this._home_contact_position) > CONTACT_REPEAT_TOLERANCE) throw new TransportError("Encoder moved after contact inhibition");
-          if (this._home_stationary(v, 0, true)) this._after_contact_stop(position);
+          const inward = this._home_contact_phase.startsWith("first") ? this._home_inward() : -this._home_inward();
+          const release = (position - this._home_contact_position) * inward;
+          if (release < -CONTACT_REPEAT_TOLERANCE || release > CONTACT_RELEASE_TOLERANCE) throw new TransportError("Encoder moved beyond the contact release allowance after inhibition");
+          if (this._home_stationary(v, STOP_PENDING_TOLERANCE, true)) this._after_contact_stop(position);
         } else if (phase === "verify_stop") {
           const v = await this._home_read(false);
-          if (Math.abs(io.signedPosition(v) - this._home_park) > 16) throw new TransportError("Encoder drifted after centering");
-          if (this._home_stationary(v, 0, true)) this._home_queue([["restoring_output", 24, this._home_reference[24]]], "verify_complete", .95);
+          if (Math.abs(io.signedPosition(v) - this._home_park) > PARK_STOP_TOLERANCE) throw new TransportError("Encoder drifted after centering");
+          if (this._home_stationary(v, STOP_PENDING_TOLERANCE, true)) this._home_queue([["restoring_output", 24, this._home_reference[24]]], "verify_complete", .95);
         } else if (phase === "verify_complete") {
           const v = await this._home_read(false), position = io.signedPosition(v);
-          if (Math.abs(position - this._home_park) > 16 || io.pending(v) !== 0 || v[19] !== 0) throw new TransportError("Final homing stop was not confirmed");
+          if (Math.abs(position - this._home_park) > PARK_STOP_TOLERANCE || !this._inhibited_feedback(v)) throw new TransportError("Final homing stop was not confirmed");
           this._baseline = v.slice(); this._origin = this._home_park; [this._low, this._high] = this._proposed_bounds;
           this._measured_endpoints = this._proposed_endpoints.slice(); this._measured_travel = this._measured_endpoints[1] - this._measured_endpoints[0];
           this._hold_position = this._stop_position = position; this._stop_confirmed = this._homed = true;
@@ -425,26 +480,35 @@
       if (this._cleanup_attempted) { this._homing = false; return; }
       this._cleanup_attempted = true; this._stop_confirmed = false;
       const errors = [];
-      for (const operation of ["inhibit", "mode_off", "clear"]) {
-        try { if (operation === "mode_off") await this._write_home_setting(0, 0); else await this._write(operation, IO_TIMEOUT); }
+      for (const operation of ["inhibit", "mode_off", "special_off"]) {
+        try {
+          if (operation === "mode_off") await this._write_home_setting(0, 0);
+          else if (operation === "special_off") await this._write_home_setting(25, 0);
+          else await this._write(operation, IO_TIMEOUT);
+        }
         catch (error) { errors.push(`${operation}: ${error.message || error}`); }
       }
       try {
         let positions = [], v;
         for (let i = 0; i < 3; i++) {
           if (i) await this._wait(.1); v = await this._read(IO_TIMEOUT);
-          if (![0, 1].includes(v[0]) || ![0, 2, 6].includes(v[1]) || io.pending(v) !== 0 || v[19] !== 0) throw new TransportError("Native cancellation did not inhibit output");
+          const disabled = (v[0] === 0 && [0, 2, 6, 10, 14].includes(v[1])) || (v[0] === 1 && v[1] === 0);
+          if (!disabled || v[25] !== 0 || !this._stationary_speed(v) || (v[0] === 1 && v[19] !== 0)) throw new TransportError("Native cancellation did not inhibit output");
           positions.push(io.signedPosition(v));
         }
         if (spread(positions) > 4) throw new TransportError("Native cancellation encoder did not settle");
         if (!errors.length) {
           try { await this._write_home_setting(0, 1); } finally { await this._write("inhibit", IO_TIMEOUT); }
           await this._wait(.8);
-          for (const [register, value] of [[25, 0], [2, 7], [3, 15], [10, 0], [24, this._home_reference[24]]]) await this._write_home_setting(register, value);
+          v = await this._read(IO_TIMEOUT);
+          if (v[0] !== 1 || v[1] !== 0 || !this._stationary_speed(v) || Math.abs(io.signedPosition(v) - positions.at(-1)) > 4) throw new TransportError("Native cancellation Modbus takeover was not stationary and inhibited");
+          await this._write_home_setting(10, 0);
+          await this._write("clear", IO_TIMEOUT);
+          for (const [register, value] of [[2, 7], [3, 15], [24, this._home_reference[24]]]) await this._write_home_setting(register, value);
           positions = [];
           for (let i = 0; i < 3; i++) {
             if (i) await this._wait(.1); v = await this._home_read(false);
-            if (io.pending(v) !== 0 || v[19] !== 0) throw new TransportError("Restored cancellation state is not stopped");
+            if (!this._inhibited_feedback(v)) throw new TransportError("Restored cancellation state is not stopped");
             positions.push(io.signedPosition(v));
           }
           if (spread(positions) > 4) throw new TransportError("Restored cancellation encoder did not settle");
@@ -468,12 +532,18 @@
           try { await this._write(operation, IO_TIMEOUT); } catch (error) { errors.push(operation + ": " + (error.message || error)); }
         }
         try {
-          for (let i = 0; i < 3; i++) {
-            if (i) await this._wait(.1);
-            const v = await this._read(IO_TIMEOUT); positions.push(this._check_active(v, false));
-            if (io.pending(v) !== 0 || v[19] !== 0) throw new TransportError("Stop readback has pending motion or nonzero output PWM");
+          const deadline = this._clock() + 1.5;
+          while (this._clock() < deadline) {
+            const v = await this._read(Math.min(IO_TIMEOUT, deadline - this._clock()));
+            const position = this._check_active(v, v[1] === 1);
+            if (this._inhibited_feedback(v)) {
+              positions.push(position);
+              if (positions.length > 3) positions.shift();
+              if (positions.length === 3 && spread(positions) <= 4) break;
+            } else positions.length = 0;
+            await this._wait(Math.min(.1, Math.max(0, deadline - this._clock())));
           }
-          if (spread(positions) > 4) throw new TransportError("Encoder did not settle after stop/inhibit");
+          if (positions.length !== 3 || spread(positions) > 4) throw new TransportError("Motor did not settle within 1.5 seconds after stop/inhibit");
         } catch (error) { errors.push("readback: " + (error.message || error)); }
         this._cleanup_errors = errors; this._enabled_at = null; this._stop_confirmed = !errors.length;
         this._stop_position = this._stop_confirmed ? positions.at(-1) : null;
