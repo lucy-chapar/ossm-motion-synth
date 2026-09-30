@@ -9,6 +9,8 @@ This is the standalone web synth spun out of
 interface, a standalone browser runtime and an optional local Python bridge.
 No Raspberry Pi, CV board or firmware flash is needed.
 
+![OSSM Motion Synth showing a waveform and virtual modulation cables](docs/images/motion-synth.png)
+
 ## Use it on the web
 
 Open [OSSM Motion Synth](https://lucychapar.com/ossm-motion-synth/) in desktop
