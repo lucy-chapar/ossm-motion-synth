@@ -32,6 +32,10 @@ def export(destination):
         "browser-engine.js", "web-serial-io.js", "web-serial-transport.js", "browser-runtime.js"))
     html = html.replace('  <script src="./app.js" defer></script>', runtime + '\n  <script src="./app.js" defer></script>')
     html = html.replace("Connecting to local app", "Starting browser synth")
+    # A new export must not reuse a visitor's cached scripts or styles.
+    for name in ASSETS:
+        version = hashlib.sha256((source / name).read_bytes()).hexdigest()[:12]
+        html = html.replace(f'"./{name}"', f'"./{name}?v={version}"')
     (destination / "index.html").write_text(html)
     for name in ASSETS:
         shutil.copyfile(source / name, destination / name)
