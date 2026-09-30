@@ -2,10 +2,14 @@
 
 The [website edition](https://lucychapar.com/ossm-motion-synth/) runs the engine,
 audio and USB–RS485 control directly in the browser using Web Serial. In desktop
-Chrome or Edge, expand **Motor connection**, click **Choose adapter**, then
-**Connect**. The browser asks which serial device this website may access.
+Chrome or Edge, expand **Motor connection** and click **Connect**. The browser
+asks you to choose your USB–RS485 adapter, then connects to it.
 No adapter opens automatically. The controls and homing sequence below are
 shared with the optional Python edition.
+
+**Wiring:** With power off, disconnect the 4-pin signal cable that runs to the
+OSSM motherboard. This setup only needs 24 V power and USB–RS485 wired directly
+to the motor.
 
 For the Python edition:
 

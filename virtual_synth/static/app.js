@@ -23,6 +23,7 @@
   let pollBusy = false, heartbeatBusy = false, rendering = false, noticeTimer = null;
   let scopeWidth = 0, scopeHeight = 0, pixelRatio = 1;
   let lastSuccessfulRequest = 0, lastStateReceipt = 0, motionEpoch = 0;
+  let connecting = false;
   const canvas = $("scope"), ctx = canvas.getContext("2d");
   const paramInputs = Array.from(document.querySelectorAll("[data-param]"));
   const audioPreview = (() => {
@@ -293,10 +294,13 @@
 
   function renderHardware() {
     const connected = isHardware(), hardware = state.hardware || {};
-    $("connect-button").disabled = !online || isHoming() || connected || !$("port-select").value || Boolean(state.armed || state.running);
+    const canSelectPort = browserRuntime ? browserRuntime.supported : Boolean($("port-select").value);
+    $("connect-button").disabled = !online || connecting || isHoming() || connected || !canSelectPort || Boolean(state.armed || state.running || state.stopping);
+    $("connect-button").textContent = connecting ? "Connecting…" : "Connect";
+    $("connect-button").setAttribute("aria-busy", String(connecting));
     $("disconnect-button").disabled = !online || !connected || isHoming();
-    $("port-select").disabled = connected || Boolean(state.armed || state.running);
-    if (browserRuntime) $("refresh-ports").disabled = !browserRuntime.supported || connected || Boolean(state.armed || state.running);
+    $("port-select").disabled = connecting || connected || Boolean(state.armed || state.running);
+    if (browserRuntime) $("refresh-ports").disabled = !browserRuntime.supported || connecting || connected || Boolean(state.armed || state.running || state.stopping);
     $("hardware-metrics").hidden = !connected;
     $("hardware-status").textContent = connected ? `${hardware.port ? `Connected: ${hardware.port}` : hardware.device ? `Connected: ${hardware.device}` : "Connected to motor interface."}${hardware.notice ? ` ${hardware.notice}` : ""}` : "No motor connected.";
     $("encoder-raw").textContent = Number.isFinite(hardware.position_raw) ? `${hardware.position_raw} counts` : "No feedback";
@@ -312,7 +316,7 @@
     $("hardware-boundary").classList.toggle("motion-enabled", Boolean(state.allow_motion));
     if (browserRuntime) {
       $("hardware-boundary").textContent = browserRuntime.supported
-        ? "Choose your USB–RS485 adapter, then Connect → Home → Arm → Run. Everything runs in this browser; no local app needed."
+        ? "Connect → Home → Arm → Run. Connect lets you choose your USB–RS485 adapter. Everything runs in this browser."
         : "Direct USB connection needs desktop Chrome or Edge with Web Serial. Wave shaping and audio still work here.";
       if (!browserRuntime.supported) $("hardware-status").textContent = "Web Serial is unavailable in this browser.";
     }
@@ -572,9 +576,29 @@
     } catch (error) { if (error.name !== "NotFoundError") report(error.message, true); }
   });
   $("port-select").addEventListener("change", () => { if (state) renderHardware(); });
-  $("connect-button").addEventListener("click", () => {
-    const port = $("port-select").value;
-    if (port) action("connect", { port }).then(() => { $("hardware-details").open = true; }).catch(() => {});
+  $("connect-button").addEventListener("click", async () => {
+    if ($("connect-button").disabled || connecting) return;
+    const epoch = motionEpoch;
+    connecting = true;
+    renderHardware();
+    try {
+      let port = $("port-select").value;
+      if (!port && browserRuntime) {
+        // Keep the chooser in this click's user activation, before any other await.
+        port = await browserRuntime.choosePort();
+        if (epoch !== motionEpoch) return;
+        await refreshPorts();
+        $("port-select").value = port;
+      }
+      if (!port || epoch !== motionEpoch) return;
+      await action("connect", { port }, true);
+      $("hardware-details").open = true;
+    } catch (error) {
+      if (error.name !== "NotFoundError" && epoch === motionEpoch) report(error.message, true);
+    } finally {
+      connecting = false;
+      if (state) renderHardware();
+    }
   });
   $("disconnect-button").addEventListener("click", () => action("disconnect").catch(() => {}));
   $("hardware-details").addEventListener("toggle", () => { if ($("hardware-details").open) refreshPorts(); });
@@ -624,7 +648,7 @@
     $("refresh-ports").textContent = "Choose adapter";
     $("refresh-ports").dataset.tooltip = "Open the browser's serial-device chooser. Choosing an adapter grants this page access; Connect reads motor status without moving it.";
     $("port-select").dataset.tooltip = "Select an adapter you have allowed this website to access. Choose adapter opens the browser permission dialog.";
-    $("connect-button").dataset.tooltip = "Open the selected USB–RS485 adapter and read motor status at 19200 baud. Home and Run are separate actions.";
+    $("connect-button").dataset.tooltip = "Choose your USB–RS485 adapter and connect to the motor at 19200 baud. If an adapter is already selected, connect to it directly. Then Home → Arm → Run.";
     document.querySelector("#hardware-details .panel-description").textContent = "Connect directly to your USB–RS485 adapter through Web Serial.";
     document.querySelector("footer span").lastChild.textContent = "RUNS IN YOUR BROWSER · NO INSTALL REQUIRED";
   }

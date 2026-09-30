@@ -42,7 +42,7 @@
     "reset-button": "Clear a recoverable fault while stopped. This cannot clear an unconfirmed hardware stop or make the mechanism safe to touch.",
     "port-select": "Choose the identified USB–RS485 adapter for your motor. Selecting a port does not connect or start motion.",
     "refresh-ports": "Refresh the list of local serial adapters. This lists ports without opening them or sending motor commands.",
-    "connect-button": "Open the selected adapter for read-only motor feedback. Connecting does not move the motor. With motion access enabled, Home motor and Run are separate actions that move it.",
+    "connect-button": "Connect to the motor through the selected USB–RS485 adapter. Then Home → Arm → Run to start motion.",
     "disconnect-button": "Close the motor connection and return to simulation. This does not erase an unconfirmed stop; check the displayed status.",
     "audio-toggle": "Turn the browser sound preview on or off. Listening never arms or starts the motor.",
     "audio-mode": "Hear movement makes pitch rise and fall with position. Hear wave shape speeds the wave into a tone: sine is smooth, square and saw are buzzy. Only the sound preview changes.",

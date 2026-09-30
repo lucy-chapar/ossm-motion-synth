@@ -12,10 +12,13 @@ No Raspberry Pi, CV board or firmware flash is needed.
 ## Use it on the web
 
 Open [OSSM Motion Synth](https://lucychapar.com/ossm-motion-synth/) in desktop
-Chrome or Edge. In **Motor connection**, click **Choose adapter** to grant the
-page access to your USB–RS485 adapter, then **Connect → Home → Arm → Run**.
-Choosing the adapter does not open it; Connect reads status. Home measures both
-ends of the rail and parks at center. No Python app or installation is required.
+Chrome or Edge. In **Motor connection**, click **Connect** and choose your
+USB–RS485 adapter, then **Home → Arm → Run**. Home measures both ends of the rail
+and parks at center. No Python app or installation is required.
+
+**Wiring:** With power off, disconnect the 4-pin signal cable that runs to the
+OSSM motherboard. This setup only needs 24 V power and USB–RS485 wired directly
+to the motor.
 
 The synth also runs without an adapter: patch waves, watch the scope, and expand
 **Audio preview** at the bottom to hear them. Browsers without Web Serial can
