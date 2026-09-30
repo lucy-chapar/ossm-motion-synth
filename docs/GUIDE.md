@@ -162,14 +162,21 @@ acknowledgments are never automatically retried.
 The browser accepts at most two counts of disabled feedback quantization,
 with zero PWM and three stable encoder readings. A connected-motor check on
 2026-09-30 measured approximately 180 mm of travel and parked within 0.1 mm
-of the measured center with output inhibited.
+of the measured center with output inhibited. Two successive published-version
+Home checks agreed within one encoder count of travel (147216 and 147215
+counts). A slow sine run completed its timer without a fault; a separate
+manual Stop also confirmed disabled output and zero PWM. These checks cover
+one connected drive, not every motor or adapter.
 
 ## USB–RS485 connection
 
 The laptop connects to the existing motor through a **USB–RS485 adapter** and
 the separately powered motor drive. Select the exact device in the interface;
 the application never guesses a port or opens one on startup. Connect sends
-FC03 status reads only at the existing 19200 baud, 8N1, slave 1. It does not
+FC03 status reads only at the existing 19200 baud, 8N1, slave 1.
+It drains stale adapter input on opening and requires a quiet receive boundary
+between commands; response CRC errors still fail the transaction without a
+command retry. It does not
 change drive mode, baud, gearing, coordinates or saved configuration. An
 observed enabled drive is not silently taken over or stopped.
 
