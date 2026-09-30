@@ -23,7 +23,7 @@
   let pollBusy = false, heartbeatBusy = false, rendering = false, noticeTimer = null;
   let scopeWidth = 0, scopeHeight = 0, pixelRatio = 1;
   let lastSuccessfulRequest = 0, lastStateReceipt = 0, motionEpoch = 0;
-  let connecting = false;
+  let connecting = false, homeCancelledByTab = false;
   const canvas = $("scope"), ctx = canvas.getContext("2d");
   const paramInputs = Array.from(document.querySelectorAll("[data-param]"));
   const audioPreview = (() => {
@@ -132,6 +132,7 @@
     const run = async () => {
       try {
         if (["arm", "run", "home_start", "connect"].includes(name) && epoch !== motionEpoch) return;
+        if (name === "home_start") homeCancelledByTab = false;
         const result = await api("/api/action", { action: name, ...details });
         if (!acceptState(result)) await poll();
         if (["connect", "disconnect", "reset", "home_start"].includes(name) && state && !state.fault && !state.unconfirmed_stop) $("notice").hidden = true;
@@ -339,6 +340,8 @@
         : phase.includes("first_") ? "Finding first end"
         : phase === "seeking" ? "Finding reference" : "Preparing motor";
       $("transport-message").textContent = `${message} · Stop output to cancel`;
+    } else if (connected && state.homing?.phase === "cancelled" && homeCancelledByTab) {
+      $("transport-message").textContent = "Home cancelled because the tab was left · Keep this tab visible and press Home again";
     } else if (connected && state.homing?.valid && !state.running && !state.armed && !state.fault) {
       const distance = state.hardware.measured_travel_raw;
       const scale = state.hardware.nominal_counts_per_mm;
@@ -628,6 +631,7 @@
   });
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) {
+      homeCancelledByTab ||= isHoming();
       muteAudio("Audio muted · tab left");
       if (browserRuntime) { motionEpoch++; browserRuntime.stop().then(acceptState).catch(() => {}); }
     }
