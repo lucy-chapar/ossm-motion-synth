@@ -167,7 +167,9 @@ of the measured center with output inhibited. Two successive published-version
 Home checks agreed within one encoder count of travel (147216 and 147215
 counts). A slow sine run completed its timer without a fault; a separate
 manual Stop also confirmed disabled output and zero PWM. These checks cover
-one connected drive, not every motor or adapter.
+one connected drive, not every motor or adapter. The subsequent 35 RPM /
+75 RPM/s Home completed with 147220 counts of travel and a stopped position
+72 counts from center.
 
 ## USB–RS485 connection
 
