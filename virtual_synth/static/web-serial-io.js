@@ -136,6 +136,9 @@
         this._reader = this.port.readable.getReader();
         this._writer = this.port.writable.getWriter();
         this._pumpPromise = this._pump();
+        // USB adapters can retain bytes from an earlier port session.
+        this._resyncAfter = now() + 150;
+        await this._resync();
       } catch (error) {
         try { await this.close(); } catch (_) { /* The original opening failure remains visible. */ }
         throw error instanceof TransportError ? error : new TransportError(`Serial open failed: ${error.message || error}`);
@@ -212,7 +215,9 @@
     }
     async _exchange(tx, timeoutSeconds) {
       this._requireOpen();
-      await delay(5); // Fixed RTU inter-frame gap, as in the Python transport.
+      // Drain late, unsolicited bytes between complete transactions. Never
+      // discard or retry a response after this request has been written.
+      if (this._resyncAfter === null) this._resyncAfter = now();
       await this._resync();
       this._requireOpen();
       const deadline = now() + timeoutSeconds * 1000;

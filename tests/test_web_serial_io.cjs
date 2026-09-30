@@ -257,3 +257,16 @@ test("unsupported and malformed requests are rejected before any write", async (
   assert.equal(port.writes.length, 0);
   await connection.close();
 });
+
+ test("opening drains old adapter bytes and the next request drains late inter-frame noise", async () => {
+  const port = new FakePort();
+  port.emit([255, 1, 3]);
+  const connection = new WebSerialConnection(port);
+  await connection.open();
+  assert.equal(port.writes.length, 0);
+  await connection.exchange(snapshotRequest());
+  port.emit([255]);
+  await connection.exchange(snapshotRequest());
+  assert.equal(port.writes.length, 2);
+  await connection.close();
+});
