@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: MPL-2.0
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ossm-motion-synth"
+version = "0.1.0"
+description = "A patchable browser motion synth with a local USB-RS485 bridge for OSSM"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MPL-2.0"
+license-files = ["LICENSE", "NOTICE.md"]
+dependencies = ["pyserial>=3.5,<4"]
+
+[project.urls]
+Repository = "https://github.com/lucy-chapar/ossm-motion-synth"
+Issues = "https://github.com/lucy-chapar/ossm-motion-synth/issues"
+
+[project.scripts]
+ossm-motion-synth = "virtual_synth.server:main"
+
+[tool.setuptools.packages.find]
+include = ["virtual_synth*"]
+
+[tool.setuptools.package-data]
+virtual_synth = ["static/*.html", "static/*.css", "static/*.js"]

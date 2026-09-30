@@ -1,0 +1,8 @@
+#!/bin/sh
+# SPDX-License-Identifier: MPL-2.0
+set -eu
+cd "$(dirname "$0")"
+if [ -x .venv/bin/python ]; then
+    exec .venv/bin/python -m virtual_synth "$@"
+fi
+exec python3 -m virtual_synth "$@"
