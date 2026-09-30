@@ -7,7 +7,8 @@ This project was extracted from
 [lucy-chapar/OSSM-Synth](https://github.com/lucy-chapar/OSSM-Synth), retaining its
 browser synth, motion engine, laptop bridge and tests. The internal protocol
 helpers in `virtual_synth/protocol/` and offline fixtures are extracted from
-that project's MPL-2.0 motor tools. Bench command-line applications, Pi
+that project's MPL-2.0 motor tools. Browser engine and Web Serial modules are
+JavaScript ports of those Python implementations. Bench command-line applications, Pi
 services, hardware designs, CV firmware and commissioning records are excluded.
 
 The synth integrates with the

@@ -1,5 +1,14 @@
 # Motion synth guide
 
+The [website edition](https://lucychapar.com/ossm-motion-synth/) runs the engine,
+audio and USB–RS485 control directly in the browser using Web Serial. In desktop
+Chrome or Edge, expand **Motor connection**, click **Choose adapter**, then
+**Connect**. The browser asks which serial device this website may access.
+No adapter opens automatically. The controls and homing sequence below are
+shared with the optional Python edition.
+
+For the Python edition:
+
 Run `./synth --open` from this checkout after installing `requirements.txt` in
 `.venv`. The launcher uses that environment when present, otherwise `python3`.
 The bridge binds only to `127.0.0.1:8765`; use `--port NUMBER` for another local
@@ -81,8 +90,9 @@ node --test tests/test_virtual_synth_audio.cjs
 
 ## Sensorless homing
 
-Launch `./synth --allow-motion --open`, select the USB–RS485 port, and click
-**Connect**. The **Home** button beside Arm and Run stays greyed out until a
+On the website, choose your USB–RS485 adapter and click **Connect**. With the
+optional Python bridge, first launch `./synth --allow-motion --open` and select
+the USB–RS485 port. The **Home** button beside Arm and Run stays greyed out until a
 motor is connected. Click it to find both ends, measure the rail travel, and
 park halfway between the measured endpoints. Successful homing leaves output
 disabled, ready for **ARM**, then **RUN**. **Stop output** cancels homing.
@@ -131,8 +141,8 @@ values and selects Modbus itself after fresh stationary readings. It does not
 change baud or save EEPROM settings. Reconnecting requires Home again. Lost
 feedback, missed deadlines, failed release or inconsistent contacts cancel the
 sequence; ambiguous motion acknowledgments are never automatically retried.
-The implementation is tested with a fake serial rail; physical testing remains
-outstanding.
+Both Python and Web Serial implementations are tested with a fake serial rail;
+physical testing remains outstanding.
 
 ## USB–RS485 connection
 
@@ -149,7 +159,7 @@ Match the adapter and actual drive before wiring. Motor power
 does not come from the laptop's USB port. Physical stop hardware remains
 independent of this application.
 
-Live operation requires launching explicitly with:
+Live operation through the optional Python bridge requires launching explicitly with:
 
 ```sh
 ./synth --allow-motion --open

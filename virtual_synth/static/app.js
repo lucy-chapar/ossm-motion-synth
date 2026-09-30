@@ -2,6 +2,7 @@
 "use strict";
 
 (() => {
+  const browserRuntime = globalThis.MotionBrowserRuntime || null;
   const $ = (id) => document.getElementById(id);
   const SVG_NS = "http://www.w3.org/2000/svg";
   const COLORS = { lfo: "#7bdccb", envelope: "#efba74" };
@@ -48,6 +49,11 @@
   }
 
   async function api(path, payload) {
+    if (browserRuntime) {
+      const result = await browserRuntime.request(path, payload);
+      lastSuccessfulRequest = performance.now();
+      return result;
+    }
     const options = { cache: "no-store" };
     if (payload !== undefined) {
       if (!token) throw new Error("The local session is not ready. Wait for the connection to recover.");
@@ -124,7 +130,7 @@
     const epoch = motionEpoch;
     const run = async () => {
       try {
-        if (["arm", "run", "home_start"].includes(name) && epoch !== motionEpoch) return;
+        if (["arm", "run", "home_start", "connect"].includes(name) && epoch !== motionEpoch) return;
         const result = await api("/api/action", { action: name, ...details });
         if (!acceptState(result)) await poll();
         return result;
@@ -222,9 +228,9 @@
     const dot = document.createElement("span"); dot.className = "status-dot";
     $("mode-badge").append(dot, document.createTextNode(hw ? "HARDWARE" : "SIMULATION"));
     $("mode-badge").classList.toggle("hardware", hw);
-    $("connection-indicator").textContent = online ? "Local app connected" : "Local app disconnected";
+    $("connection-indicator").textContent = browserRuntime ? hw ? "USB–RS485 connected" : "Running in your browser" : online ? "Local app connected" : "Local app disconnected";
     $("scope-corner").textContent = hw ? "HARDWARE · ENCODER WHEN AVAILABLE" : "SIMULATED OUTPUT";
-    const runningLabel = state.unconfirmed_stop ? "STOP UNCONFIRMED" : state.fault ? "FAULT" : isHoming() ? "HOMING" : state.running ? "RUNNING" : state.armed ? "ARMED" : "STOPPED";
+    const runningLabel = state.stopping ? "STOPPING" : state.unconfirmed_stop ? "STOP UNCONFIRMED" : state.fault ? "FAULT" : isHoming() ? "HOMING" : state.running ? "RUNNING" : state.armed ? "ARMED" : "STOPPED";
     $("run-status").replaceChildren();
     const runDot = document.createElement("span"); runDot.className = "status-dot";
     $("run-status").append(runDot, document.createTextNode(runningLabel));
@@ -273,6 +279,10 @@
     });
     renderHardware();
     renderHoming();
+    if (state.stopping) {
+      for (const id of ["home-button", "arm-button", "run-button", "connect-button", "disconnect-button", "reset-button"]) $(id).disabled = true;
+      $("transport-message").textContent = "Stopping motor · waiting for feedback";
+    }
     const lastSample = (state.history || [])[Math.max(0, (state.history || []).length - 1)];
     const lastActual = hw && lastSample && Number.isFinite(lastSample.actual) ? lastSample : null;
     $("carriage-actual").hidden = !lastActual;
@@ -285,7 +295,8 @@
     const connected = isHardware(), hardware = state.hardware || {};
     $("connect-button").disabled = !online || isHoming() || connected || !$("port-select").value || Boolean(state.armed || state.running);
     $("disconnect-button").disabled = !online || !connected || isHoming();
-    $("port-select").disabled = connected;
+    $("port-select").disabled = connected || Boolean(state.armed || state.running);
+    if (browserRuntime) $("refresh-ports").disabled = !browserRuntime.supported || connected || Boolean(state.armed || state.running);
     $("hardware-metrics").hidden = !connected;
     $("hardware-status").textContent = connected ? `${hardware.port ? `Connected: ${hardware.port}` : hardware.device ? `Connected: ${hardware.device}` : "Connected to motor interface."}${hardware.notice ? ` ${hardware.notice}` : ""}` : "No motor connected.";
     $("encoder-raw").textContent = Number.isFinite(hardware.position_raw) ? `${hardware.position_raw} counts` : "No feedback";
@@ -299,6 +310,12 @@
     $("stop-confirmed").classList.toggle("unconfirmed", !confirmed);
     $("hardware-boundary").textContent = state.allow_motion ? "Ready for hardware: Connect → Home → Arm → Run. Connect only reads status; Home moves the motor." : "Launch ./synth --allow-motion for hardware Home and Run. Connecting here reads status only.";
     $("hardware-boundary").classList.toggle("motion-enabled", Boolean(state.allow_motion));
+    if (browserRuntime) {
+      $("hardware-boundary").textContent = browserRuntime.supported
+        ? "Choose your USB–RS485 adapter, then Connect → Home → Arm → Run. Everything runs in this browser; no local app needed."
+        : "Direct USB connection needs desktop Chrome or Edge with Web Serial. Wave shaping and audio still work here.";
+      if (!browserRuntime.supported) $("hardware-status").textContent = "Web Serial is unavailable in this browser.";
+    }
   }
 
   function renderHoming() {
@@ -459,7 +476,7 @@
       online = false;
       if (audioPreview.enabled || audioStarting) muteAudio("Audio muted · connection lost");
       if (performance.now() - lastStateReceipt > 1500) {
-        $("connection-indicator").textContent = "Local app disconnected";
+        $("connection-indicator").textContent = browserRuntime ? "Browser controller unavailable" : "Local app disconnected";
         $("transport-message").textContent = "Connection lost · output state unconfirmed";
         $("home-button").disabled = true; $("arm-button").disabled = true; $("run-button").disabled = true;
       }
@@ -479,7 +496,7 @@
     try {
       const result = await api("/api/ports"), previous = $("port-select").value;
       $("port-select").replaceChildren();
-      const placeholder = document.createElement("option"); placeholder.value = ""; placeholder.textContent = result.ports && result.ports.length ? "Select a serial port" : "No serial ports found"; $("port-select").append(placeholder);
+      const placeholder = document.createElement("option"); placeholder.value = ""; placeholder.textContent = result.ports && result.ports.length ? "Select a serial port" : browserRuntime ? "Choose an adapter to grant access" : "No serial ports found"; $("port-select").append(placeholder);
       for (const port of result.ports || []) {
         if (typeof port.device !== "string") continue;
         const option = document.createElement("option"); option.value = port.device; option.textContent = port.description ? `${port.device} · ${port.description}` : port.device; $("port-select").append(option);
@@ -487,7 +504,7 @@
       if (Array.from($("port-select").options).some((option) => option.value === previous)) $("port-select").value = previous;
       if (state) renderHardware();
     } catch (error) { report(error.message, true); }
-    finally { $("refresh-ports").disabled = false; }
+    finally { $("refresh-ports").disabled = false; if (state) renderHardware(); }
   }
 
   paramInputs.forEach((input) => {
@@ -545,7 +562,15 @@
   });
   $("gate-button").addEventListener("click", () => action("gate", { value: !Boolean(state && state.gate) }).catch(() => {}));
   $("reset-button").addEventListener("click", () => action("reset").catch(() => {}));
-  $("refresh-ports").addEventListener("click", refreshPorts);
+  $("refresh-ports").addEventListener("click", async () => {
+    if (!browserRuntime) return refreshPorts();
+    try {
+      const id = await browserRuntime.choosePort();
+      await refreshPorts();
+      $("port-select").value = id;
+      if (state) renderHardware();
+    } catch (error) { if (error.name !== "NotFoundError") report(error.message, true); }
+  });
   $("port-select").addEventListener("change", () => { if (state) renderHardware(); });
   $("connect-button").addEventListener("click", () => {
     const port = $("port-select").value;
@@ -577,20 +602,32 @@
     updateAudio();
   });
   document.addEventListener("visibilitychange", () => {
-    if (document.hidden) muteAudio("Audio muted · tab left");
+    if (document.hidden) {
+      muteAudio("Audio muted · tab left");
+      if (browserRuntime) { motionEpoch++; browserRuntime.stop().then(acceptState).catch(() => {}); }
+    }
     else poll();
   });
   window.addEventListener("pagehide", () => {
     stopped = true;
     motionEpoch++;
     muteAudio();
-    if (token) fetch("/api/action", { method: "POST", headers: { "Content-Type": "application/json", "X-Synth-Token": token }, body: JSON.stringify({ action: "stop" }), keepalive: true }).catch(() => {});
+    if (browserRuntime) browserRuntime.stop().catch(() => {});
+    else if (token) fetch("/api/action", { method: "POST", headers: { "Content-Type": "application/json", "X-Synth-Token": token }, body: JSON.stringify({ action: "stop" }), keepalive: true }).catch(() => {});
   });
   window.addEventListener("pageshow", () => { stopped = false; poll(); });
   new ResizeObserver(resizeScope).observe(canvas.parentElement);
   new ResizeObserver(drawCables).observe($("patch-bay"));
   renderPreset();
   renderAudio();
+  if (browserRuntime) {
+    $("refresh-ports").textContent = "Choose adapter";
+    $("refresh-ports").dataset.tooltip = "Open the browser's serial-device chooser. Choosing an adapter grants this page access; Connect reads motor status without moving it.";
+    $("port-select").dataset.tooltip = "Select an adapter you have allowed this website to access. Choose adapter opens the browser permission dialog.";
+    $("connect-button").dataset.tooltip = "Open the selected USB–RS485 adapter and read motor status at 19200 baud. Home and Run are separate actions.";
+    document.querySelector("#hardware-details .panel-description").textContent = "Connect directly to your USB–RS485 adapter through Web Serial.";
+    document.querySelector("footer span").lastChild.textContent = "RUNS IN YOUR BROWSER · NO INSTALL REQUIRED";
+  }
   try { globalThis.MotionTooltips?.install(); }
   catch (_) { /* Hover help is optional; motion controls must remain available. */ }
   for (const input of paramInputs) setInput(input, DEFAULTS[input.dataset.param]);
@@ -602,7 +639,7 @@
       token = session.token;
       await poll();
     } catch (error) {
-      report("Cannot connect to the local synth app. Keep this page open and check that the server is running.", true);
+      report(browserRuntime ? `Cannot start the browser synth: ${error.message}` : "Cannot connect to the local synth app. Keep this page open and check that the server is running.", true);
       setTimeout(initialize, 2000);
     }
   }

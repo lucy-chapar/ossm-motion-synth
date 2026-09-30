@@ -1,15 +1,32 @@
 # OSSM Motion Synth
 
 A patchable motion instrument in your browser. Shape a waveform, connect virtual
-modulation cables, hear the signal, and control an OSSM through a laptop and
-USB–RS485 adapter.
+modulation cables, hear the signal, and control an OSSM directly through a
+USB–RS485 adapter using Web Serial.
 
 This is the standalone web synth spun out of
 [OSSM-Synth](https://github.com/lucy-chapar/OSSM-Synth). It includes the browser
-interface and local Python bridge. No Raspberry Pi, CV board or firmware flash
-is needed.
+interface, a standalone browser runtime and an optional local Python bridge.
+No Raspberry Pi, CV board or firmware flash is needed.
 
-## Run locally
+## Use it on the web
+
+Open [OSSM Motion Synth](https://lucychapar.com/ossm-motion-synth/) in desktop
+Chrome or Edge. In **Motor connection**, click **Choose adapter** to grant the
+page access to your USB–RS485 adapter, then **Connect → Home → Arm → Run**.
+Choosing the adapter does not open it; Connect reads status. Home measures both
+ends of the rail and parks at center. No Python app or installation is required.
+
+The synth also runs without an adapter: patch waves, watch the scope, and expand
+**Audio preview** at the bottom to hear them. Browsers without Web Serial can
+use those controls, with motor connection unavailable.
+
+Motor commands run in the browser. Leaving the tab requests a stop; a closed,
+suspended or crashed browser cannot guarantee delivery of a software stop.
+Physical stop/power isolation remains independent. No motor was driven while
+porting or testing this browser edition.
+
+## Optional Python bridge
 
 Requires Python 3.11 or later.
 
@@ -58,16 +75,38 @@ connection requirements and recovery behavior.
 
 ```sh
 .venv/bin/python -m unittest discover -s tests -v
-node --test tests/test_virtual_synth_audio.cjs
+node --test tests/*.cjs
 ```
 
-Tests use fake serial devices and require no motor. Node.js is needed only for
-the audio tests; there is no frontend build step. The Python package includes
-all browser assets and runs without a CDN.
+Tests use fake serial devices and require no motor. Node.js 22 or later runs the
+audio, browser engine, controller and Web Serial tests, including comparisons
+against the Python engine. There is no frontend build step. All browser assets
+are included and run without a CDN.
 
 The optional Python bridge binds to loopback and accepts only same-origin
 control requests. The website edition connects directly to a USB–RS485 adapter
 through Web Serial; it does not require the Python bridge.
+
+## Host the browser edition
+
+```sh
+python3 scripts/export_web.py --output dist/web
+```
+
+Serve that directory on **HTTPS** (localhost also works for development).
+Relative assets allow deployment at a subpath. The export includes source
+attribution and a SHA-256 manifest so a website can pin the exact version.
+It makes no calls to a Python API or cloud control service.
+
+For an Astro island, host the export under `public/apps/ossm-motion-synth/`
+and load it in a same-origin iframe with `allow="serial 'self'; autoplay 'self'"`.
+The iframe keeps the instrument styles separate from the surrounding site.
+Any parent `Permissions-Policy` must allow `serial=(self)`.
+
+Web Serial access is granted through the browser's chooser after a user click;
+previously allowed adapters are listed without opening them. The app never
+auto-connects or auto-runs. See the
+[Web Serial API documentation](https://developer.chrome.com/docs/capabilities/serial).
 
 ## License
 
