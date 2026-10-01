@@ -655,7 +655,7 @@
       }
     }
   }
-  for (const name of ["connect", "snapshot", "arm", "start", "command", "begin_home", "poll_home", "stop", "close"]) {
+  for (const name of ["connect", "snapshot", "recover_stop", "reset_fault", "arm", "start", "command", "begin_home", "poll_home", "stop", "close"]) {
     const method = MotorTransport.prototype[name];
     if (method) MotorTransport.prototype[name] = function (...args) { return this._enqueue(() => method.apply(this, args), name === "stop" || name === "close"); };
   }
