@@ -17,7 +17,7 @@ function setup({ supported = true, factory } = {}) {
 function fakeMotor({ stopConfirmed = true } = {}) {
   const hw = { connected: false, mode: 1, output_enabled: false, pending_raw: 0, pwm_raw: 0,
     owned: false, running: false, armed: false, homing: false, homed: false, fault: null,
-    position_normalized: 0.5, stop_confirmed: true, raw_bounds: [-9830, 9830] };
+    position_normalized: 0.5, max_velocity_raw_s: 73728, max_acceleration_raw_s2: 147456, stop_confirmed: true, raw_bounds: [-9830, 9830] };
   const calls = [];
   return { calls, hw, status: () => ({ ...hw }),
     async connect() { calls.push("connect"); hw.connected = true; return this.status(); },
@@ -80,7 +80,9 @@ test("connect is read-only; home completes before hardware can arm", async () =>
   await env.action("arm"); await env.action("run");
   env.advance(.1); await env.runtime.tick();
   const command = motor.calls.find((entry) => Array.isArray(entry));
-  assert.ok(command); assert.ok(Math.abs(command[1] - .5) < .003);
+  assert.ok(command);
+  assert.ok(command[1] > .5);
+  assert.ok(command[1] - .5 <= .5 * motor.hw.max_acceleration_raw_s2 / 19660 * .1 ** 2);
 });
 test("Stop fences queued and in-flight start and cannot re-enable output", async () => {
   const motor = fakeMotor(); motor.hw.homed = true;
@@ -231,4 +233,19 @@ test("closing the runtime prevents reopening ports or restarting output", async 
   for (const name of ["arm", "run", "connect"]) await assert.rejects(env.action(name), /closed/);
   await assert.rejects(env.runtime.choosePort(), /closed/);
   assert.deepEqual(env.counts(), { choices: 0, opens: 0 });
+});
+
+test("default sine uses reported drive limits across a measured 180mm rail", async () => {
+  const motor = fakeMotor(); motor.hw.homed = true; motor.hw.raw_bounds = [-71972, 71972];
+  const env = setup({factory: () => motor});
+  await env.connect(); await env.action("arm"); await env.action("run");
+  const samples = [];
+  for (let i = 0; i < 600; i++) {
+    env.advance(.02); await env.action("heartbeat"); await env.runtime.tick();
+    if(i > 200) samples.push(env.runtime.state().signal);
+  }
+  const span = Math.max(...samples.map(s => s.command)) - Math.min(...samples.map(s => s.command));
+  assert.ok(span > .5, `Default pattern span was only ${span}`);
+  assert.ok(samples.every(s => Math.abs(s.velocity) <= motor.hw.max_velocity_raw_s / 143944 + 1e-9));
+  await env.action("stop");
 });

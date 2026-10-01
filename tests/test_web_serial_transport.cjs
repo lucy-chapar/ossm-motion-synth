@@ -17,7 +17,7 @@ class Clock {
 class FakeConnection {
   constructor({native = false, homeIgnored = false} = {}) {
     this.values = Array(26).fill(0);
-    this.values[0] = 1; this.values[2] = 7; this.values[3] = 15;
+    this.values[0] = 1; this.values[2] = 150; this.values[3] = 60000;
     this.values[11] = 800; this.values[21] = 1;
     this.position(20000);
     this.native = native; this.homeIgnored = homeIgnored;
@@ -36,7 +36,7 @@ class FakeConnection {
   async close() { this.closeCount++; this.opened = false; }
   async exchange(request, timeout) {
     assert.equal(this.opened, true, "exchange requires an open fake connection");
-    assert.ok(timeout > 0 && timeout <= .15);
+    assert.ok(timeout > 0 && timeout <= .5);
     const tx = Uint8Array.from(request);
     assert.equal(crc16(tx.slice(0, -2)), tx.at(-2) | tx.at(-1) << 8);
     assert.equal(tx[0], 1);
@@ -120,10 +120,10 @@ class FakeConnection {
   }
 }
 
-function make({motor = new FakeConnection(), allowed = true} = {}) {
+function make({motor = new FakeConnection(), allowed = true, nativeHome = true} = {}) {
   const clock = new Clock(), selectedPort = {}, factories = [];
   const transport = new MotorTransport(selectedPort, {
-    allowMotion: allowed, portLabel: "offline-test", clock: clock.now, wait: clock.wait,
+    allowMotion: allowed, nativeHome, portLabel: "offline-test", clock: clock.now, wait: clock.wait,
     connectionFactory: port => { factories.push(port); return motor; },
   });
   return {transport, motor, clock, factories, selectedPort};
@@ -270,6 +270,20 @@ test("three fresh tracking failures inhibit before a fourth target", async () =>
   await assert.rejects(transport.command(1), /Tracking error/);
   assert.equal(motor.destinations.length, 3);
   assert.deepEqual(motor.commands.slice(-2), ["clear", "inhibit"]);
+  await transport.close();
+});
+
+test("tracking budget accepts one command interval but stops persistent larger lag", async () => {
+  const {transport, motor} = await running();
+  transport._low = -142266; transport._high = 1715;
+  transport._target = -70000; motor.position(-75000);
+  motor.onCommand = (_, operation) => { if (operation === "absolute") motor.position(transport._target - 5000); };
+  for (let i = 0; i < 4; i++) await transport.command(.5);
+  assert.equal(transport.status().running, true);
+  motor.onCommand = (_, operation) => { if (operation === "absolute") motor.position(-90000); };
+  await transport.command(.5); await transport.command(.5); await transport.command(.5);
+  await assert.rejects(transport.command(.5), /Tracking error/);
+  assert.equal(transport.status().stop_confirmed, true);
   await transport.close();
 });
 
@@ -610,7 +624,7 @@ test("both native directions measure repeatable endpoints and center in one coor
       sign * (3277 - 409600 - 819), sign * -158925, sign * -161382, center]);
     assert.equal(motor.settings.filter(([r, v]) => r === 25 && v === 1).length, 1);
     assert.ok(motor.settings.every(([r]) => r !== 20 && r !== 21));
-    assert.deepEqual(motor.values.slice(0, 4), [1, 0, 7, 15]);
+    assert.deepEqual(motor.values.slice(0, 4), [1, 0, 150, 60000]);
     assert.equal(motor.values[24], 0); assert.equal(motor.values[25], 0);
     for (const state of motor.absoluteStates) {
       assert.deepEqual(state.slice(0, 4), [1, 1, 35, 75]);
@@ -1142,7 +1156,7 @@ test("first search has a full-distance deadline and never reissues a freely reac
 });
 
 test("native completion rejects mismatched reset configuration and unknown flags", async () => {
-  for (const [register, value] of [[10, 32767], [1, 13], [25, 0], [24, 539], [2, 81], [3, 16], [4, 496]]) {
+  for (const [register, value] of [[10, 32767], [1, 13], [25, 0], [24, 610], [2, 81], [3, 16], [4, 496]]) {
     const motor = nativeResetMotor(), native = motor.onNative;
     motor.onNative = m => { native(m); if (m.nativeReads > 1) m.values[register] = value; };
     const context = await homing(false, motor);
@@ -1172,7 +1186,7 @@ test("native reset flags and defaults may settle before three stationary complet
   }
   assert.equal(transport.status().home_origin_raw, -18);
   assert.equal((await advance(context)).homed, true);
-  assert.deepEqual(motor.values.slice(0, 4), [1, 0, 7, 15]);
+  assert.deepEqual(motor.values.slice(0, 4), [1, 0, 150, 60000]);
   await transport.close();
 });
 
@@ -1224,7 +1238,7 @@ test("native-reset cancellation clears special mode and gearing before any FC16 
   assert.equal(stopped.output_enabled, false); assert.equal(stopped.pending_raw, 0);
   assert.equal(stopped.pwm_raw, 0); assert.equal(motor.values[25], 0);
   const writes = motor.transmissions.slice(start).filter(tx => tx[1] !== 3).map(tx => [tx[1], tx[3], tx[4] << 8 | tx[5]]);
-  assert.deepEqual(writes.slice(0, 7), [[6, 1, 0], [6, 0, 0], [6, 25, 0], [6, 0, 1], [6, 1, 0], [6, 10, 0], [16, 12, 2]]);
+  assert.deepEqual(writes.slice(0, 8), [[6, 1, 0], [6, 0, 0], [6, 25, 0], [6, 1, 0], [6, 0, 1], [6, 1, 0], [6, 10, 0], [16, 12, 2]]);
   assert.deepEqual(motor.destinations, []);
   assert.equal(motor.settings.filter(([r, v]) => r === 25 && v === 1).length, 1);
   await context.transport.close();
@@ -1274,7 +1288,7 @@ test("actual browser runtime and transport complete chooser, Home, ARM/RUN and c
     transportFactory: port => {
       assert.equal(port, selectedPort);
       liveTransport = new MotorTransport(port, {
-        allowMotion: true, clock: clock.now, wait: clock.wait,
+        allowMotion: true, nativeHome: true, clock: clock.now, wait: clock.wait,
         connectionFactory: () => motor, portLabel: "offline-runtime-rail",
       });
       return liveTransport;
@@ -1346,4 +1360,28 @@ test("actual browser runtime and transport complete chooser, Home, ARM/RUN and c
     assert.equal(motor.maxActive, 1);
   } finally { await runtime.close(); }
   assert.equal(motor.closeCount, 1);
+});
+
+test("native Home restores saved output despite a temporary inhibited output setting", async () => {
+ const motor = new FakeConnection({native:true});motor.values[24]=89;
+ motor.onNative = m => {m.values[24]=540;};
+ const context = await homing(false,motor);
+ const result = await advance(context);
+ assert.equal(result.homed,true);assert.equal(result.output_limit_stall_raw,540);
+ assert.equal(result.speed_rpm,150);assert.equal(result.acceleration_rpm_s,60000);
+});
+
+test("direct Home measures both directions without native coordinate reset", async () => {
+  for (const reverse of [false, true]) {
+    const motor = new FakeConnection({native: true});
+    motor.contacts = [-140563,23277];
+    const context = make({motor, nativeHome:false});
+    await context.transport.connect(); await context.transport.begin_home(reverse);
+    const result = await advance(context);
+    assert.equal(result.homed,true); assert.equal(result.stop_confirmed,true);
+    assert.equal(result.measured_travel_raw,163840);
+    assert.equal(result.position_normalized,.5);
+    assert.ok(!motor.settings.some(([r,v])=>r===25 && v===1));
+    await context.transport.close();
+  }
 });

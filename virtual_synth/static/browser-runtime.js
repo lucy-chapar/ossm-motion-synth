@@ -176,7 +176,8 @@
           try {
             const hw = await transport.arm(); await assertCurrent();
             const span = spanOf(hw);
-            engine.reset({ position: hw.position_normalized, vmax: 3822 / span, amax: 8192 / span });
+            if (![hw.max_velocity_raw_s, hw.max_acceleration_raw_s2].every(v => Number.isFinite(v) && v > 0)) throw new Error("Motor motion limits are unavailable.");
+            engine.reset({ position: hw.position_normalized, vmax: hw.max_velocity_raw_s / span, amax: hw.max_acceleration_raw_s2 / span });
             signal = engine.step(0, { running: false });
           } catch (error) { await motionError("Cannot arm", error); }
         }

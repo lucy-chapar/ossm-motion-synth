@@ -104,15 +104,10 @@ disabled, ready for **ARM**, then **RUN**. **Stop output** cancels homing.
 The progress message reports which end is being found or when the motor is
 moving to center.
 
-The initial reference uses the native command from
-[OSSM ALT's linked OSSM-RS firmware](https://github.com/ossm-rs/ossm-rs/blob/5f4edbd085da07e18f628b88cbad0caa96db269a/ossm-rs/src/motion/mod.rs#L28-L67):
-80 RPM, output/stall setting 89, and special function `0x19 = 1`. The vendor
-describes a 36-degree retreat and coordinate reset. The browser then restores
-Modbus position control at 35 RPM / 75 RPM/s and measures both contacts in that
-same coordinate system. It does not assume the native reference lies within
-a fixed distance of the first endpoint: each search is bounded to 500 nominal
-mm. Two native homes alone would erase the reference needed to measure the
-distance between the ends.
+The browser measures both ends directly in the existing encoder coordinate,
+at 35 RPM / 75 RPM/s with output/stall setting 89. It does not invoke the
+native coordinate-reset command. Each search is bounded to 500 nominal mm.
+The optional Python bridge retains its native reference stage.
 
 Each measured contact requires at least half a second of stationary encoder
 readings within four counts, substantial pending motion, and elevated output
@@ -131,7 +126,10 @@ at the midpoint of the two contacts, verifies arrival, then inhibits output
 and restores the previous output/stall setting. The waveform planner uses
 this measured working span, keeping its existing physical velocity and
 acceleration limits when converting normalized positions to encoder counts.
-After parking, Home restores the waveform profile of 7 RPM / 15 RPM/s.
+After parking, browser Home restores 150 RPM and acceleration register 60000.
+The vendor documents 60000 as disabling the drive's internal acceleration
+curve. The browser plans acceleration itself; applying a second drive ramp
+would add position lag. The Python bridge retains its earlier profile.
 A successful Home does not start waveform motion.
 
 The bridge never transmits an absolute position target of zero because that
@@ -203,16 +201,18 @@ before accepting it. Reconnecting requires Home again.
 
 RUN clears pending motion, checks stationary disabled readback, enables the
 drive and checks the enabled hold before sending bounded targets. The planner
-uses the existing conservative maximum velocity of 3822 counts/s and maximum
-acceleration of 8192 counts/s². It bounds position, speed and acceleration;
+uses a browser maximum velocity of 73728 counts/s (90 nominal mm/s) and
+maximum acceleration of 147456 counts/s² (180 nominal mm/s²), with ten percent
+speed headroom below the drive's 150 RPM setting. The optional Python bridge
+retains 3822 counts/s and 8192 counts/s². It bounds position, speed and acceleration;
 **jerk limiting is not implemented**. Waveforms with abrupt corners therefore
 produce different requested and planned traces, and drive interpolation is
 not modeled. Physical performance is not established by the simulation.
 
 Hardware target/feedback cycles run at most 10 Hz, independent of browser
-animation. Each run lasts at most 20 seconds. The old 19200-baud transaction
-budget is retained; a fast UI or oscillator does not imply high motor bandwidth.
-Tracking error over 1024 counts for three samples, drive faults, configuration
+animation. Each run lasts at most 20 seconds. The browser allows 200 ms per 19200-baud transaction; a fast UI or oscillator does not imply high motor bandwidth.
+Browser tracking error beyond one command interval of travel plus 1024 counts,
+capped at ten percent of the working span, for three fresh samples, drive faults, configuration
 changes, communication failures and missed scheduling deadlines latch a fault.
 Targets are never retried after an ambiguous write acknowledgment.
 
@@ -257,3 +257,15 @@ only; Pi services, CV firmware and CAD live in the original hardware project.
 
 Runtime references: [Python HTTP server](https://docs.python.org/3/library/http.server.html)
 and [pySerial API](https://pyserial.readthedocs.io/en/latest/pyserial_api.html).
+
+### Connected-drive pattern check, 2026-10-01
+
+A background test using the browser runtime and Web Serial transport through
+the USB–RS485 adapter completed a 20-second, 0.25 Hz sine at 70% stroke without
+a fault. Encoder feedback covered approximately 98 mm against approximately
+100 mm requested on the measured 179.7 mm rail. A triangle pattern and manual
+Stop also completed without a fault. Stop readbacks confirmed output
+inhibited, zero PWM and stationary encoder feedback. This verifies one drive
+and adapter through a direct serial harness, not the deployed Chrome session.
+Intermittent response timeouts were also observed during this session; they
+remain latched faults and never cause automatic motion retries.
