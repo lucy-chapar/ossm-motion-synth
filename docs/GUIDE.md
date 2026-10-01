@@ -210,7 +210,7 @@ produce different requested and planned traces, and drive interpolation is
 not modeled. Physical performance is not established by the simulation.
 
 Hardware target/feedback cycles run at most 10 Hz, independent of browser
-animation. Each run lasts at most 20 seconds. The browser allows 200 ms per 19200-baud transaction; a fast UI or oscillator does not imply high motor bandwidth.
+animation. Browser runs continue until Stop, a disconnect or a monitored fault. The browser allows 200 ms per 19200-baud transaction; a fast UI or oscillator does not imply high motor bandwidth.
 Browser tracking error beyond one command interval of travel plus 1024 counts,
 capped at ten percent of the working span, for three fresh samples, drive faults, configuration
 changes, persistent communication failures and missed scheduling deadlines latch a fault.
@@ -226,7 +226,7 @@ local tab may request a stop. Backgrounding the control tab stops its heartbeat.
 
 STOP, a fault, or normal run completion independently attempts clear and inhibit,
 then allows up to 1.5 seconds to settle and checks three stationary disabled
-readbacks. Normal browser runs stop just before the independent 20-second
+readbacks. Normal browser runs have no elapsed-time limit; the optional Python bridge retains its 20-second
 transport deadline. A failed clear acknowledgment
 does not prevent an inhibit attempt. Failure remains **stop unconfirmed**;
 disconnecting or clicking reset must not relabel it as a confirmed stop. A new
@@ -291,3 +291,10 @@ A connected-drive test discarded one status reply and one target acknowledgement
 while the motor ran a 20-second sine. Both recovered, the run completed without
 a fault, and output inhibition was confirmed. This tested deliberately discarded
 responses through the serial harness, not a physical USB unplug during motion.
+
+After a confirmed stop, disabled encoder position may settle up to 1 nominal mm
+from that fixed stop position. The reference does not move with later readings,
+so gradual drift cannot accumulate indefinitely. Enabled output, PWM, speed,
+changed configuration and travel-bound violations are still rejected. Stop and
+Arm still require three stable readings. A stopped-feedback error now reports
+the position displacement, pending counts, speed, PWM and output word.

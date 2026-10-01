@@ -136,55 +136,34 @@ test("reconnect clears stop uncertainty only for inhibited output with bounded i
     if (!resolves) await assert.rejects(env.action("reset"), /unconfirmed/, label);
   }
 });
-test("hardware duration limit stops without a late command", async () => {
+test("manual Stop after twenty seconds prevents later targets", async () => {
   const motor = fakeMotor(); motor.hw.homed = true;
   const env = setup({ factory: () => motor });
   await env.connect(); await env.action("arm"); await env.action("run");
   for (let i = 0; i < 101; i++) {
     env.advance(.2); await env.action("heartbeat"); await env.runtime.tick();
   }
+  assert.equal(env.runtime.state().running, true);
+  await env.action("stop");
+  const targetCount = motor.calls.filter(Array.isArray).length;
+  env.advance(.2); await env.runtime.tick();
+  assert.equal(motor.calls.filter(Array.isArray).length, targetCount);
   assert.equal(env.runtime.state().running, false);
   assert.ok(motor.calls.includes("stop"));
   assert.equal(env.runtime.state().fault, null);
 });
 
-test("normal run deadline includes the enabled hold and stops before the transport budget guard", async () => {
-  const motor = fakeMotor(); motor.hw.homed = true;
-  const env = setup({ factory: () => motor });
-  let enabledAt, stoppedAt;
-  const commandsAt = [], originalStop = motor.stop;
-  motor.start = async function () {
-    this.calls.push("start");
-    env.advance(.4); // Readback and disabled hold happen before output enables.
-    enabledAt = env.time();
-    this.hw.running = this.hw.owned = true; this.hw.stop_confirmed = false;
-    env.advance(.45); // Three enabled hold observations precede Start's return.
-    this.hw.run_seconds = env.time() - enabledAt;
-    return this.status();
-  };
-  motor.command = async function (position) {
-    const elapsed = env.time() - enabledAt;
-    if (20 - elapsed <= .155) throw new Error("20-second hardware run limit reached");
-    commandsAt.push(elapsed); this.calls.push(["command", position]);
-    env.advance(.07); // Model the read and write time of a hardware target.
-    return this.status();
-  };
-  motor.stop = async function () { stoppedAt = env.time() - enabledAt; return originalStop.call(this); };
-  await env.connect(); await env.action("arm"); await env.action("run");
-  assert.ok(Math.abs(env.runtime.state().run_remaining_s - 19.25) < 1e-9);
-  for (let i = 0; i < 250 && env.runtime.state().running; i++) {
-    env.advance(.1); await env.action("heartbeat"); await env.runtime.tick();
-  }
-  const state = env.runtime.state();
-  assert.equal(state.running, false); assert.equal(state.armed, false);
-  assert.equal(state.fault, null); assert.equal(state.unconfirmed_stop, false);
-  assert.equal(state.run_remaining_s, null);
-  assert.ok(stoppedAt >= 19.7 && stoppedAt < 20);
-  assert.ok(commandsAt.length > 0 && commandsAt.every(time => time < 19.7));
-  assert.equal(motor.calls.filter(call => call === "stop").length, 1);
+test("hardware patterns continue beyond twenty seconds until explicit Stop", async () => {
+ const motor=fakeMotor();motor.hw.homed=true;const env=setup({factory:()=>motor});
+ await env.connect();await env.action('arm');await env.action('run');
+ for(let i=0;i<900;i++){env.advance(.1);await env.action('heartbeat');await env.runtime.tick();}
+ assert.equal(env.runtime.state().running,true);assert.equal(env.runtime.state().fault,null);
+ assert.equal(env.runtime.state().run_remaining_s,null);assert.ok(motor.calls.filter(Array.isArray).length>500);
+ await env.action('stop');assert.equal(env.runtime.state().running,false);assert.equal(env.runtime.state().hardware.stop_confirmed,true);
+ await env.runtime.close();
 });
 
-test("scheduling and heartbeat failures remain faults when they cross the normal run deadline", async () => {
+test("scheduling and heartbeat failures still stop a long-running pattern", async () => {
   for (const [delay, message] of [[.3, /scheduling deadline/], [1.6, /heartbeat/]]) {
     const motor = fakeMotor(); motor.hw.homed = true;
     const env = setup({ factory: () => motor });

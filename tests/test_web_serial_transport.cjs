@@ -227,15 +227,11 @@ test("legacy motion window rejects zero and signed-counter overflow", async () =
   }
 });
 
-test("twenty-second limit rejects late commands and still independently cleans up", async () => {
-  for (const action of ["command", "snapshot"]) {
-    const {transport, motor, clock} = await running();
-    await clock.wait(20);
-    await assert.rejects(action === "command" ? transport.command(.7) : transport.snapshot());
-    assert.deepEqual(motor.destinations, []);
-    assert.deepEqual(motor.commands.slice(-2), ["clear", "inhibit"]);
-    assert.equal(transport.status().stop_confirmed, true); await transport.close();
-  }
+test("transport continues after twenty seconds and still confirms explicit Stop", async () => {
+ const {transport,motor,clock}=await running();await clock.wait(90);
+ await transport.command(.7);assert.equal((await transport.snapshot()).running,true);
+ assert.equal(motor.destinations.length,1);assert.equal(transport.status().max_run_seconds,null);
+ assert.equal((await transport.stop()).stop_confirmed,true);await transport.close();
 });
 
 test("invalid normalized values fault without sending an absolute target", async () => {
@@ -424,7 +420,7 @@ test("fresh contradictory or missing readback invalidates a previously confirmed
   for (const change of ["drift", "pending", "negative_pending", "pwm", "speed", "negative_speed", "read_error"]) {
     const {transport, motor} = await running();
     assert.equal((await transport.stop()).stop_confirmed, true);
-    if (change === "drift") motor.position(20005);
+    if (change === "drift") motor.position(20821);
     if (change === "pending") motor.remaining(3);
     if (change === "negative_pending") motor.remaining(-3);
     if (change === "pwm") motor.values[19] = 1;
@@ -1425,4 +1421,18 @@ test("confirmed communication fault resets on the same connection without motion
  const result=await transport.reset_fault();assert.equal(result.fault,null);assert.equal(result.homed,true);
  assert.equal(result.armed,false);assert.equal(result.running,false);assert.equal(motor.destinations.length,targets);
  await transport.close();
+});
+
+test("disabled post-stop settling accepts 1mm but cannot accumulate unbounded drift", async () => {
+ const {transport,motor}=await running();await transport.stop();const stopped=transport.status().position_raw;
+ motor.position(stopped+200);assert.equal((await transport.snapshot()).stop_confirmed,true);
+ motor.position(stopped+819);assert.equal((await transport.snapshot()).stop_confirmed,true);
+ motor.position(stopped+821);await assert.rejects(transport.snapshot(),/position drift 821 counts/);
+ await transport.close();
+});
+test("settling allowance never accepts enabled output, PWM or speed", async () => {
+ for(const field of [1,19,16]) {
+  const {transport,motor}=await running();await transport.stop();motor.values[field]=field===16?2:1;
+  await assert.rejects(transport.snapshot());assert.equal(transport.status().stop_confirmed,false);await transport.close();
+ }
 });

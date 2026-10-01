@@ -250,7 +250,7 @@
     $("reset-button").disabled = !online || isHoming() || Boolean(state.running || state.unconfirmed_stop);
     $("scope-empty").hidden = Boolean(state.running || (state.history && state.history.length > 1));
     $("actual-legend").hidden = !hw || !(state.history || []).some((sample) => Number.isFinite(sample.actual));
-    $("transport-message").textContent = hw ? state.running && Number.isFinite(state.run_remaining_s) ? `Hardware run · ${format(state.run_remaining_s, 1)} s remaining` : canMove ? state.homing?.valid ? "Motor homed · Arm, then Run" : "Motor connected · Home before arming" : "Read-only connection · motion locked" : state.running ? "Simulated motion · no motor commands" : "Simulation · no motor connected";
+    $("transport-message").textContent = hw ? state.running ? "Hardware running · Stop output to finish" : canMove ? state.homing?.valid ? "Motor homed · Arm, then Run" : "Motor connected · Home before arming" : "Read-only connection · motion locked" : state.running ? "Simulated motion · no motor commands" : "Simulation · no motor connected";
     for (const input of paramInputs) {
       const key = input.dataset.param;
       if (document.activeElement !== input && !(key in pendingParams)) setInput(input, params[key]);

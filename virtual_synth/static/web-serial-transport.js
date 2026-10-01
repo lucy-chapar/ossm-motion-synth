@@ -16,7 +16,7 @@
 })(globalThis, function (io) {
   "use strict";
   const { TransportError } = io;
-  const IO_TIMEOUT = .2, MAX_RUN_SECONDS = 20, HALF_WINDOW = 4096, PADDING = 128;
+  const IO_TIMEOUT = .2, MAX_RUN_SECONDS = null, HALF_WINDOW = 4096, PADDING = 128;
   const CONFIG = [0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 20, 21, 24, 25];
   const HOME_IO_TIMEOUT = .5;
   const HOME_SEEK_SECONDS = 30, HOME_TOTAL_SECONDS = 360, COUNTS_PER_MM = 32768 / 40;
@@ -31,6 +31,7 @@
   const CONTACT_PWM = 1966, CONTACT_ERROR = 512, CONTACT_SECONDS = .5, CONTACT_REPEAT_TOLERANCE = 128;
   const CONTACT_RELEASE_TOLERANCE = 512;
   const PARK_STOP_TOLERANCE = 128, STOP_PENDING_TOLERANCE = 2;
+  const STOP_SETTLE_TOLERANCE = Math.ceil(COUNTS_PER_MM); // 1 mm from the confirmed stop; never a rolling reference.
   const OUTPUT_STATUSES = [0, 1, 2, 3, 6, 7, 10, 11, 14, 15];
   const clock = () => performance.now() / 1000;
   const wait = seconds => new Promise(resolve => setTimeout(resolve, seconds * 1000));
@@ -97,7 +98,6 @@
     _require_connection() { if (!this._connection) throw new TransportError("Connect an explicitly selected serial device first"); }
     _require_clear_fault() { this._require_connection(); if (this._fault) throw new TransportError("Fault is latched; disconnect and inspect before reconnecting: " + this._fault); }
     _budget() {
-      if (this._enabled_at !== null && MAX_RUN_SECONDS - (this._clock() - this._enabled_at) <= IO_TIMEOUT + .005) throw new TransportError("20-second hardware run limit reached");
       return IO_TIMEOUT;
     }
     async _exchange(tx, budget) {
@@ -125,7 +125,10 @@
           let position;
           if (this._origin === null) { this._configuration(this._values, false, this._baseline); position = io.signedPosition(this._values); }
           else position = this._check_active(this._values, false);
-          if (!this._inhibited_feedback(this._values) || Math.abs(position - this._stop_position) > 4) throw new TransportError("Fresh readback contradicts the confirmed stationary stop");
+          const displacement = Math.abs(position - this._stop_position);
+          if (!this._inhibited_feedback(this._values) || displacement > STOP_SETTLE_TOLERANCE) {
+            throw new TransportError(`Stopped feedback changed: position drift ${displacement} counts (limit ${STOP_SETTLE_TOLERANCE}), pending ${io.pending(this._values)}, actual speed ${this._signed_speed(this._values)}, PWM ${this._signed_pwm(this._values)}, output ${this._values[1]}`);
+          }
         }
         return this._values;
       } catch (error) { this._stop_confirmed = false; throw error; }
