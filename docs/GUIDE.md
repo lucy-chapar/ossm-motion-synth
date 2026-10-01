@@ -300,3 +300,9 @@ so gradual drift cannot accumulate indefinitely. Enabled output, PWM, speed,
 changed configuration and travel-bound violations are still rejected. Stop and
 Arm still require three stable readings. A stopped-feedback error now reports
 the position displacement, pending counts, speed, PWM and output word.
+
+The browser's everyday slider ranges are 0.02–0.3 Hz for Rate, 0.01–0.3 Hz for
+LFO, and 0.2–5 seconds for Attack and Release. Stroke and Center retain their
+full percentage ranges. The underlying engine accepts the previous parameter
+range for compatibility. These control ranges improve adjustment resolution;
+wide strokes and combined modulation can still engage the motion limiter.
