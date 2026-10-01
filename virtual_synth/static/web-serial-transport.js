@@ -22,8 +22,8 @@
   const HOME_SEEK_SECONDS = 30, HOME_TOTAL_SECONDS = 360, COUNTS_PER_MM = 32768 / 40;
   const HOME_SEARCH_COUNTS = 409600, HOME_MIN_SPAN = 16384, HOME_INSET = 1638;
   const HOME_RETOUCH_OVERTRAVEL = 819;
-  // 60000 disables the vendor internal ramp; the planner supplies the ramp.
-  const RUN_SPEED_RPM = 150, RUN_ACCEL_RPM_S = 60000, PLANNED_ACCEL_RPM_S = 300;
+  // Keep a drive ramp for serial target changes; the planner remains gentler.
+  const RUN_SPEED_RPM = 150, RUN_ACCEL_RPM_S = 1500, PLANNED_ACCEL_RPM_S = 300;
   const RUN_MAX_VELOCITY = 32768 * RUN_SPEED_RPM / 60 * .9;
   const RUN_MAX_ACCELERATION = 32768 * PLANNED_ACCEL_RPM_S / 60 * .9;
   const HOME_SPEED_RPM = 35, HOME_ACCEL_RPM_S = 75;
@@ -151,7 +151,7 @@
       if (!equalPrefix(rx, tx, 6)) throw new TransportError("Absolute-position acknowledgement address/count mismatch; no retry");
     }
     _configuration(v, enabled, baseline = null) {
-      if (v[0] !== 1 || v[1] !== Number(enabled) || v[2] !== RUN_SPEED_RPM || v[3] !== RUN_ACCEL_RPM_S || v[10] !== 0 || v[14] !== 0 || v[20] !== 0 || v[21] !== 1 || v[25] !== 0) throw new TransportError("Require mode1, scalar output " + Number(enabled) + ", speed/acceleration150/60000, gear0, alarm0, save0, address1, special0");
+      if (v[0] !== 1 || v[1] !== Number(enabled) || v[2] !== RUN_SPEED_RPM || v[3] !== RUN_ACCEL_RPM_S || v[10] !== 0 || v[14] !== 0 || v[20] !== 0 || v[21] !== 1 || v[25] !== 0) throw new TransportError("Require mode1, scalar output " + Number(enabled) + ", speed/acceleration150/1500, gear0, alarm0, save0, address1, special0");
       if (baseline && CONFIG.some(i => v[i] !== baseline[i])) throw new TransportError("Motor configuration changed after arming");
     }
     _check_active(v, enabled, hold = false) {

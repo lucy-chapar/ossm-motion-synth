@@ -126,10 +126,12 @@ at the midpoint of the two contacts, verifies arrival, then inhibits output
 and restores the previous output/stall setting. The waveform planner uses
 this measured working span, keeping its existing physical velocity and
 acceleration limits when converting normalized positions to encoder counts.
-After parking, browser Home restores 150 RPM and acceleration register 60000.
-The vendor documents 60000 as disabling the drive's internal acceleration
-curve. The browser plans acceleration itself; applying a second drive ramp
-would add position lag. The Python bridge retains its earlier profile.
+After parking, browser Home restores 150 RPM and 1500 RPM/s drive acceleration.
+This keeps the drive's internal ramp enabled to soften changes between serial
+position targets (100 ms from rest to the full configured speed). The browser
+planner retains its gentler 300 RPM/s nominal acceleration with ten percent
+headroom. The drive ramp can add tracking lag; it does not make physically
+limited patterns achievable. The Python bridge retains its earlier profile.
 A successful Home does not start waveform motion.
 
 The bridge never transmits an absolute position target of zero because that
