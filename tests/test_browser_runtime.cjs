@@ -7,12 +7,13 @@ const { createRuntime } = require("../virtual_synth/static/browser-runtime.js");
 function setup({ supported = true, factory } = {}) {
   let now = 0, choices = 0, opens = 0;
   const port = { getInfo: () => ({ usbVendorId: 1027, usbProductId: 24577 }) };
-  const serial = supported ? { getPorts: async () => [port], requestPort: () => { choices++; return Promise.resolve(port); } } : null;
+  const listeners = {};
+  const serial = supported ? { addEventListener: (name,fn)=>{listeners[name]=fn;}, removeEventListener: ()=>{}, getPorts: async () => [port], requestPort: () => { choices++; return Promise.resolve(port); } } : null;
   const runtime = createRuntime({ serial, clock: () => now, autoStart: false,
     transportFactory: (selected) => { assert.equal(selected, port); opens++; return factory(); } });
   const action = (name, details = {}) => runtime.request("/api/action", { action: name, ...details });
   return { runtime, action, advance: (dt) => { now += dt; }, time: () => now, port,
-    counts: () => ({ choices, opens }), async connect() { const chosen = await runtime.choosePort(); return action("connect", { port: chosen }); } };
+    emit: (name,event)=>listeners[name]?.(event), counts: () => ({ choices, opens }), async connect() { const chosen = await runtime.choosePort(); return action("connect", { port: chosen }); } };
 }
 function fakeMotor({ stopConfirmed = true } = {}) {
   const hw = { connected: false, mode: 1, output_enabled: false, pending_raw: 0, pwm_raw: 0,
@@ -248,4 +249,20 @@ test("default sine uses reported drive limits across a measured 180mm rail", asy
   assert.ok(span > .5, `Default pattern span was only ${span}`);
   assert.ok(samples.every(s => Math.abs(s.velocity) <= motor.hw.max_velocity_raw_s / 143944 + 1e-9));
   await env.action("stop");
+});
+
+test("USB disconnect releases old transport and reconnect never starts motion", async () => {
+ const motors=[fakeMotor(),fakeMotor()],env=setup({factory:()=>motors.shift()});await env.connect();
+ env.emit('disconnect',{port:env.port});await env.runtime.tick();
+ assert.equal(env.runtime.state().hardware.connected,false);
+ await env.connect();assert.equal(env.runtime.state().hardware.connected,true);
+ assert.equal(env.runtime.state().armed,false);assert.equal(env.runtime.state().running,false);
+ await env.runtime.close();
+});
+test("reply recovery pauses time instead of faulting or generating catch-up targets", async () => {
+ const motor=fakeMotor();motor.hw.homed=true;const env=setup({factory:()=>motor});
+ await env.connect();await env.action('arm');await env.action('run');
+ const command=motor.command.bind(motor);motor.command=async target=>{env.advance(.35);motor.hw.communication_recoveries=1;return command(target);};
+ env.advance(.1);await env.runtime.tick();env.advance(.02);await env.runtime.tick();
+ assert.equal(env.runtime.state().fault,null);assert.equal(env.runtime.state().running,true);await env.runtime.close();
 });

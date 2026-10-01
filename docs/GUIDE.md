@@ -213,7 +213,7 @@ Hardware target/feedback cycles run at most 10 Hz, independent of browser
 animation. Each run lasts at most 20 seconds. The browser allows 200 ms per 19200-baud transaction; a fast UI or oscillator does not imply high motor bandwidth.
 Browser tracking error beyond one command interval of travel plus 1024 counts,
 capped at ten percent of the working span, for three fresh samples, drive faults, configuration
-changes, communication failures and missed scheduling deadlines latch a fault.
+changes, persistent communication failures and missed scheduling deadlines latch a fault.
 Targets are never retried after an ambiguous write acknowledgment.
 
 ## Stop, disconnect and recovery
@@ -268,4 +268,26 @@ Stop also completed without a fault. Stop readbacks confirmed output
 inhibited, zero PWM and stationary encoder feedback. This verifies one drive
 and adapter through a direct serial harness, not the deployed Chrome session.
 Intermittent response timeouts were also observed during this session; they
-remain latched faults and never cause automatic motion retries.
+are now eligible for the bounded reply recovery described below; uncertain motion targets are never resent.
+
+### Brief glitches and reconnecting
+
+The browser retries a missing or corrupt status reply once after clearing late
+bytes. A lost waveform-target acknowledgement triggers fresh, validated status
+feedback rather than retransmitting the target. The planner pauses during this
+recovery and resumes from its current phase without catch-up targets. Three
+consecutive target cycles requiring recovery stop the run. A failed write,
+closed stream, drive alarm, changed configuration or out-of-range position still
+stops immediately. Travel bounds and the run time limit remain in effect.
+
+After a confirmed stop from a communication fault, **Reset fault** checks three
+fresh stationary readings and lets you Arm again on the same connection,
+retaining the measured rail. USB unplug releases the old port automatically.
+Reconnect checks the drive and, if the previous stop was unconfirmed and output
+is still enabled, inhibits it and verifies stationary feedback. A new USB
+connection requires Home again. Reconnection never starts motion automatically.
+
+A connected-drive test discarded one status reply and one target acknowledgement
+while the motor ran a 20-second sine. Both recovered, the run completed without
+a fault, and output inhibition was confirmed. This tested deliberately discarded
+responses through the serial harness, not a physical USB unplug during motion.

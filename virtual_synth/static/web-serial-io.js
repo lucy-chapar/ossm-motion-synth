@@ -253,6 +253,12 @@
         return validateResponse(tx, Uint8Array.from([...head, ...tail]));
       } catch (error) {
         this._resyncAfter = deadline;
+        // The write completed. A missing/corrupt response can be recovered by
+        // fresh feedback; a pending/failed write or closed stream cannot.
+        if (error instanceof TransportError && !this._receiveError && !this._closing &&
+            /Response timeout|CRC|Response slave|Response function|byte count|trailing/.test(error.message)) {
+          error.recoverableResponse = true;
+        }
         throw error;
       }
     }

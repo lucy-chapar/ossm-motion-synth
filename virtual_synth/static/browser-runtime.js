@@ -106,13 +106,16 @@
       signal = engine.step(Math.min(dt, 0.25), { gate, running });
       if (transport && now - lastIO >= (running || homing().active ? 0.1 : 0.5)) {
         lastIO = now;
-        const ioEpoch = epoch;
+        const ioEpoch = epoch, recoveriesBefore = transport.status().communication_recoveries || 0;
         try {
           if (homing().active) {
             lastHardware = await transport.poll_home();
             if (!lastHardware.homing && lastHardware.fault) await fail(`Sensorless homing: ${lastHardware.fault}`);
           } else if (running) lastHardware = await transport.command(signal.command);
           else if (transport.status().connected && !fault) lastHardware = await transport.snapshot();
+          // A bounded recovery pauses the planner. Do not advance through the
+          // missed interval or send catch-up targets afterward.
+          if ((lastHardware?.communication_recoveries || 0) > recoveriesBefore) lastTick = lastIO = clock();
         } catch (error) { if (ioEpoch === epoch) await fail(`RS485: ${error.message || error}`); }
       }
       const hw = hardware();
@@ -202,7 +205,10 @@
       } else if (name === "reset") {
         if (running || armed) throw new Error("Stop before resetting a fault.");
         if (unconfirmedStop) throw new Error("Stop is unconfirmed. Reconnect and verify disabled output first.");
-        if (transport?.status().fault) throw new Error("Disconnect and inspect the drive before reconnecting.");
+        if (transport?.status().fault) {
+          if (!transport.reset_fault) throw new Error("Reconnect before resetting this fault.");
+          lastHardware = await transport.reset_fault(); await assertCurrent();
+        }
         fault = null; gate = false;
       } else if (name === "connect") {
         if (armed || transport) throw new Error("Stop and disconnect before selecting another port.");
@@ -210,7 +216,10 @@
         if (!listed.ports.some((port) => port.device === payload.port)) throw new Error("Choose a currently available serial adapter.");
         await assertCurrent();
         const candidate = transportFactory(ports.get(payload.port));
-        try { lastHardware = await candidate.connect(); }
+        try {
+          lastHardware = await candidate.connect();
+          if (unconfirmedStop && lastHardware.output_enabled && candidate.recover_stop) lastHardware = await candidate.recover_stop();
+        }
         catch (error) { await candidate.close(); throw error; }
         if (requestedEpoch !== epoch || closed) {
           await candidate.close(); lastHardware = null;
@@ -247,7 +256,16 @@
     }
     function onDisconnect(event) {
       if (transport && (event.target === connectedPort || event.port === connectedPort)) {
-        fence(); enqueue(() => fail("USB serial adapter disconnected. Reconnect before continuing."));
+        fence(); enqueue(async () => {
+          await fail("USB serial adapter disconnected. Reconnect to continue.");
+          const detached = transport;
+          try { await detached?.close(); } catch (_) { /* Retain stop uncertainty. */ }
+          if (transport === detached) {
+            lastHardware = detached?.status() || lastHardware;
+            if (lastHardware) lastHardware.connected = false;
+            transport = null; connectedPort = null;
+          }
+        });
       }
     }
     serial?.addEventListener?.("disconnect", onDisconnect);

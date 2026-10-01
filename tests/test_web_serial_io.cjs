@@ -270,3 +270,9 @@ test("unsupported and malformed requests are rejected before any write", async (
   assert.equal(port.writes.length, 2);
   await connection.close();
 });
+
+test("missing response is recoverable, but the request is not resent automatically", async () => {
+ const port=new FakePort(()=>{}),connection=new WebSerialConnection(port);await connection.open();
+ await assert.rejects(connection.exchange(absoluteRequest(100),.02),e=>e.recoverableResponse===true);
+ assert.equal(port.writes.length,1);await connection.close();
+});

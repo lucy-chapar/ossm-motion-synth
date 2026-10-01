@@ -49,6 +49,7 @@
       this._factory = connectionFactory; this._clock = now; this._wait = sleep;
       for (const field of ["connection", "values", "baseline", "origin", "hold_position", "low", "high", "enabled_at", "target", "stop_position", "fault", "observed_at", "home_origin", "home_started", "home_phase_started", "home_reference", "home_expected", "home_initial", "home_park", "home_motion_timeout", "home_move_phase", "home_move_from", "home_move_target", "home_contact_phase", "home_contact_position", "home_hold_position", "proposed_endpoints", "proposed_bounds", "measured_endpoints", "measured_travel"]) this["_" + field] = null;
       for (const field of ["owned", "cleanup_attempted", "armed", "running", "stop_confirmed", "homing", "homed", "home_activity"]) this["_" + field] = false;
+      this._communication_recoveries = 0; this._recovery_streak = 0;
       this._tracking_failures = 0; this._home_phase = "idle"; this._home_progress = 0; this._home_direction = "normal";
       this._cleanup_errors = []; this._home_samples = []; this._home_actions = []; this._home_candidates = {}; this._home_contacts = {};
       this._queue = Promise.resolve(); this._epoch = 0; this._activeEpoch = 0; this._inCleanup = false;
@@ -87,6 +88,7 @@
         output_limit_stall_raw: v?.[24] ?? null, pwm_raw: v?.[19] ?? null,
         origin_raw: this._origin, raw_bounds: this._origin !== null ? [this._low, this._high] : null,
         position_normalized: position !== null && this._origin !== null ? (position - this._low) / (this._high - this._low) : null,
+        communication_recoveries: this._communication_recoveries,
         target_raw: this._target, observed_at: this._observed_at,
         run_seconds: this._running && this._enabled_at !== null ? Math.max(0, this._clock() - this._enabled_at) : 0,
         max_run_seconds: MAX_RUN_SECONDS, cleanup_errors: this._cleanup_errors.slice(), notice,
@@ -109,7 +111,15 @@
     }
     async _read(budget = null) {
       try {
-        this._values = io.parseSnapshot(await this._exchange(io.snapshotRequest(), budget ?? this._budget()));
+        let response;
+        try { response = await this._exchange(io.snapshotRequest(), budget ?? this._budget()); }
+        catch (error) {
+          if (!error.recoverableResponse || this._inCleanup) throw error;
+          this._checkCancelled();
+          response = await this._exchange(io.snapshotRequest(), budget ?? this._budget());
+          this._communication_recoveries++;
+        }
+        this._values = io.parseSnapshot(response);
         this._observed_at = this._clock(); this._checkCancelled();
         if (this._stop_confirmed) {
           let position;
@@ -171,6 +181,46 @@
       }
       return this.status();
     }
+    async reset_fault() {
+      this._require_connection();
+      if (this._armed || this._running || this._homing || !this._stop_confirmed ||
+          !/Response timeout|Communication remained unstable/.test(this._fault || "")) {
+        throw new TransportError("Reconnect or Home is required for this fault");
+      }
+      const positions = [];
+      for (let i = 0; i < 3; i++) {
+        if (i) await this._wait(.1);
+        const v = await this._read(.5); this._configuration(v, false, this._baseline);
+        if (!this._inhibited_feedback(v)) throw new TransportError("Fault reset requires stationary inhibited feedback");
+        positions.push(io.signedPosition(v));
+      }
+      if (spread(positions) > 4) throw new TransportError("Encoder moved during fault reset");
+      this._fault = null; this._recovery_streak = 0; this._tracking_failures = 0;
+      this._cleanup_attempted = false; this._cleanup_errors = [];
+      this._homed = Boolean(this._measured_endpoints && this._origin !== null);
+      return this.status();
+    }
+    async recover_stop() {
+      this._require_connection();
+      if (!this.allow_motion || this._armed || this._running || this._homing) throw new TransportError("Reconnect stop requires an idle transport");
+      // After USB loss the motor may still be holding the last bounded target.
+      // Inhibit only; never restore an old run or reuse its calibration.
+      this._owned = true; this._stop_confirmed = false;
+      try {
+        try { await this._write("inhibit", .5); }
+        catch (error) { if (!error.recoverableResponse) throw error; }
+        const positions = [];
+        for (let i = 0; i < 3; i++) {
+          if (i) await this._wait(.1);
+          const v = await this._read(.5); this._configuration(v, false);
+          if (!this._inhibited_feedback(v)) throw new TransportError("Reconnect stop is not yet stationary");
+          positions.push(io.signedPosition(v));
+        }
+        if (spread(positions) > 4) throw new TransportError("Encoder moved during reconnect stop verification");
+        this._stop_position = positions.at(-1); this._stop_confirmed = true; this._owned = false;
+      } catch (error) { this._fault = String(error.message || error); throw error; }
+      return this.status();
+    }
     async snapshot() {
       this._require_connection();
       try { const v = await this._read(); if (this._armed || this._running) this._check_active(v, this._running); }
@@ -227,6 +277,7 @@
       if (!this.allow_motion || !this._armed || !this._running) throw new TransportError("ARM and START are required before sending a target");
       try {
         if (typeof normalized !== "number" || !Number.isFinite(normalized) || normalized < 0 || normalized > 1) throw new TransportError("Position must be finite and normalized0..1");
+        const recoveriesBefore = this._communication_recoveries;
         const target = this._nonzero_target(this._low + (this._high - this._low) * normalized, this._low, this._high);
         const position = this._check_active(await this._read(), true);
         // Feedback precedes the next 100 ms target. Allow one command interval
@@ -234,7 +285,17 @@
         const trackingLimit = Math.min((this._high - this._low) * .1, 1024 + RUN_MAX_VELOCITY * .1);
         this._tracking_failures = Math.abs(position - this._target) > trackingLimit ? this._tracking_failures + 1 : 0;
         if (this._tracking_failures >= 3) throw new TransportError("Tracking error exceeded the motion budget for three fresh samples");
-        await this._absolute(target, this._budget()); this._target = target;
+        try { await this._absolute(target, this._budget()); }
+        catch (error) {
+          if (!error.recoverableResponse) throw error;
+          // Never retransmit the uncertain target. Recover the link with fresh
+          // validated feedback before accepting another, current target.
+          this._check_active(await this._read(), true);
+          this._communication_recoveries++;
+        }
+        this._target = target;
+        this._recovery_streak = this._communication_recoveries > recoveriesBefore ? this._recovery_streak + 1 : 0;
+        if (this._recovery_streak >= 3) throw new TransportError("Communication remained unstable for three target cycles");
       } catch (error) { await this._fault_and_cleanup(error); }
       return this.status();
     }
@@ -554,7 +615,11 @@
         this._cleanup_attempted = true; this._stop_confirmed = false;
         const errors = [], positions = [];
         for (const operation of ["clear", "inhibit"]) {
-          try { await this._write(operation, IO_TIMEOUT); } catch (error) { errors.push(operation + ": " + (error.message || error)); }
+          try { await this._write(operation, IO_TIMEOUT); }
+          catch (error) {
+            if (error.recoverableResponse) this._communication_recoveries++;
+            else errors.push(operation + ": " + (error.message || error));
+          }
         }
         try {
           const deadline = this._clock() + 1.5;

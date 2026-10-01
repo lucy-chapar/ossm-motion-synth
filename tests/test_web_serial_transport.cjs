@@ -1385,3 +1385,44 @@ test("direct Home measures both directions without native coordinate reset", asy
     await context.transport.close();
   }
 });
+
+function droppedReply() { return Object.assign(new TransportError("Response timeout"), {recoverableResponse:true}); }
+test("one dropped status reply recovers without stopping or duplicating a target", async () => {
+ const {transport,motor}=await running(); motor.onRead=()=>{motor.onRead=null;throw droppedReply();};
+ await transport.command(.6); assert.equal(motor.destinations.length,1);
+ assert.equal(transport.status().running,true); assert.equal(transport.status().communication_recoveries,1);
+ await transport.stop(); await transport.close();
+});
+test("lost target acknowledgement uses fresh feedback and never retransmits target", async () => {
+ const {transport,motor}=await running(); motor.onCommand=(_,op)=>{if(op==='absolute'){motor.onCommand=null;throw droppedReply();}};
+ await transport.command(.6); assert.equal(motor.destinations.length,1); assert.equal(transport.status().running,true);
+ await transport.stop(); await transport.close();
+});
+test("persistent dropped replies stop after three recovering target cycles", async () => {
+ const {transport,motor}=await running(); motor.onCommand=(_,op)=>{if(op==='absolute')throw droppedReply();};
+ await transport.command(.5);await transport.command(.5);
+ await assert.rejects(transport.command(.5),/Communication remained unstable/);
+ assert.equal(motor.destinations.length,3); assert.equal(transport.status().stop_confirmed,true);
+ await transport.close();
+});
+test("lost inhibit acknowledgement can be confirmed by fresh stationary readbacks", async () => {
+ const {transport,motor}=await running();motor.onCommand=(_,op)=>{if(op==='inhibit')throw droppedReply();};
+ assert.equal((await transport.stop()).stop_confirmed,true);await transport.close();
+});
+
+test("reconnect inhibits a still-enabled drive without resuming or inheriting calibration", async () => {
+ const {transport,motor}=make();motor.values[1]=1;await transport.connect();
+ const result=await transport.recover_stop();assert.equal(result.stop_confirmed,true);
+ assert.equal(result.output_enabled,false);assert.equal(result.homed,false);
+ assert.deepEqual(motor.commands,['inhibit']);assert.deepEqual(motor.destinations,[]);await transport.close();
+});
+
+test("confirmed communication fault resets on the same connection without motion or losing rail bounds", async () => {
+ const {transport,motor}=await running();transport._measured_endpoints=[15000,25000];
+ motor.onCommand=(_,op)=>{if(op==='absolute')throw droppedReply();};
+ await transport.command(.5);await transport.command(.5);await assert.rejects(transport.command(.5));
+ motor.onCommand=null;const targets=motor.destinations.length;
+ const result=await transport.reset_fault();assert.equal(result.fault,null);assert.equal(result.homed,true);
+ assert.equal(result.armed,false);assert.equal(result.running,false);assert.equal(motor.destinations.length,targets);
+ await transport.close();
+});
