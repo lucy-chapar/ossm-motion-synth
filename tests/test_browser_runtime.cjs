@@ -4,12 +4,12 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const { createRuntime } = require("../virtual_synth/static/browser-runtime.js");
 
-function setup({ supported = true, factory } = {}) {
+function setup({ supported = true, factory, storage } = {}) {
   let now = 0, choices = 0, opens = 0;
   const port = { getInfo: () => ({ usbVendorId: 1027, usbProductId: 24577 }) };
   const listeners = {};
   const serial = supported ? { addEventListener: (name,fn)=>{listeners[name]=fn;}, removeEventListener: ()=>{}, getPorts: async () => [port], requestPort: () => { choices++; return Promise.resolve(port); } } : null;
-  const runtime = createRuntime({ serial, clock: () => now, autoStart: false,
+  const runtime = createRuntime({ serial, storage, clock: () => now, autoStart: false,
     transportFactory: (selected) => { assert.equal(selected, port); opens++; return factory(); } });
   const action = (name, details = {}) => runtime.request("/api/action", { action: name, ...details });
   return { runtime, action, advance: (dt) => { now += dt; }, time: () => now, port,
@@ -325,4 +325,37 @@ test("Play combines fresh arming and starting while retaining Home requirement",
  await env.action("resume"); await env.action("stop");
  await env.action("play"); assert.equal(env.runtime.state().running,true);
  await env.runtime.close();
+});
+
+test("remembered adapter identity survives property order and concurrent discovery", async () => {
+  const port = { getInfo: () => ({usbProductId:29987, usbVendorId:6790}) };
+  const motor = fakeMotor(); let opens=0;
+  const runtime=createRuntime({autoStart:false,
+    storage:{getItem:()=>'{"usbVendorId":6790,"usbProductId":29987}',setItem:()=>{}},
+    serial:{getPorts:async()=>[port],requestPort:async()=>port},
+    transportFactory:()=>{opens++;return motor;}});
+  assert.deepEqual(await Promise.all([runtime.autoConnect(),runtime.autoConnect()]),[true,true]);
+  assert.equal(opens,1); assert.equal(runtime.state().running,false);
+  await runtime.close();
+});
+
+test("empty or cancelled Chrome chooser gives actionable guidance without a motor fault", async () => {
+  const error=new Error('No port selected');error.name='NotFoundError';
+  const runtime=createRuntime({autoStart:false,serial:{getPorts:async()=>[],requestPort:async()=>{throw error;}}});
+  await assert.rejects(runtime.choosePort(),{name:'NotFoundError'});
+  assert.match(runtime.state().connection_notice,/unplug and reconnect USB/);
+  assert.equal(runtime.state().fault,null);
+  await runtime.close();
+});
+
+test("reattachment waits for disconnect cleanup before reconnecting", async () => {
+  const store=new Map();
+  const env=setup({factory:()=>fakeMotor(),storage:{getItem:k=>store.get(k),setItem:(k,v)=>store.set(k,v)}});
+  await env.connect();
+  env.emit('disconnect',{target:env.port});
+  assert.equal(await env.runtime.autoConnect(),true);
+  assert.equal(env.counts().opens,2);
+  assert.equal(env.runtime.state().running,false);
+  assert.equal(env.runtime.state().homing.valid,false);
+  await env.runtime.close();
 });

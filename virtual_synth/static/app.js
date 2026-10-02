@@ -298,7 +298,7 @@
     $("port-select").disabled = connecting || connected || Boolean(state.armed || state.running || state.paused);
     if (browserRuntime) $("refresh-ports").disabled = !browserRuntime.supported || connecting || connected || Boolean(state.armed || state.running || state.paused || state.stopping);
     $("hardware-metrics").hidden = !connected;
-    $("hardware-status").textContent = connected ? `${hardware.port ? `Connected: ${hardware.port}` : hardware.device ? `Connected: ${hardware.device}` : "Connected to motor interface."}${hardware.notice ? ` ${hardware.notice}` : ""}` : "No motor connected.";
+    $("hardware-status").textContent = connected ? `${hardware.port ? `Connected: ${hardware.port}` : hardware.device ? `Connected: ${hardware.device}` : "Connected to motor interface."}${hardware.notice ? ` ${hardware.notice}` : ""}` : state.connection_notice || "No motor connected.";
     $("encoder-raw").textContent = Number.isFinite(hardware.position_raw) ? `${hardware.position_raw} counts` : "No feedback";
     $("current-raw").textContent = Number.isFinite(hardware.current_raw) ? `${hardware.current_raw} raw` : "No feedback";
     const confirmed = hardware.stop_confirmed === true
@@ -573,7 +573,7 @@
       await refreshPorts();
       $("port-select").value = id;
       if (state) renderHardware();
-    } catch (error) { if (error.name !== "NotFoundError") report(error.message, true); }
+    } catch (error) { report(browserRuntime.state().connection_notice || error.message, error.name !== "NotFoundError"); }
   });
   $("port-select").addEventListener("change", () => { if (state) renderHardware(); });
   $("connect-button").addEventListener("click", async () => {
@@ -594,7 +594,7 @@
       await action("connect", { port }, true);
       $("hardware-details").open = true;
     } catch (error) {
-      if (error.name !== "NotFoundError" && epoch === motionEpoch) report(error.message, true);
+      if (epoch === motionEpoch) report(browserRuntime?.state().connection_notice || error.message, error.name !== "NotFoundError");
     } finally {
       connecting = false;
       if (state) renderHardware();

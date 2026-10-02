@@ -26,7 +26,15 @@
     const ports = new Map();
     const storage = options.storage === undefined ? globalThis.localStorage : options.storage;
     const adapterKey = "motion-synth.adapter";
-    const identity = port => JSON.stringify(port.getInfo?.() || {});
+    const identity = port => {
+      const info = port.getInfo?.() || {};
+      return JSON.stringify(Object.fromEntries(Object.keys(info).sort().map(key => [key, info[key]])));
+    };
+    const normalizedIdentity = value => {
+      try { const info = JSON.parse(value); return JSON.stringify(Object.fromEntries(Object.keys(info).sort().map(key => [key, info[key]]))); }
+      catch (_) { return null; }
+    };
+    let connectionNotice = "", autoConnecting = null;
     let paused = false;
     let nextPort = 1, transport = null, connectedPort = null, lastHardware = null;
     let mode = "simulation", armed = false, running = false, gate = false, fault = null;
@@ -57,7 +65,7 @@
     };
     function state() {
       return copy({ mode, armed, running, paused, gate, fault, params: engine.params, signal, history,
-        hardware: hardware(), allow_motion: supported, run_remaining_s: null,
+        connection_notice: connectionNotice, hardware: hardware(), allow_motion: supported, run_remaining_s: null,
         unconfirmed_stop: unconfirmedStop, stopping: stoppingCount > 0, control_revision: revision, homing: homing(), web_serial_supported: supported });
     }
     function fence() {
@@ -146,7 +154,13 @@
       const requestedEpoch = epoch;
       return serial.requestPort().then((port) => {
         if (closed || requestedEpoch !== epoch) throw new Error("Adapter selection was cancelled. Choose again when ready.");
+        connectionNotice = "";
         return remember(port);
+      }).catch(error => {
+        if (error.name === "NotFoundError") connectionNotice = "No adapter selected. If the chooser is empty, unplug and reconnect USB, close other apps using the adapter, then choose again. Chrome permission belongs to this website and browser profile.";
+        else if (error.name === "SecurityError") connectionNotice = "Serial access is blocked. Allow serial devices in this site's Chrome settings and use desktop Chrome over HTTPS.";
+        else connectionNotice = `Adapter selection failed: ${error.message || error}`;
+        throw error;
       });
     }
     async function act(payload, requestedEpoch) {
@@ -240,12 +254,16 @@
           lastHardware = await candidate.connect();
           if (unconfirmedStop && lastHardware.output_enabled && candidate.recover_stop) lastHardware = await candidate.recover_stop();
         }
-        catch (error) { await candidate.close(); throw error; }
+        catch (error) {
+          try { await candidate.close(); } catch (_) { /* Preserve the connection error. */ }
+          connectionNotice = `Cannot open adapter: ${error.message || error}. Close other tabs or apps using it, reconnect USB, then try Connect again.`;
+          throw new Error(connectionNotice);
+        }
         if (requestedEpoch !== epoch || closed) {
           await candidate.close(); lastHardware = null;
           throw new Error("Connection was stopped before it completed.");
         }
-        transport = candidate; connectedPort = ports.get(payload.port);
+        connectionNotice = ""; transport = candidate; connectedPort = ports.get(payload.port);
         try { storage?.setItem(adapterKey, identity(connectedPort)); } catch (_) { /* Storage may be unavailable. */ } mode = "hardware"; revision++; history = [];
         await assertCurrent();
         lastIO = lastTick = clock();
@@ -275,17 +293,28 @@
       const requestedEpoch = epoch;
       return enqueue(() => act(payload, requestedEpoch));
     }
-    async function autoConnect() {
-      if (!supported || transport || paused || armed || running || closed) return false;
-      let saved; try { saved = storage?.getItem(adapterKey); } catch (_) { return false; }
-      if (!saved || saved === "{}") return false;
-      const available = await serial.getPorts();
-      const matches = available.filter(port => identity(port) === saved);
-      if (matches.length !== 1) return false;
-      await request("/api/action", { action: "connect", port: remember(matches[0]) });
-      return true;
+    function autoConnect() {
+      if (autoConnecting) return autoConnecting;
+      autoConnecting = (async () => {
+        // USB reattachment can arrive while the disconnect task is closing the old port.
+        await chain;
+        if (!supported || transport || paused || armed || running || closed) return false;
+        let saved; try { saved = normalizedIdentity(storage?.getItem(adapterKey)); } catch (_) { return false; }
+        if (!saved || saved === "{}") return false;
+        const available = await serial.getPorts();
+        const matches = available.filter(port => identity(port) === saved);
+        if (matches.length !== 1) {
+          connectionNotice = matches.length > 1
+            ? "Multiple adapters match the remembered device. Choose the correct adapter to connect."
+            : "Remembered adapter is unavailable. Reconnect USB, or choose an adapter to grant this Chrome profile access.";
+          return false;
+        }
+        await request("/api/action", { action: "connect", port: remember(matches[0]) });
+        return true;
+      })().finally(() => { autoConnecting = null; });
+      return autoConnecting;
     }
-    function onConnect() { autoConnect().catch(() => {}); }
+    function onConnect() { autoConnect().catch(error => { connectionNotice = error.message || String(error); }); }
     function onDisconnect(event) {
       if (transport && (event.target === connectedPort || event.port === connectedPort)) {
         fence(); enqueue(async () => {
