@@ -60,6 +60,10 @@
     if (!Number.isInteger(target) || target < -2147483648 || target > 2147483647 || target === 0) throw new TransportError("Absolute target must be a nonzero signed 32-bit integer; zero resets coordinates.");
     return frame([1, 16, 0, 22, 0, 2, 4, target >>> 8 & 255, target & 255, target >>> 24 & 255, target >>> 16 & 255]);
   }
+  function fastPositionRequest(target) {
+    if (!Number.isInteger(target) || target < -2147483648 || target > 2147483647 || target === 0) throw new TransportError("Position must be nonzero signed32-bit");
+    return frame([1, 0x7b, target >>> 24 & 255, target >>> 16 & 255, target >>> 8 & 255, target & 255]);
+  }
   function outputRequest(operation) {
     if (operation === "clear") return frame([1, 16, 0, 12, 0, 2, 4, 0, 0, 0, 0]);
     if (operation === "enable" || operation === "inhibit") return frame([1, 6, 0, 1, 0, operation === "enable" ? 1 : 0]);
@@ -73,6 +77,7 @@
   function validateRequest(value) {
     const tx = bytes(value);
     validateCRC(tx);
+    if (tx[0] === 1 && tx[1] === 0x7b && tx.length === 8 && tx.slice(2, 6).some(v => v !== 0)) return tx;
     if (tx[0] !== 1 || tx[2] !== 0) throw new TransportError("Only fixed slave 1 registers are supported.");
     if (tx[1] === 3 && tx.length === 8 && tx[3] === 0 && tx[4] === 0 && tx[5] === 26) return tx;
     if (tx[1] === 6 && tx.length === 8 && (CONFIG_REGISTERS.has(tx[3]) || (tx[3] === 1 && tx[4] === 0 && tx[5] <= 1))) return tx;
@@ -89,6 +94,7 @@
     if (rx[1] !== tx[1]) throw new TransportError("Response function mismatch.");
     if (tx[1] === 3) { parseSnapshot(rx); return rx; }
     if (rx.length !== 8) throw new TransportError("Acknowledgement length mismatch.");
+    if (tx[1] === 0x7b) return rx; // Reply contains encoder low word, then high word.
     // Output acknowledgements may contain pre-update status flags. The caller
     // validates those against the previous snapshot and then verifies readback.
     const comparedBytes = tx[1] === 6 && tx[3] === 1 ? 4 : 6;
@@ -294,5 +300,5 @@
       }
     }
   }
-  return { WebSerialConnection, TransportError, crc16, frame, snapshotRequest, parseSnapshot, signedPosition, pending, absoluteRequest, outputRequest, configRequest };
+  return { WebSerialConnection, TransportError, crc16, frame, snapshotRequest, parseSnapshot, signedPosition, pending, absoluteRequest, fastPositionRequest, outputRequest, configRequest };
 });

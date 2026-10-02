@@ -126,10 +126,10 @@ at the midpoint of the two contacts, verifies arrival, then inhibits output
 and restores the previous output/stall setting. The waveform planner uses
 this measured working span, keeping its existing physical velocity and
 acceleration limits when converting normalized positions to encoder counts.
-After parking, browser Home restores 150 RPM and 1500 RPM/s drive acceleration.
+After parking, browser Home restores 600 RPM and 20000 RPM/s drive acceleration.
 This keeps the drive's internal ramp enabled to soften changes between serial
-position targets (100 ms from rest to the full configured speed). The browser
-planner retains its gentler 300 RPM/s nominal acceleration with ten percent
+position targets (30 ms from rest to the full configured speed). The browser
+planner retains its gentler 3600 RPM/s nominal acceleration with ten percent
 headroom. The drive ramp can add tracking lag; it does not make physically
 limited patterns achievable. The Python bridge retains its earlier profile.
 A successful Home does not start waveform motion.
@@ -203,9 +203,9 @@ before accepting it. Reconnecting requires Home again.
 
 RUN clears pending motion, checks stationary disabled readback, enables the
 drive and checks the enabled hold before sending bounded targets. The planner
-uses a browser maximum velocity of 73728 counts/s (90 nominal mm/s) and
-maximum acceleration of 147456 counts/s² (180 nominal mm/s²), with ten percent
-speed headroom below the drive's 150 RPM setting. The optional Python bridge
+uses a browser maximum velocity of 294912 counts/s (360 nominal mm/s) and
+maximum acceleration of 1769472 counts/s² (2160 nominal mm/s²), with ten percent
+speed headroom below the drive's 600 RPM setting. The optional Python bridge
 retains 3822 counts/s and 8192 counts/s². It bounds position, speed and acceleration;
 **jerk limiting is not implemented**. Waveforms with abrupt corners therefore
 produce different requested and planned traces, and drive interpolation is
@@ -307,7 +307,7 @@ full percentage ranges. The underlying engine accepts the previous parameter
 range for compatibility. These control ranges improve adjustment resolution;
 wide strokes and combined modulation can still engage the motion limiter.
 
-Stop verification tolerates a dropped status reply within its existing 1.5-second
+Stop verification tolerates a dropped status reply within its three-second
 deadline, then requires three fresh stable inhibited readings. Pressing Stop
 again after failed cleanup makes a new inhibit/verification attempt; it never
 restarts motion. The fault banner retains the original fault and cleanup error.
@@ -324,33 +324,45 @@ After a successful connection, the browser remembers the adapter USB identity.
 On page load or USB attachment it reconnects only if exactly one previously
 permitted adapter matches. Identical adapters require manual selection. First
 use still requires the browser chooser; automatic connection never starts motion
-or restores calibration. Home and Arm remain explicit after reconnection.
-
-Running target cycles now request a 60 ms cadence instead of 100 ms. Each cycle
-still reads and validates feedback before sending the next absolute target. The
-actual rate depends on serial response time; no commands queue up to catch up.
-The drive retains its 1500 RPM/s acceleration ramp and the software planner's
-lower acceleration budget. This uses the existing drive position protocol rather
-than assuming an unsupported buffered trajectory command.
-
+or restores calibration. Home and Play remain explicit after reconnection.
 
 Browser homing uses 70 RPM / 150 RPM/s for the long endpoint searches and
 center parking. The short retreat and repeated contact checks retain 35 RPM /
 75 RPM/s. Output limit, contact confirmation, repeat agreement, search bounds
-and stop verification are unchanged. The faster profile requires a live check.
+and stop verification are unchanged. The faster homing profile has passed the connected rail check.
 
 Stop verification now permits up to three seconds for inhibited feedback to settle.
 Three stable encoder readings and disabled-output, speed, pending and PWM checks
 remain required. A failure includes the last feedback fields and encoder spread.
 
-The browser Rate control now reaches 1 Hz. Homing restores a 300 RPM drive
-speed ceiling and retains the 1500 RPM/s drive ramp. The planner budgets
-180 mm/s and 360 mm/s² with the existing headroom. High-rate wide strokes
-can still be acceleration-limited; actual following depends on the mechanism.
-This higher run profile has not yet been physically verified.
+The browser Rate control reaches 1 Hz. Wide high-rate patterns can still exceed
+the motion budget; the tested faster profile is described below.
 
 
 The browser controls are Connect → Home → Play. Play performs the same
 fresh stationary arming checks internally before enabling motion. It changes
 to Pause while running and Resume while paused. Stop ends the session and
 inhibits output. Connecting and homing never automatically start a pattern.
+
+
+### Faster browser streaming profile
+
+The browser uses the same dedicated `0x7b` absolute-position command as the
+upstream OSSM-alt motor library. Its eight-byte reply carries the current encoder
+position (low word, then high word), not a target echo; this was checked on the
+connected drive with output inhibited and a distinct target. Full configuration,
+alarm, pending and output snapshots remain required at 100 ms intervals.
+Homing retains the established bulk-register position commands.
+
+The stream requests a 33 ms cadence, subject to serial timing, with no catch-up
+queue. The drive ceiling is 600 RPM, internal acceleration is 20000 RPM/s,
+and the planner budgets 360 mm/s and 2160 mm/s². Both drive and planner ramps
+remain enabled. The vendor manual describes lag from the internal ramp when the
+external controller also ramps; higher drive acceleration reduces that overlap.
+
+A bounded physical test completed 0.5 Hz and 1 Hz / 70% sine strokes, including
+Pause/Resume and verified stopping. At 1 Hz the encoder covered 98.1 mm versus
+98.4 mm commanded on this approximately 179.7 mm rail. This validates that
+operating point on the tested mechanism; phase lag remains. Other drive revisions
+must support the dedicated position command. Unsupported replies stop output;
+the transport never switches protocols or resends uncertain targets during a run.

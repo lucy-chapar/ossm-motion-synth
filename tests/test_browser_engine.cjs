@@ -207,3 +207,16 @@ test("invalid time, gate, target and reset inputs cannot partially advance the e
   }
   for (const phase of [NaN, Infinity, true, "0"]) assert.throws(() => waveform("sine", phase));
 });
+
+
+test("higher hardware motion budget retains a broad one-hertz sine stroke", () => {
+ const {Engine}=require("../virtual_synth/static/browser-engine.js");
+ const e=new Engine(); e.configure({rate_hz:1,stroke:.7});
+ e.reset({position:.5,vmax:294912/143949,amax:1769472/143949});
+ let low=1,high=0;
+ for(let i=0;i<1000;i++) {const s=e.step(.02,{running:true});
+  assert.ok(s.command>=.1 && s.command<=.9);
+  if(i>250){low=Math.min(low,s.command);high=Math.max(high,s.command);}
+ }
+ assert.ok(high-low>.55, "planner should preserve the feasible 56% working-range stroke");
+});

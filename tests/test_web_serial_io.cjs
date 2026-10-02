@@ -276,3 +276,24 @@ test("missing response is recoverable, but the request is not resent automatical
  await assert.rejects(connection.exchange(absoluteRequest(100),.02),e=>e.recoverableResponse===true);
  assert.equal(port.writes.length,1);await connection.close();
 });
+
+
+test("dedicated absolute position request uses signed big-endian target", () => {
+ const io=require("../virtual_synth/static/web-serial-io.js");
+ assert.deepEqual(Array.from(io.fastPositionRequest(-1).slice(0,6)),[1,123,255,255,255,255]);
+ assert.throws(()=>io.fastPositionRequest(0));
+ assert.throws(()=>io.fastPositionRequest(2**31));
+});
+
+
+test("dedicated position exchange accepts encoder feedback instead of a target echo and rejects corrupt replies", async () => {
+ for (const corrupt of [false,true]) {
+  const reply=frame([1,123,0x12,0x34,0xff,0xff]);
+  if(corrupt) reply[7]^=1;
+  const port=new FakePort((_,p)=>p.emit(reply)), c=new WebSerialConnection(port);
+  await c.open();
+  if(corrupt) await assert.rejects(c.exchange(io.fastPositionRequest(1000),.2), /CRC/);
+  else assert.deepEqual(await c.exchange(io.fastPositionRequest(1000),.2),reply);
+  await c.close();
+ }
+});

@@ -17,7 +17,7 @@ class Clock {
 class FakeConnection {
   constructor({native = false, homeIgnored = false} = {}) {
     this.values = Array(26).fill(0);
-    this.values[0] = 1; this.values[2] = 300; this.values[3] = 1500;
+    this.values[0] = 1; this.values[2] = 600; this.values[3] = 20000;
     this.values[11] = 800; this.values[21] = 1;
     this.position(20000);
     this.native = native; this.homeIgnored = homeIgnored;
@@ -58,6 +58,13 @@ class FakeConnection {
           if (replacement !== undefined) return replacement;
         }
         return frame([1, 3, 52, ...this.values.flatMap(value => [value >>> 8, value & 255])]);
+      }
+      if (tx[1] === 0x7b) {
+        const target = (tx[2] << 24) | (tx[3] << 16) | (tx[4] << 8) | tx[5];
+        this.target = target; this.destinations.push(target); this.commands.push("absolute");
+        const actual = this.values[22] | this.values[23] << 16;
+        this.position(target); this.remaining(0);
+        return frame([1, 0x7b, actual >>> 8 & 255, actual & 255, actual >>> 24 & 255, actual >>> 16 & 255]);
       }
       const register = tx[2] << 8 | tx[3];
       let reply, operation;
@@ -120,10 +127,10 @@ class FakeConnection {
   }
 }
 
-function make({motor = new FakeConnection(), allowed = true, nativeHome = true} = {}) {
+function make({motor = new FakeConnection(), allowed = true, nativeHome = true, fastPositions = false} = {}) {
   const clock = new Clock(), selectedPort = {}, factories = [];
   const transport = new MotorTransport(selectedPort, {
-    allowMotion: allowed, nativeHome, portLabel: "offline-test", clock: clock.now, wait: clock.wait,
+    allowMotion: allowed, nativeHome, fastPositions, portLabel: "offline-test", clock: clock.now, wait: clock.wait,
     connectionFactory: port => { factories.push(port); return motor; },
   });
   return {transport, motor, clock, factories, selectedPort};
@@ -620,7 +627,7 @@ test("both native directions measure repeatable endpoints and center in one coor
       sign * (3277 - 409600 - 819), sign * -158925, sign * -161382, center]);
     assert.equal(motor.settings.filter(([r, v]) => r === 25 && v === 1).length, 1);
     assert.ok(motor.settings.every(([r]) => r !== 20 && r !== 21));
-    assert.deepEqual(motor.values.slice(0, 4), [1, 0, 300, 1500]);
+    assert.deepEqual(motor.values.slice(0, 4), [1, 0, 600, 20000]);
     assert.equal(motor.values[24], 0); assert.equal(motor.values[25], 0);
     for (const [index, state] of motor.absoluteStates.entries()) {
       const recheck = [1, 2, 4, 5].includes(index);
@@ -1183,7 +1190,7 @@ test("native reset flags and defaults may settle before three stationary complet
   }
   assert.equal(transport.status().home_origin_raw, -18);
   assert.equal((await advance(context)).homed, true);
-  assert.deepEqual(motor.values.slice(0, 4), [1, 0, 300, 1500]);
+  assert.deepEqual(motor.values.slice(0, 4), [1, 0, 600, 20000]);
   await transport.close();
 });
 
@@ -1365,7 +1372,7 @@ test("native Home restores saved output despite a temporary inhibited output set
  const context = await homing(false,motor);
  const result = await advance(context);
  assert.equal(result.homed,true);assert.equal(result.output_limit_stall_raw,540);
- assert.equal(result.speed_rpm,300);assert.equal(result.acceleration_rpm_s,1500);
+ assert.equal(result.speed_rpm,600);assert.equal(result.acceleration_rpm_s,20000);
 });
 
 test("direct Home measures both directions without native coordinate reset", async () => {
@@ -1466,4 +1473,18 @@ test("stop allows delayed mechanical settling without resending motion", async (
   assert.ok(clock.now() - began <= 3.01);
   assert.deepEqual(motor.commands.slice(before), ["clear", "inhibit"]);
   await transport.close();
+});
+
+
+test("fast stream uses encoder replies and retains periodic full status checks", async () => {
+ const {transport,motor,clock}=await running({fastPositions:true});
+ const before=motor.readCount;
+ await transport.command(.51); await clock.wait(.04); await transport.command(.52);
+ assert.equal(motor.readCount,before);
+ assert.ok(motor.transmissions.some(tx=>tx[1]===0x7b));
+ await clock.wait(.1); await transport.command(.53);
+ assert.equal(motor.readCount,before+1);
+ motor.values[14]=1; await clock.wait(.11);
+ await assert.rejects(transport.command(.54));
+ assert.equal(transport.status().running,false); await transport.close();
 });

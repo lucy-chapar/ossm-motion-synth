@@ -23,7 +23,7 @@
   const HOME_SEARCH_COUNTS = 409600, HOME_MIN_SPAN = 16384, HOME_INSET = 1638;
   const HOME_RETOUCH_OVERTRAVEL = 819;
   // Keep a drive ramp for serial target changes; the planner remains gentler.
-  const RUN_SPEED_RPM = 300, RUN_ACCEL_RPM_S = 1500, PLANNED_ACCEL_RPM_S = 600;
+  const RUN_SPEED_RPM = 600, RUN_ACCEL_RPM_S = 20000, PLANNED_ACCEL_RPM_S = 3600;
   const RUN_MAX_VELOCITY = 32768 * RUN_SPEED_RPM / 60 * .9;
   const RUN_MAX_ACCELERATION = 32768 * PLANNED_ACCEL_RPM_S / 60 * .9;
   const HOME_SPEED_RPM = 70, HOME_ACCEL_RPM_S = 150;
@@ -44,10 +44,11 @@
 
   class MotorTransport {
     constructor(port, { allowMotion = false, connectionFactory = null, clock: now = clock,
-                        wait: sleep = wait, nativeHome = false, portLabel = "Selected USB serial adapter" } = {}) {
+                        wait: sleep = wait, nativeHome = false, fastPositions = false, portLabel = "Selected USB serial adapter" } = {}) {
       if (!port) throw new TypeError("An explicitly selected SerialPort is required");
       this.port = portLabel; this._port = port; this.allow_motion = allowMotion === true;
       this._nativeHome = nativeHome === true;
+      this._fastPositions = fastPositions === true; this._snapshot_at = -Infinity;
       this._factory = connectionFactory; this._clock = now; this._wait = sleep;
       for (const field of ["connection", "values", "baseline", "origin", "hold_position", "low", "high", "enabled_at", "target", "stop_position", "fault", "observed_at", "home_origin", "home_started", "home_phase_started", "home_reference", "home_expected", "home_initial", "home_park", "home_motion_timeout", "home_move_phase", "home_move_from", "home_move_target", "home_contact_phase", "home_contact_position", "home_hold_position", "proposed_endpoints", "proposed_bounds", "measured_endpoints", "measured_travel"]) this["_" + field] = null;
       for (const field of ["owned", "cleanup_attempted", "armed", "running", "stop_confirmed", "homing", "homed", "home_activity"]) this["_" + field] = false;
@@ -121,7 +122,7 @@
           this._communication_recoveries++;
         }
         this._values = io.parseSnapshot(response);
-        this._observed_at = this._clock(); this._checkCancelled();
+        this._observed_at = this._snapshot_at = this._clock(); this._checkCancelled();
         if (this._stop_confirmed) {
           let position;
           if (this._origin === null) { this._configuration(this._values, false, this._baseline); position = io.signedPosition(this._values); }
@@ -152,7 +153,7 @@
       if (!equalPrefix(rx, tx, 6)) throw new TransportError("Absolute-position acknowledgement address/count mismatch; no retry");
     }
     _configuration(v, enabled, baseline = null) {
-      if (v[0] !== 1 || v[1] !== Number(enabled) || v[2] !== RUN_SPEED_RPM || v[3] !== RUN_ACCEL_RPM_S || v[10] !== 0 || v[14] !== 0 || v[20] !== 0 || v[21] !== 1 || v[25] !== 0) throw new TransportError("Require mode1, scalar output " + Number(enabled) + ", speed/acceleration300/1500, gear0, alarm0, save0, address1, special0");
+      if (v[0] !== 1 || v[1] !== Number(enabled) || v[2] !== RUN_SPEED_RPM || v[3] !== RUN_ACCEL_RPM_S || v[10] !== 0 || v[14] !== 0 || v[20] !== 0 || v[21] !== 1 || v[25] !== 0) throw new TransportError("Require mode1, scalar output " + Number(enabled) + ", speed/acceleration600/20000, gear0, alarm0, save0, address1, special0");
       if (baseline && CONFIG.some(i => v[i] !== baseline[i])) throw new TransportError("Motor configuration changed after arming");
     }
     _check_active(v, enabled, hold = false) {
@@ -283,13 +284,22 @@
         if (typeof normalized !== "number" || !Number.isFinite(normalized) || normalized < 0 || normalized > 1) throw new TransportError("Position must be finite and normalized0..1");
         const recoveriesBefore = this._communication_recoveries;
         const target = this._nonzero_target(this._low + (this._high - this._low) * normalized, this._low, this._high);
-        const position = this._check_active(await this._read(), true);
-        // Feedback precedes the next target (normally 60 ms). Allow one command interval
+        const position = this._check_active(!this._fastPositions || this._clock() - this._snapshot_at >= .1 ? await this._read() : this._values, true);
+        // Encoder feedback arrives with each dedicated target reply. Allow 100 ms
         // of travel, capped at ten percent of the calibrated working range.
         const trackingLimit = Math.min((this._high - this._low) * .1, 1024 + RUN_MAX_VELOCITY * .1);
-        this._tracking_failures = Math.abs(position - this._target) > trackingLimit ? this._tracking_failures + 1 : 0;
+        if (!this._fastPositions) this._tracking_failures = Math.abs(position - this._target) > trackingLimit ? this._tracking_failures + 1 : 0;
         if (this._tracking_failures >= 3) throw new TransportError("Tracking error exceeded the motion budget for three fresh samples");
-        try { await this._absolute(target, this._budget()); }
+        try {
+          if (this._fastPositions) {
+            const rx = await this._exchange(io.fastPositionRequest(target), this._budget());
+            this._values[22] = (rx[2] << 8) | rx[3]; this._values[23] = (rx[4] << 8) | rx[5];
+            this._observed_at = this._clock();
+            const actual = this._check_active(this._values, true);
+            this._tracking_failures = Math.abs(actual - this._target) > trackingLimit ? this._tracking_failures + 1 : 0;
+            if (this._tracking_failures >= 3) throw new TransportError("Tracking error exceeded the motion budget for three fresh samples");
+          } else await this._absolute(target, this._budget());
+        }
         catch (error) {
           if (!error.recoverableResponse) throw error;
           // Never retransmit the uncertain target. Recover the link with fresh
