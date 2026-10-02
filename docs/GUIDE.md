@@ -348,3 +348,9 @@ speed ceiling and retains the 1500 RPM/s drive ramp. The planner budgets
 180 mm/s and 360 mm/s² with the existing headroom. High-rate wide strokes
 can still be acceleration-limited; actual following depends on the mechanism.
 This higher run profile has not yet been physically verified.
+
+
+The browser controls are Connect → Home → Play. Play performs the same
+fresh stationary arming checks internally before enabling motion. It changes
+to Pause while running and Resume while paused. Stop ends the session and
+inhibits output. Connecting and homing never automatically start a pattern.

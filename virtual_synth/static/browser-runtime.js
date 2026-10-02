@@ -172,6 +172,11 @@
         try { lastHardware = await transport.begin_home(payload.direction === "reverse"); await assertCurrent(); }
         catch (error) { await motionError("Cannot home", error); }
         revision++; gate = false; lastHeartbeat = lastTick = clock();
+      } else if (name === "play") {
+        if (running || paused || fault || unconfirmedStop) throw new Error("Play requires a healthy stopped synth.");
+        if (!armed) await act({ action: "arm" }, requestedEpoch);
+        await assertCurrent();
+        return act({ action: "run" }, requestedEpoch);
       } else if (name === "arm") {
         if (fault || unconfirmedStop) throw new Error("Resolve and reset the fault before arming.");
         if (paused) throw new Error("Resume or Stop the paused session before arming.");

@@ -15,7 +15,7 @@ No Raspberry Pi, CV board or firmware flash is needed.
 
 Open [OSSM Motion Synth](https://lucychapar.com/ossm-motion-synth/) in desktop
 Chrome or Edge. In **Motor connection**, click **Connect** and choose your
-USB–RS485 adapter, then **Home → Arm → Run**. Home measures both ends of the rail
+USB–RS485 adapter, then **Home → Play**. Home measures both ends of the rail
 and parks at center. No Python app or installation is required.
 
 **Wiring:** With power off, disconnect the 4-pin signal cable that runs to the
@@ -45,7 +45,7 @@ python3 -m venv .venv
 ```
 
 The interface opens at **http://127.0.0.1:8765** in simulation mode. Choose a
-preset, then **Arm → Run**. Use `--port NUMBER` if that port is already in use.
+preset, then **Play**. Use `--port NUMBER` if that port is already in use.
 The installed `ossm-motion-synth` command and `python -m virtual_synth` launch
 the same application. On Windows, use `.venv\Scripts\python -m pip install .`
 and `.venv\Scripts\python -m virtual_synth --open` after creating the environment.
@@ -64,7 +64,7 @@ and `.venv\Scripts\python -m virtual_synth --open` after creating the environmen
 ./synth --allow-motion --open
 ```
 
-Select the adapter, then **Connect → Home → Arm → Run**. Home stays disabled
+Select the adapter, then **Connect → Home → Play**. Home stays disabled
 until a motor is connected. Connection reads status; Home finds both ends and
 parks at the measured center. Run starts the waveform. The bridge uses 19200
 baud, 8N1, slave 1 and never selects a port automatically.

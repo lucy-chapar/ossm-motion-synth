@@ -111,7 +111,7 @@
         : "Sine sounds smooth; square and saw sound buzzy. Rate is sped up ×1,000 into a tone; stroke and its envelope control loudness. This is before motion limiting."
       : `Pitch rises and falls with the ${$("audio-source").value === "command" ? "planned position" : "requested wave"}. Rate sets the pace; stroke sets how far the pitch travels. A held position sounds like a steady note.`;
     $("audio-status").textContent = audioMessage || (!enabled ? "Muted"
-      : state && !state.running ? "Audio ready · Arm, then Run"
+      : state && !state.running ? "Audio ready · Press Play"
       : wave && positionPatch ? "Wave bypassed · choose Hear movement"
       : frame && frame.gain > 0 ? "Listening"
       : "Silent");
@@ -131,7 +131,7 @@
     const epoch = motionEpoch;
     const run = async () => {
       try {
-        if (["arm", "run", "resume", "pause", "home_start", "connect"].includes(name) && epoch !== motionEpoch) return;
+        if (["play", "arm", "run", "resume", "pause", "home_start", "connect"].includes(name) && epoch !== motionEpoch) return;
         if (name === "home_start") homeCancelledByTab = false;
         const result = await api("/api/action", { action: name, ...details });
         if (!acceptState(result)) await poll();
@@ -234,10 +234,8 @@
     $("run-status").append(runDot, document.createTextNode(runningLabel));
     $("run-status").classList.toggle("running", Boolean(state.running));
     $("run-status").classList.toggle("armed", Boolean(state.armed && !state.running));
-    $("arm-button").disabled = !online || isHoming() || !canMove || (hw && !state.homing?.valid) || Boolean(state.armed || state.paused) || Boolean(state.fault || state.unconfirmed_stop);
-    $("arm-button").setAttribute("aria-pressed", String(Boolean(state.armed)));
     $("run-button").textContent = state.running ? "Ⅱ Pause" : state.paused ? "▶ Resume" : "▶ Play";
-    $("run-button").disabled = !online || !canMove || (!state.armed && !state.paused) || (!browserRuntime && state.running) || Boolean(state.fault || state.unconfirmed_stop || state.stopping);
+    $("run-button").disabled = !online || !canMove || (hw && !state.homing?.valid) || isHoming() || (!browserRuntime && state.running) || Boolean(state.fault || state.unconfirmed_stop || state.stopping);
     $("stop-button").disabled = !token;
     $("gate-button").disabled = !online || isHoming();
     $("gate-button").setAttribute("aria-pressed", String(Boolean(state.gate)));
@@ -246,7 +244,7 @@
     $("reset-button").disabled = !online || isHoming() || Boolean(state.running || state.unconfirmed_stop);
     $("scope-empty").hidden = Boolean(state.running || (state.history && state.history.length > 1));
     $("actual-legend").hidden = !hw || !(state.history || []).some((sample) => Number.isFinite(sample.actual));
-    $("transport-message").textContent = hw ? state.running ? "Hardware running · Stop output to finish" : canMove ? state.homing?.valid ? "Motor homed · Arm, then Run" : "Motor connected · Home before arming" : "Read-only connection · motion locked" : state.running ? "Simulated motion · no motor commands" : "Simulation · no motor connected";
+    $("transport-message").textContent = hw ? state.running ? "Hardware running · Stop to finish" : canMove ? state.homing?.valid ? "Motor homed · Press Play" : "Motor connected · Home before playing" : "Read-only connection · motion locked" : state.running ? "Simulated motion · no motor commands" : "Simulation · no motor connected";
     for (const input of paramInputs) {
       const key = input.dataset.param;
       if (document.activeElement !== input && !(key in pendingParams)) setInput(input, params[key]);
@@ -279,7 +277,7 @@
     renderHardware();
     renderHoming();
     if (state.stopping) {
-      for (const id of ["home-button", "arm-button", "run-button", "connect-button", "disconnect-button", "reset-button"]) $(id).disabled = true;
+      for (const id of ["home-button", "run-button", "connect-button", "disconnect-button", "reset-button"]) $(id).disabled = true;
       $("transport-message").textContent = "Stopping motor · waiting for feedback";
     }
     const lastSample = (state.history || [])[Math.max(0, (state.history || []).length - 1)];
@@ -310,11 +308,11 @@
       && !hardware.fault && !state.fault && !state.running && !state.unconfirmed_stop;
     $("stop-confirmed").textContent = confirmed ? "Confirmed" : "Unconfirmed";
     $("stop-confirmed").classList.toggle("unconfirmed", !confirmed);
-    $("hardware-boundary").textContent = state.allow_motion ? "Ready for hardware: Connect → Home → Arm → Run. Connect only reads status; Home moves the motor." : "Launch ./synth --allow-motion for hardware Home and Run. Connecting here reads status only.";
+    $("hardware-boundary").textContent = state.allow_motion ? "Ready for hardware: Connect → Home → Play. Connect only reads status; Home moves the motor." : "Launch ./synth --allow-motion for hardware Home and Run. Connecting here reads status only.";
     $("hardware-boundary").classList.toggle("motion-enabled", Boolean(state.allow_motion));
     if (browserRuntime) {
       $("hardware-boundary").textContent = browserRuntime.supported
-        ? "Connect → Home → Arm → Run. Connect lets you choose your USB–RS485 adapter. Everything runs in this browser."
+        ? "Connect → Home → Play. Connect lets you choose your USB–RS485 adapter. Everything runs in this browser."
         : "Direct USB connection needs desktop Chrome or Edge with Web Serial. Wave shaping and audio still work here.";
       if (!browserRuntime.supported) $("hardware-status").textContent = "Web Serial is unavailable in this browser.";
     }
@@ -335,7 +333,7 @@
         : phase.includes("first_retreat") ? "Backing away from first end"
         : phase.includes("first_") ? "Finding first end"
         : phase === "seeking" ? "Finding reference" : "Preparing motor";
-      $("transport-message").textContent = `${message} · Stop output to cancel`;
+      $("transport-message").textContent = `${message} · Stop to cancel`;
     } else if (connected && state.homing?.phase === "cancelled" && homeCancelledByTab) {
       $("transport-message").textContent = "Home cancelled because the tab was left · Keep this tab visible and press Home again";
     } else if (connected && state.homing?.valid && !state.running && !state.armed && !state.fault) {
@@ -345,7 +343,7 @@
         ? `Travel ≈ ${format(distance / scale, 1)} mm · ` : "";
       const centered = Number.isFinite(state.hardware.origin_raw) && Number.isFinite(state.hardware.position_raw)
         && Math.abs(state.hardware.position_raw - state.hardware.origin_raw) <= 16;
-      $("transport-message").textContent = `${travel}${centered ? "Centered" : "Homed"} · Arm, then Run`;
+      $("transport-message").textContent = `${travel}${centered ? "Centered" : "Homed"} · Press Play`;
     }
   }
 
@@ -481,7 +479,7 @@
       if (audioPreview.enabled || audioStarting) muteAudio("Audio muted · connection lost");
       if (performance.now() - lastStateReceipt > 1500) {
         $("transport-message").textContent = "Connection lost · output state unconfirmed";
-        $("home-button").disabled = true; $("arm-button").disabled = true; $("run-button").disabled = true;
+        $("home-button").disabled = true; $("run-button").disabled = true;
       }
     } finally { pollBusy = false; }
   }
@@ -546,10 +544,13 @@
       report("A control change was rejected. Successfully update a control before arming or running.", true);
       return;
     }
-    if (epoch === motionEpoch) action(name).catch(() => {});
+    if (epoch === motionEpoch) {
+      if (name === "play" && !browserRuntime) {
+        try { if (!state.armed) await action("arm"); if (epoch === motionEpoch) await action("run"); } catch (_) {}
+      } else action(name).catch(() => {});
+    }
   }
-  $("arm-button").addEventListener("click", () => requestMotion("arm"));
-  $("run-button").addEventListener("click", () => state?.running && browserRuntime ? action("pause").catch(() => {}) : requestMotion(state?.paused ? "resume" : "run"));
+  $("run-button").addEventListener("click", () => state?.running && browserRuntime ? action("pause").catch(() => {}) : requestMotion(state?.paused ? "resume" : "play"));
   $("stop-button").addEventListener("click", () => {
     motionEpoch++;
     muteAudio();
@@ -648,7 +649,7 @@
     $("refresh-ports").textContent = "Choose adapter";
     $("refresh-ports").dataset.tooltip = "Open the browser's serial-device chooser. Choosing an adapter grants this page access; Connect reads motor status without moving it.";
     $("port-select").dataset.tooltip = "Select an adapter you have allowed this website to access. Choose adapter opens the browser permission dialog.";
-    $("connect-button").dataset.tooltip = "Choose your USB–RS485 adapter and connect to the motor at 19200 baud. If an adapter is already selected, connect to it directly. Then Home → Arm → Run.";
+    $("connect-button").dataset.tooltip = "Choose your USB–RS485 adapter and connect to the motor at 19200 baud. If an adapter is already selected, connect to it directly. Then Home → Play.";
     document.querySelector("#hardware-details .panel-description").textContent = "Connect directly to your USB–RS485 adapter through Web Serial.";
     document.querySelector("footer span").lastChild.textContent = "RUNS IN YOUR BROWSER · NO INSTALL REQUIRED";
   }

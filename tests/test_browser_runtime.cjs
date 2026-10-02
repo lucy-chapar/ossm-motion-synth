@@ -312,3 +312,17 @@ test("paused simulation cannot switch adapters or bypass Home through Resume", a
  await assert.rejects(env.action("resume"), /paused/);
  assert.equal(motor.calls.includes("start"), false);
 });
+
+
+test("Play combines fresh arming and starting while retaining Home requirement", async () => {
+ const motor=fakeMotor(), env=setup({factory:()=>motor});
+ await env.connect(); await assert.rejects(env.action("play"), /Home/);
+ assert.equal(motor.calls.includes("start"),false);
+ motor.hw.homed=true; await env.action("play");
+ assert.deepEqual(motor.calls.slice(-2),["arm","start"]);
+ assert.equal(env.runtime.state().running,true);
+ await env.action("pause"); await assert.rejects(env.action("play"), /stopped/);
+ await env.action("resume"); await env.action("stop");
+ await env.action("play"); assert.equal(env.runtime.state().running,true);
+ await env.runtime.close();
+});
