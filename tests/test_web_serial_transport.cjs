@@ -463,7 +463,7 @@ test("Stop waits for transient coast feedback before confirming three stable inh
   await transport.close();
 });
 
-test("Stop never confirms persistent demand, speed, enabled output or encoder drift", async () => {
+test("Stop never confirms persistent demand, speed, enabled output or material encoder drift", async () => {
   for (const failure of ["pending", "speed", "output", "drift", "pwm"]) {
     const {transport, motor, clock} = await running();
     let inhibited = false, reads = 0;
@@ -474,7 +474,7 @@ test("Stop never confirms persistent demand, speed, enabled output or encoder dr
       if (failure === "pending") m.remaining(3);
       if (failure === "speed") m.values[16] = 65504;
       if (failure === "output") m.values[1] = 1;
-      if (failure === "drift") m.position(20000 + 3 * reads);
+      if (failure === "drift") m.position(20000 + 50 * reads);
       if (failure === "pwm") m.values[19] = 1;
     };
     const before = motor.commands.length, started = clock.now();
@@ -1487,4 +1487,23 @@ test("fast stream uses encoder replies and retains periodic full status checks",
  motor.values[14]=1; await clock.wait(.11);
  await assert.rejects(transport.command(.54));
  assert.equal(transport.status().running,false); await transport.close();
+});
+
+test("stop accepts sub-tenth-millimetre disabled settling but rejects continuing drift",async()=>{
+ const {transport,motor}=await running();let n=0;
+ motor.onRead=m=>{m.position(20000+((n++%3)*35));};
+ assert.equal((await transport.stop()).stop_confirmed,true);motor.onRead=null;await transport.close();
+ const other=await running();n=0;
+ other.motor.onRead=m=>{m.position(20000+(n++*50));};
+ await assert.rejects(other.transport.stop(),/did not settle/);
+ assert.equal(other.transport.status().stop_confirmed,false);other.motor.onRead=null;await other.transport.close();
+});
+
+test("a later confirmed Stop permits clearing a settling fault after fresh stationary checks",async()=>{
+ const {transport,motor}=await running();let n=0;
+ motor.onRead=m=>{m.position(20000+(n++*50));};
+ await assert.rejects(transport.stop(),/did not settle/);
+ motor.onRead=null;assert.equal((await transport.stop()).stop_confirmed,true);
+ assert.match(transport.status().fault,/did not settle/);
+ assert.equal((await transport.reset_fault()).fault,null);await transport.close();
 });

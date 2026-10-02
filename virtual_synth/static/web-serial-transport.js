@@ -32,6 +32,7 @@
   const CONTACT_PWM = 1966, CONTACT_ERROR = 512, CONTACT_SECONDS = .5, CONTACT_REPEAT_TOLERANCE = 128;
   const CONTACT_RELEASE_TOLERANCE = 512;
   const PARK_STOP_TOLERANCE = 128, STOP_PENDING_TOLERANCE = 2;
+  const STOP_CONFIRM_TOLERANCE = Math.ceil(COUNTS_PER_MM * .1); // 0.1 mm of disabled mechanical settling.
   const STOP_SETTLE_TOLERANCE = Math.ceil(COUNTS_PER_MM); // 1 mm from the confirmed stop; never a rolling reference.
   const OUTPUT_STATUSES = [0, 1, 2, 3, 6, 7, 10, 11, 14, 15];
   const clock = () => performance.now() / 1000;
@@ -189,7 +190,7 @@
     async reset_fault() {
       this._require_connection();
       if (this._armed || this._running || this._homing || !this._stop_confirmed ||
-          !/Response timeout|Communication remained unstable/.test(this._fault || "")) {
+          !/Response timeout|Communication remained unstable|Motor did not settle within 3 seconds after stop\/inhibit/.test(this._fault || "")) {
         throw new TransportError("Reconnect or Home is required for this fault");
       }
       const positions = [];
@@ -199,7 +200,7 @@
         if (!this._inhibited_feedback(v)) throw new TransportError("Fault reset requires stationary inhibited feedback");
         positions.push(io.signedPosition(v));
       }
-      if (spread(positions) > 4) throw new TransportError("Encoder moved during fault reset");
+      if (spread(positions) > STOP_CONFIRM_TOLERANCE) throw new TransportError("Encoder moved during fault reset");
       this._fault = null; this._recovery_streak = 0; this._tracking_failures = 0;
       this._cleanup_attempted = false; this._cleanup_errors = [];
       this._homed = Boolean(this._measured_endpoints && this._origin !== null);
@@ -653,11 +654,11 @@
             if (this._inhibited_feedback(v)) {
               positions.push(position);
               if (positions.length > 3) positions.shift();
-              if (positions.length === 3 && spread(positions) <= 4) break;
+              if (positions.length === 3 && spread(positions) <= STOP_CONFIRM_TOLERANCE) break;
             } else positions.length = 0;
             await this._wait(Math.min(.1, Math.max(0, deadline - this._clock())));
           }
-          if (positions.length !== 3 || spread(positions) > 4) throw new TransportError(`Motor did not settle within 3 seconds after stop/inhibit: output ${this._values?.[1]}, pending ${this._values ? io.pending(this._values) : "unknown"}, speed ${this._values ? this._signed_speed(this._values) : "unknown"}, PWM ${this._values?.[19]}, encoder spread ${positions.length ? spread(positions) : "no stationary samples"} counts`);
+          if (positions.length !== 3 || spread(positions) > STOP_CONFIRM_TOLERANCE) throw new TransportError(`Motor did not settle within 3 seconds after stop/inhibit: output ${this._values?.[1]}, pending ${this._values ? io.pending(this._values) : "unknown"}, speed ${this._values ? this._signed_speed(this._values) : "unknown"}, PWM ${this._values?.[19]}, encoder spread ${positions.length ? spread(positions) : "no stationary samples"} counts (${positions.length}/3 samples; limit ${STOP_CONFIRM_TOLERANCE} counts)`);
         } catch (error) { errors.push("readback: " + (error.message || error)); }
         this._cleanup_errors = errors; this._enabled_at = null; this._stop_confirmed = !errors.length;
         this._stop_position = this._stop_confirmed ? positions.at(-1) : null;
