@@ -26,7 +26,8 @@
   const RUN_SPEED_RPM = 150, RUN_ACCEL_RPM_S = 1500, PLANNED_ACCEL_RPM_S = 300;
   const RUN_MAX_VELOCITY = 32768 * RUN_SPEED_RPM / 60 * .9;
   const RUN_MAX_ACCELERATION = 32768 * PLANNED_ACCEL_RPM_S / 60 * .9;
-  const HOME_SPEED_RPM = 35, HOME_ACCEL_RPM_S = 75;
+  const HOME_SPEED_RPM = 70, HOME_ACCEL_RPM_S = 150;
+  const HOME_RECHECK_SPEED_RPM = 35, HOME_RECHECK_ACCEL_RPM_S = 75;
   const HOME_COUNTS_PER_SECOND = 32768 * HOME_SPEED_RPM / 60;
   const CONTACT_PWM = 1966, CONTACT_ERROR = 512, CONTACT_SECONDS = .5, CONTACT_REPEAT_TOLERANCE = 128;
   const CONTACT_RELEASE_TOLERANCE = 512;
@@ -310,7 +311,7 @@
       this._home_actions = actions.slice(); this._home_following = following; this._home_stage(actions[0][0], progress);
     }
     async _write_home_setting(register, value) {
-      const permitted = { 0: [0, 1], 2: [RUN_SPEED_RPM, HOME_SPEED_RPM, 80], 3: [15, RUN_ACCEL_RPM_S, HOME_ACCEL_RPM_S], 9: [0, 1], 10: [0], 24: [89, this._home_reference[24]], 25: [0, 1] };
+      const permitted = { 0: [0, 1], 2: [RUN_SPEED_RPM, HOME_SPEED_RPM, HOME_RECHECK_SPEED_RPM, 80], 3: [15, RUN_ACCEL_RPM_S, HOME_ACCEL_RPM_S, HOME_RECHECK_ACCEL_RPM_S], 9: [0, 1], 10: [0], 24: [89, this._home_reference[24]], 25: [0, 1] };
       if (!permitted[register]?.includes(value)) throw new TransportError("Setting is outside the fixed native homing profile");
       const tx = io.configRequest(register, value), rx = await this._exchange(tx, HOME_IO_TIMEOUT);
       if (!equalPrefix(rx, tx, 6)) throw new TransportError("Homing setting acknowledgement mismatch; no retry");
@@ -395,11 +396,15 @@
     _begin_home_move(phase, target, position, enable = false) {
       target = this._nonzero_target(target, -(2 ** 31), 2 ** 31 - 1);
       this._home_move_phase = phase; this._home_move_from = position; this._home_move_target = target;
-      this._home_motion_timeout = Math.abs(target - position) / HOME_COUNTS_PER_SECOND + HOME_SPEED_RPM / HOME_ACCEL_RPM_S + 5;
+      const recheck = phase.endsWith("retreat") || phase.endsWith("retouch");
+      const speed = recheck ? HOME_RECHECK_SPEED_RPM : HOME_SPEED_RPM;
+      const acceleration = recheck ? HOME_RECHECK_ACCEL_RPM_S : HOME_ACCEL_RPM_S;
+      this._home_motion_timeout = Math.abs(target - position) / (32768 * speed / 60) + speed / acceleration + 5;
       const progress = { first_contact: .63, first_retreat: .67, first_retouch: .7,
         second_contact: .73, second_retreat: .8, second_retouch: .84, centering: .88 }[phase];
-      if (enable) { this._home_hold_position = position; this._home_queue([["clearing_probe_hold", "clear", 0], ["enabling_probe", "enable", 1]], "move_hold", progress); }
-      else this._home_stage("commanding_" + phase, progress);
+      const profile = [["setting_move_speed", 2, speed], ["setting_move_acceleration", 3, acceleration]];
+      if (enable) { this._home_hold_position = position; this._home_queue([...profile, ["clearing_probe_hold", "clear", 0], ["enabling_probe", "enable", 1]], "move_hold", progress); }
+      else this._home_queue(profile, "commanding_" + phase, progress);
     }
     _contact_detected(v) {
       const position = io.signedPosition(v), error = this._home_move_target - position, pending = io.pending(v);

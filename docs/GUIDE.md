@@ -332,3 +332,9 @@ actual rate depends on serial response time; no commands queue up to catch up.
 The drive retains its 1500 RPM/s acceleration ramp and the software planner's
 lower acceleration budget. This uses the existing drive position protocol rather
 than assuming an unsupported buffered trajectory command.
+
+
+Browser homing uses 70 RPM / 150 RPM/s for the long endpoint searches and
+center parking. The short retreat and repeated contact checks retain 35 RPM /
+75 RPM/s. Output limit, contact confirmation, repeat agreement, search bounds
+and stop verification are unchanged. The faster profile requires a live check.
