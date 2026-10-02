@@ -7,7 +7,7 @@
   const SVG_NS = "http://www.w3.org/2000/svg";
   const COLORS = { lfo: "#7bdccb", envelope: "#efba74" };
   const LABELS = { lfo: "LFO", envelope: "Envelope", rate: "Rate", stroke: "Stroke", center: "Center", position: "Position" };
-  const LOG_RANGES = { rate_hz: [0.02, 0.3], lfo_rate_hz: [0.01, 0.3], attack_s: [0.2, 5], release_s: [0.2, 5] };
+  const LOG_RANGES = { rate_hz: [0.02, 1], lfo_rate_hz: [0.01, 0.3], attack_s: [0.2, 5], release_s: [0.2, 5] };
   const PERCENT = new Set(["stroke", "center", "lower", "upper"]);
   const DEFAULTS = { rate_hz: 0.25, stroke: 0.7, center: 0.5, shape: "sine", attack_s: 0.8, release_s: 1.2, env_to_stroke: false, lfo_rate_hz: 0.07, lower: 0.1, upper: 0.9, patches: [] };
   const PRESETS = {

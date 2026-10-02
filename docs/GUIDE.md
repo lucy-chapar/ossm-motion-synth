@@ -342,3 +342,9 @@ and stop verification are unchanged. The faster profile requires a live check.
 Stop verification now permits up to three seconds for inhibited feedback to settle.
 Three stable encoder readings and disabled-output, speed, pending and PWM checks
 remain required. A failure includes the last feedback fields and encoder spread.
+
+The browser Rate control now reaches 1 Hz. Homing restores a 300 RPM drive
+speed ceiling and retains the 1500 RPM/s drive ramp. The planner budgets
+180 mm/s and 360 mm/s² with the existing headroom. High-rate wide strokes
+can still be acceleration-limited; actual following depends on the mechanism.
+This higher run profile has not yet been physically verified.

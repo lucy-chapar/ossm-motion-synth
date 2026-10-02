@@ -17,7 +17,7 @@ class Clock {
 class FakeConnection {
   constructor({native = false, homeIgnored = false} = {}) {
     this.values = Array(26).fill(0);
-    this.values[0] = 1; this.values[2] = 150; this.values[3] = 1500;
+    this.values[0] = 1; this.values[2] = 300; this.values[3] = 1500;
     this.values[11] = 800; this.values[21] = 1;
     this.position(20000);
     this.native = native; this.homeIgnored = homeIgnored;
@@ -620,7 +620,7 @@ test("both native directions measure repeatable endpoints and center in one coor
       sign * (3277 - 409600 - 819), sign * -158925, sign * -161382, center]);
     assert.equal(motor.settings.filter(([r, v]) => r === 25 && v === 1).length, 1);
     assert.ok(motor.settings.every(([r]) => r !== 20 && r !== 21));
-    assert.deepEqual(motor.values.slice(0, 4), [1, 0, 150, 1500]);
+    assert.deepEqual(motor.values.slice(0, 4), [1, 0, 300, 1500]);
     assert.equal(motor.values[24], 0); assert.equal(motor.values[25], 0);
     for (const [index, state] of motor.absoluteStates.entries()) {
       const recheck = [1, 2, 4, 5].includes(index);
@@ -1183,7 +1183,7 @@ test("native reset flags and defaults may settle before three stationary complet
   }
   assert.equal(transport.status().home_origin_raw, -18);
   assert.equal((await advance(context)).homed, true);
-  assert.deepEqual(motor.values.slice(0, 4), [1, 0, 150, 1500]);
+  assert.deepEqual(motor.values.slice(0, 4), [1, 0, 300, 1500]);
   await transport.close();
 });
 
@@ -1365,7 +1365,7 @@ test("native Home restores saved output despite a temporary inhibited output set
  const context = await homing(false,motor);
  const result = await advance(context);
  assert.equal(result.homed,true);assert.equal(result.output_limit_stall_raw,540);
- assert.equal(result.speed_rpm,150);assert.equal(result.acceleration_rpm_s,1500);
+ assert.equal(result.speed_rpm,300);assert.equal(result.acceleration_rpm_s,1500);
 });
 
 test("direct Home measures both directions without native coordinate reset", async () => {
