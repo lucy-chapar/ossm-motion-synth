@@ -300,3 +300,15 @@ test("automatic connection uses only a unique previously confirmed adapter", asy
   assert.equal(runtime.state().running, false);
   await runtime.close();
 });
+
+
+test("paused simulation cannot switch adapters or bypass Home through Resume", async () => {
+ const motor = fakeMotor(), env = setup({factory: () => motor});
+ const selected = await env.runtime.choosePort();
+ await env.action("arm"); await env.action("run"); await env.action("pause");
+ await assert.rejects(env.action("arm"), /paused/);
+ await assert.rejects(env.action("connect", {port:selected}), /Stop/);
+ await env.action("stop"); await env.action("connect", {port:selected});
+ await assert.rejects(env.action("resume"), /paused/);
+ assert.equal(motor.calls.includes("start"), false);
+});

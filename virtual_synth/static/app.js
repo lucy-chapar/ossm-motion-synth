@@ -234,7 +234,7 @@
     $("run-status").append(runDot, document.createTextNode(runningLabel));
     $("run-status").classList.toggle("running", Boolean(state.running));
     $("run-status").classList.toggle("armed", Boolean(state.armed && !state.running));
-    $("arm-button").disabled = !online || isHoming() || !canMove || (hw && !state.homing?.valid) || Boolean(state.armed) || Boolean(state.fault || state.unconfirmed_stop);
+    $("arm-button").disabled = !online || isHoming() || !canMove || (hw && !state.homing?.valid) || Boolean(state.armed || state.paused) || Boolean(state.fault || state.unconfirmed_stop);
     $("arm-button").setAttribute("aria-pressed", String(Boolean(state.armed)));
     $("run-button").textContent = state.running ? "Ⅱ Pause" : state.paused ? "▶ Resume" : "▶ Play";
     $("run-button").disabled = !online || !canMove || (!state.armed && !state.paused) || (!browserRuntime && state.running) || Boolean(state.fault || state.unconfirmed_stop || state.stopping);
@@ -293,12 +293,12 @@
   function renderHardware() {
     const connected = isHardware(), hardware = state.hardware || {};
     const canSelectPort = browserRuntime ? browserRuntime.supported : Boolean($("port-select").value);
-    $("connect-button").disabled = !online || connecting || isHoming() || connected || !canSelectPort || Boolean(state.armed || state.running || state.stopping);
+    $("connect-button").disabled = !online || connecting || isHoming() || connected || !canSelectPort || Boolean(state.armed || state.running || state.paused || state.stopping);
     $("connect-button").textContent = connecting ? "Connecting…" : "Connect";
     $("connect-button").setAttribute("aria-busy", String(connecting));
     $("disconnect-button").disabled = !online || !connected || isHoming();
-    $("port-select").disabled = connecting || connected || Boolean(state.armed || state.running);
-    if (browserRuntime) $("refresh-ports").disabled = !browserRuntime.supported || connecting || connected || Boolean(state.armed || state.running || state.stopping);
+    $("port-select").disabled = connecting || connected || Boolean(state.armed || state.running || state.paused);
+    if (browserRuntime) $("refresh-ports").disabled = !browserRuntime.supported || connecting || connected || Boolean(state.armed || state.running || state.paused || state.stopping);
     $("hardware-metrics").hidden = !connected;
     $("hardware-status").textContent = connected ? `${hardware.port ? `Connected: ${hardware.port}` : hardware.device ? `Connected: ${hardware.device}` : "Connected to motor interface."}${hardware.notice ? ` ${hardware.notice}` : ""}` : "No motor connected.";
     $("encoder-raw").textContent = Number.isFinite(hardware.position_raw) ? `${hardware.position_raw} counts` : "No feedback";
@@ -324,7 +324,7 @@
     const active = isHoming();
     const connected = isHardware() && state.hardware?.connected === true;
     $("home-button").disabled = !online || !connected || !state.allow_motion || active
-      || Boolean(state.armed || state.running || state.fault || state.unconfirmed_stop);
+      || Boolean(state.paused || state.armed || state.running || state.fault || state.unconfirmed_stop);
     $("home-button").textContent = active ? "Homing…" : "Home";
     $("home-button").setAttribute("aria-busy", String(active));
     if (active) {

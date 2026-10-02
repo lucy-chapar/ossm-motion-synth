@@ -166,7 +166,7 @@
         engine.configure(proposed);
       } else if (name === "home_start") {
         if (!Number.isInteger(payload.control_revision) || payload.control_revision !== revision) throw new Error("Controls changed since this Home request. Refresh status and start again.");
-        if (armed || running || fault || unconfirmedStop) throw new Error("Stop output and clear the fault before homing.");
+        if (paused || armed || running || fault || unconfirmedStop) throw new Error("Stop output and clear the fault before homing.");
         if (!transport?.status().connected) throw new Error("Connect a motor before homing.");
         if (![undefined, "normal", "reverse"].includes(payload.direction)) throw new Error("Select Normal or Reverse homing direction.");
         try { lastHardware = await transport.begin_home(payload.direction === "reverse"); await assertCurrent(); }
@@ -174,6 +174,7 @@
         revision++; gate = false; lastHeartbeat = lastTick = clock();
       } else if (name === "arm") {
         if (fault || unconfirmedStop) throw new Error("Resolve and reset the fault before arming.");
+        if (paused) throw new Error("Resume or Stop the paused session before arming.");
         if (armed) throw new Error("Already armed.");
         if (transport) {
           if (!transport.status().homed) throw new Error("Home the motor before arming this connection.");
@@ -194,6 +195,7 @@
       } else if (name === "resume") {
         if (!paused || fault || unconfirmedStop) throw new Error("A healthy paused synth is required.");
         if (transport) {
+          if (!transport.status().homed) throw new Error("Home the motor before resuming.");
           try {
             await transport.arm(); await assertCurrent();
             const hw = await transport.start(); await assertCurrent();
@@ -224,7 +226,7 @@
         }
         fault = null; gate = false;
       } else if (name === "connect") {
-        if (armed || transport) throw new Error("Stop and disconnect before selecting another port.");
+        if (paused || armed || transport) throw new Error("Stop and disconnect before selecting another port.");
         const listed = await listPorts();
         if (!listed.ports.some((port) => port.device === payload.port)) throw new Error("Choose a currently available serial adapter.");
         await assertCurrent();
@@ -269,7 +271,7 @@
       return enqueue(() => act(payload, requestedEpoch));
     }
     async function autoConnect() {
-      if (!supported || transport || armed || running || closed) return false;
+      if (!supported || transport || paused || armed || running || closed) return false;
       let saved; try { saved = storage?.getItem(adapterKey); } catch (_) { return false; }
       if (!saved || saved === "{}") return false;
       const available = await serial.getPorts();
