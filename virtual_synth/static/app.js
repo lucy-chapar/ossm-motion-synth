@@ -227,11 +227,6 @@
     rendering = true;
     const params = currentParams(), signal = state.signal || {};
     const hw = isHardware(), canMove = !hw || state.allow_motion === true;
-    $("mode-badge").replaceChildren();
-    const dot = document.createElement("span"); dot.className = "status-dot";
-    $("mode-badge").append(dot, document.createTextNode(hw ? "HARDWARE" : "SIMULATION"));
-    $("mode-badge").classList.toggle("hardware", hw);
-    $("connection-indicator").textContent = browserRuntime ? hw ? "USB–RS485 connected" : "Running in your browser" : online ? "Local app connected" : "Local app disconnected";
     $("scope-corner").textContent = hw ? "HARDWARE · ENCODER WHEN AVAILABLE" : "SIMULATED OUTPUT";
     const runningLabel = state.stopping ? "STOPPING" : state.unconfirmed_stop ? "STOP UNCONFIRMED" : state.fault ? "FAULT" : isHoming() ? "HOMING" : state.running ? "RUNNING" : state.paused ? "PAUSED" : state.armed ? "ARMED" : "STOPPED";
     $("run-status").replaceChildren();
@@ -485,7 +480,6 @@
       online = false;
       if (audioPreview.enabled || audioStarting) muteAudio("Audio muted · connection lost");
       if (performance.now() - lastStateReceipt > 1500) {
-        $("connection-indicator").textContent = browserRuntime ? "Browser controller unavailable" : "Local app disconnected";
         $("transport-message").textContent = "Connection lost · output state unconfirmed";
         $("home-button").disabled = true; $("arm-button").disabled = true; $("run-button").disabled = true;
       }
