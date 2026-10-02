@@ -184,7 +184,7 @@
       if (now() >= deadline) throw new TransportError("Response timeout; no retry was sent.");
       return Uint8Array.from(this._buffer.splice(0, count));
     }
-    async _resync() {
+    async _resync(quietMs = 10) {
       if (this._resyncAfter === null) return;
       // A rejected header or a timeout can leave a partial reply in flight.
       // Discard that reply through its original response window, then require
@@ -198,12 +198,12 @@
         this._buffer.length = 0;
         quietSince = Math.max(quietSince, this._lastReceiveAt ?? quietSince);
         const time = now();
-        if (time >= notBefore && time - quietSince >= 10) {
+        if (time >= notBefore && time - quietSince >= quietMs) {
           this._resyncAfter = null;
           return;
         }
         if (time >= deadline) throw new TransportError("Serial input did not become quiet after a response error; no new request was sent.");
-        const wakeAt = Math.min(deadline, Math.max(notBefore, quietSince + 10));
+        const wakeAt = Math.min(deadline, Math.max(notBefore, quietSince + quietMs));
         // A timed poll also handles a quiet receive stream without installing
         // another read or changing the sole reader pump's ownership.
         await delay(Math.max(1, Math.min(10, wakeAt - time)));
@@ -223,8 +223,10 @@
       this._requireOpen();
       // Drain late, unsolicited bytes between complete transactions. Never
       // discard or retry a response after this request has been written.
-      if (this._resyncAfter === null) this._resyncAfter = now();
-      await this._resync();
+      const recovering = this._resyncAfter !== null;
+      if (!recovering) this._resyncAfter = now();
+      // 3 ms exceeds the 3.5-character Modbus gap at 19200 baud.
+      await this._resync(recovering ? 10 : 3);
       this._requireOpen();
       const deadline = now() + timeoutSeconds * 1000;
       let writeSettled = false;

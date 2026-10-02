@@ -22,8 +22,8 @@
   const HOME_SEEK_SECONDS = 30, HOME_TOTAL_SECONDS = 360, COUNTS_PER_MM = 32768 / 40;
   const HOME_SEARCH_COUNTS = 409600, HOME_MIN_SPAN = 16384, HOME_INSET = 1638;
   const HOME_RETOUCH_OVERTRAVEL = 819;
-  // Keep a drive ramp for serial target changes; the planner remains gentler.
-  const RUN_SPEED_RPM = 600, RUN_ACCEL_RPM_S = 20000, PLANNED_ACCEL_RPM_S = 3600;
+  // External acceleration-limited trajectory; drive streaming feedforward is 98%.
+  const RUN_SPEED_RPM = 1200, RUN_ACCEL_RPM_S = 60098, PLANNED_ACCEL_RPM_S = 6000;
   const RUN_MAX_VELOCITY = 32768 * RUN_SPEED_RPM / 60 * .9;
   const RUN_MAX_ACCELERATION = 32768 * PLANNED_ACCEL_RPM_S / 60 * .9;
   const HOME_SPEED_RPM = 70, HOME_ACCEL_RPM_S = 150;
@@ -112,7 +112,7 @@
       if (rx.length !== (tx[1] === 3 ? 57 : 8)) throw new TransportError("Response length mismatch");
       return rx;
     }
-    async _read(budget = null, speedRecheck = false) {
+    async _read(budget = null, speedRecheck = 0) {
       try {
         let response;
         try { response = await this._exchange(io.snapshotRequest(), budget ?? this._budget()); }
@@ -124,18 +124,26 @@
         }
         this._values = io.parseSnapshot(response);
         this._observed_at = this._snapshot_at = this._clock(); this._checkCancelled();
+        // When electrically inhibited, let the speed estimator settle before
+        // returning feedback. The eventual read must still pass every guard.
+        if (!this._inCleanup && speedRecheck < 6 && this._values[0] === 1 && this._values[1] === 0 &&
+            this._values[19] === 0 && Math.abs(io.pending(this._values)) <= STOP_PENDING_TOLERANCE &&
+            !this._stationary_speed(this._values)) {
+          await this._wait(.1);
+          return await this._read(budget, speedRecheck + 1);
+        }
         if (this._stop_confirmed) {
           let position;
           if (this._origin === null) { this._configuration(this._values, false, this._baseline); position = io.signedPosition(this._values); }
           else position = this._check_active(this._values, false);
           const displacement = Math.abs(position - this._stop_position);
           // A speed-only contradiction can be a transient estimator sample.
-          // Recheck once, read-only; output, demand, PWM and fixed drift remain strict.
-          if (!speedRecheck && !this._inCleanup && this._values[0] === 1 && this._values[1] === 0 &&
-              Math.abs(io.pending(this._values)) <= STOP_PENDING_TOLERANCE && this._values[19] === 0 &&
-              displacement <= STOP_CONFIRM_TOLERANCE && !this._stationary_speed(this._values)) {
-            await this._wait(.05);
-            return await this._read(budget, true);
+          // Up to six read-only rechecks; final stop guards remain strict.
+          if (speedRecheck < 6 && !this._inCleanup && this._values[0] === 1 && this._values[1] === 0 &&
+              Math.abs(io.pending(this._values)) <= 16 && this._values[19] === 0 &&
+              displacement <= STOP_SETTLE_TOLERANCE && (!this._stationary_speed(this._values) || Math.abs(io.pending(this._values)) > STOP_PENDING_TOLERANCE)) {
+            await this._wait(.1);
+            return await this._read(budget, speedRecheck + 1);
           }
           if (!this._inhibited_feedback(this._values) || displacement > STOP_SETTLE_TOLERANCE) {
             throw new TransportError(`Stopped feedback changed: position drift ${displacement} counts (limit ${STOP_SETTLE_TOLERANCE}), pending ${io.pending(this._values)}, actual speed ${this._signed_speed(this._values)}, PWM ${this._signed_pwm(this._values)}, output ${this._values[1]}`);
@@ -162,7 +170,7 @@
       if (!equalPrefix(rx, tx, 6)) throw new TransportError("Absolute-position acknowledgement address/count mismatch; no retry");
     }
     _configuration(v, enabled, baseline = null) {
-      if (v[0] !== 1 || v[1] !== Number(enabled) || v[2] !== RUN_SPEED_RPM || v[3] !== RUN_ACCEL_RPM_S || v[10] !== 0 || v[14] !== 0 || v[20] !== 0 || v[21] !== 1 || v[25] !== 0) throw new TransportError("Require mode1, scalar output " + Number(enabled) + ", speed/acceleration600/20000, gear0, alarm0, save0, address1, special0");
+      if (v[0] !== 1 || v[1] !== Number(enabled) || v[2] !== RUN_SPEED_RPM || v[3] !== RUN_ACCEL_RPM_S || v[10] !== 0 || v[14] !== 0 || v[20] !== 0 || v[21] !== 1 || v[25] !== 0) throw new TransportError("Require mode1, scalar output " + Number(enabled) + ", speed/acceleration1200/60098, gear0, alarm0, save0, address1, special0");
       if (baseline && CONFIG.some(i => v[i] !== baseline[i])) throw new TransportError("Motor configuration changed after arming");
     }
     _check_active(v, enabled, hold = false) {
@@ -268,12 +276,18 @@
       return this.status();
     }
     async _stable_hold(enabled) {
-      const positions = [];
-      for (let i = 0; i < 3; i++) {
-        await this._wait(.1); const v = await this._read(); positions.push(this._check_active(v, enabled, true));
-        if (Math.abs(io.pending(v)) > (enabled ? 16 : STOP_PENDING_TOLERANCE) || Math.abs(this._signed_speed(v)) > 1 || (!enabled && v[19] !== 0)) throw new TransportError("Pending motion, speed or output PWM exceeded hold verification limits");
+      const positions = [], deadline = this._clock() + 1.5;
+      for (let i = 0; i < 15 && this._clock() < deadline; i++) {
+        await this._wait(.1); const v = await this._read();
+        const position = this._check_active(v, enabled, true);
+        if (Math.abs(io.pending(v)) > (enabled ? 16 : STOP_PENDING_TOLERANCE) ||
+            Math.abs(this._signed_speed(v)) > 1 || (!enabled && v[19] !== 0)) {
+          positions.length = 0; continue; // Hold only: never resend a motion target.
+        }
+        positions.push(position); if (positions.length > 3) positions.shift();
+        if (positions.length === 3 && spread(positions) <= 4) return;
       }
-      if (spread(positions) > 4) throw new TransportError("Encoder was not stable during hold verification");
+      throw new TransportError("Pending motion, speed or output PWM exceeded hold verification limits, or encoder did not settle within 1.5 seconds");
     }
     async start() {
       this._require_clear_fault();
@@ -293,7 +307,7 @@
         if (typeof normalized !== "number" || !Number.isFinite(normalized) || normalized < 0 || normalized > 1) throw new TransportError("Position must be finite and normalized0..1");
         const recoveriesBefore = this._communication_recoveries;
         const target = this._nonzero_target(this._low + (this._high - this._low) * normalized, this._low, this._high);
-        const position = this._check_active(!this._fastPositions || this._clock() - this._snapshot_at >= .1 ? await this._read() : this._values, true);
+        const position = this._check_active(!this._fastPositions || this._clock() - this._snapshot_at >= .2 ? await this._read() : this._values, true);
         // Encoder feedback arrives with each dedicated target reply. Allow 100 ms
         // of travel, capped at ten percent of the calibrated working range.
         const trackingLimit = Math.min((this._high - this._low) * .1, 1024 + RUN_MAX_VELOCITY * .1);
@@ -415,7 +429,7 @@
     _begin_home_move(phase, target, position, enable = false) {
       target = this._nonzero_target(target, -(2 ** 31), 2 ** 31 - 1);
       this._home_move_phase = phase; this._home_move_from = position; this._home_move_target = target;
-      const recheck = phase.endsWith("retreat") || phase.endsWith("retouch");
+      const recheck = phase.endsWith("retreat") || phase.endsWith("retouch") || phase === "centering";
       const speed = recheck ? HOME_RECHECK_SPEED_RPM : HOME_SPEED_RPM;
       const acceleration = recheck ? HOME_RECHECK_ACCEL_RPM_S : HOME_ACCEL_RPM_S;
       this._home_motion_timeout = Math.abs(target - position) / (32768 * speed / 60) + speed / acceleration + 5;
@@ -649,7 +663,7 @@
           }
         }
         try {
-          const deadline = this._clock() + 3;
+          const started = this._clock(), deadline = started + 3;
           for (let attempt = 0; attempt < 40 && this._clock() < deadline; attempt++) {
             let v;
             try { v = await this._read(Math.min(IO_TIMEOUT, deadline - this._clock())); }
@@ -662,7 +676,7 @@
             if (this._inhibited_feedback(v)) {
               positions.push(position);
               if (positions.length > 3) positions.shift();
-              if (positions.length === 3 && spread(positions) <= STOP_CONFIRM_TOLERANCE) break;
+              if (positions.length === 3 && spread(positions) <= STOP_CONFIRM_TOLERANCE && this._clock() - started >= .6) break;
             } else positions.length = 0;
             await this._wait(Math.min(.1, Math.max(0, deadline - this._clock())));
           }

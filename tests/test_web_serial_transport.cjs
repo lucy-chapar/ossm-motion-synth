@@ -17,7 +17,7 @@ class Clock {
 class FakeConnection {
   constructor({native = false, homeIgnored = false} = {}) {
     this.values = Array(26).fill(0);
-    this.values[0] = 1; this.values[2] = 600; this.values[3] = 20000;
+    this.values[0] = 1; this.values[2] = 1200; this.values[3] = 60098;
     this.values[11] = 800; this.values[21] = 1;
     this.position(20000);
     this.native = native; this.homeIgnored = homeIgnored;
@@ -627,10 +627,10 @@ test("both native directions measure repeatable endpoints and center in one coor
       sign * (3277 - 409600 - 819), sign * -158925, sign * -161382, center]);
     assert.equal(motor.settings.filter(([r, v]) => r === 25 && v === 1).length, 1);
     assert.ok(motor.settings.every(([r]) => r !== 20 && r !== 21));
-    assert.deepEqual(motor.values.slice(0, 4), [1, 0, 600, 20000]);
+    assert.deepEqual(motor.values.slice(0, 4), [1, 0, 1200, 60098]);
     assert.equal(motor.values[24], 0); assert.equal(motor.values[25], 0);
     for (const [index, state] of motor.absoluteStates.entries()) {
-      const recheck = [1, 2, 4, 5].includes(index);
+      const recheck = [1, 2, 4, 5, 6].includes(index);
       assert.deepEqual(state.slice(0, 4), recheck ? [1, 1, 35, 75] : [1, 1, 70, 150]);
       assert.equal(state[24], 89); assert.equal(state[25], 0);
     }
@@ -1190,7 +1190,7 @@ test("native reset flags and defaults may settle before three stationary complet
   }
   assert.equal(transport.status().home_origin_raw, -18);
   assert.equal((await advance(context)).homed, true);
-  assert.deepEqual(motor.values.slice(0, 4), [1, 0, 600, 20000]);
+  assert.deepEqual(motor.values.slice(0, 4), [1, 0, 1200, 60098]);
   await transport.close();
 });
 
@@ -1372,7 +1372,7 @@ test("native Home restores saved output despite a temporary inhibited output set
  const context = await homing(false,motor);
  const result = await advance(context);
  assert.equal(result.homed,true);assert.equal(result.output_limit_stall_raw,540);
- assert.equal(result.speed_rpm,600);assert.equal(result.acceleration_rpm_s,20000);
+ assert.equal(result.speed_rpm,1200);assert.equal(result.acceleration_rpm_s,60098);
 });
 
 test("direct Home measures both directions without native coordinate reset", async () => {
@@ -1482,9 +1482,9 @@ test("fast stream uses encoder replies and retains periodic full status checks",
  await transport.command(.51); await clock.wait(.04); await transport.command(.52);
  assert.equal(motor.readCount,before);
  assert.ok(motor.transmissions.some(tx=>tx[1]===0x7b));
- await clock.wait(.1); await transport.command(.53);
+ await clock.wait(.2); await transport.command(.53);
  assert.equal(motor.readCount,before+1);
- motor.values[14]=1; await clock.wait(.11);
+ motor.values[14]=1; await clock.wait(.21);
  await assert.rejects(transport.command(.54));
  assert.equal(transport.status().running,false); await transport.close();
 });
@@ -1517,3 +1517,14 @@ test("confirmed stop rechecks an isolated speed-only contradiction without motio
  await assert.rejects(other.transport.snapshot(),/actual speed -256/);
  assert.equal(other.transport.status().stop_confirmed,false);other.motor.values[16]=0;await other.transport.close();
 });
+
+ test("inhibited preflight waits for transient speed but rejects persistent speed", async () => {
+  const {transport,motor}=await running(); await transport.stop();
+  transport._stop_confirmed=false; let reads=0; const writes=motor.commands.length;
+  motor.onRead=m=>{m.values[16]=reads++<3?255:0;};
+  await transport.snapshot(); assert.equal(reads,4); assert.equal(motor.commands.length,writes);
+  motor.onRead=m=>{m.values[16]=255;}; reads=motor.readCount;
+  await transport.snapshot(); assert.equal(motor.readCount-reads,7);
+  await assert.rejects(transport._stable_hold(false),/stationary|settle|hold/i);
+  motor.onRead=null; motor.values[16]=0; await transport.close();
+ });

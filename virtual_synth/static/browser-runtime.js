@@ -112,8 +112,8 @@
       const activeHome = homing().active;
       if ((armed || activeHome) && now - lastHeartbeat > 1.5) await fail("Control tab heartbeat expired. Output stopped; rearm explicitly.");
       else if ((running && dt > 0.25) || (activeHome && dt > 1)) await fail("Motion scheduling deadline missed. No catch-up targets were sent.");
-      signal = engine.step(paused ? 0 : Math.min(dt, 0.25), { gate, running });
-      if (transport && now - lastIO >= (running ? 0.033 : homing().active ? 0.1 : 0.5)) {
+      signal = engine.step(paused ? 0 : Math.min(dt, 0.25), { gate, running, tracking: mode === "hardware" });
+      if (transport && now - lastIO >= (running ? 0.015 : homing().active ? 0.1 : 0.5)) {
         lastIO = now;
         const ioEpoch = epoch, recoveriesBefore = transport.status().communication_recoveries || 0;
         try {
@@ -331,7 +331,7 @@
     }
     serial?.addEventListener?.("disconnect", onDisconnect);
     serial?.addEventListener?.("connect", onConnect);
-    if (options.autoStart !== false) timer = setInterval(tick, 20);
+    if (options.autoStart !== false) timer = setInterval(tick, 10);
     return { request, choosePort, autoConnect, tick, state, stop, supported,
       async close() { closed = true; clearInterval(timer); await stop(); if (transport) await transport.close(); serial?.removeEventListener?.("disconnect", onDisconnect); serial?.removeEventListener?.("connect", onConnect); } };
   }

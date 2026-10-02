@@ -126,12 +126,12 @@ at the midpoint of the two contacts, verifies arrival, then inhibits output
 and restores the previous output/stall setting. The waveform planner uses
 this measured working span, keeping its existing physical velocity and
 acceleration limits when converting normalized positions to encoder counts.
-After parking, browser Home restores 600 RPM and 20000 RPM/s drive acceleration.
-This keeps the drive's internal ramp enabled to soften changes between serial
-position targets (30 ms from rest to the full configured speed). The browser
-planner retains its gentler 3600 RPM/s nominal acceleration with ten percent
-headroom. The drive ramp can add tracking lag; it does not make physically
-limited patterns achievable. The Python bridge retains its earlier profile.
+After parking, browser Home restores a 1200 RPM ceiling and the documented
+60098 streaming setting (98% position feedforward, no additional internal ramp).
+The browser retains its acceleration-limited continuous trajectory, with nominal
+720 mm/s velocity and 3600 mm/s² acceleration ceilings. Centering uses the slower
+35 RPM / 75 RPM/s calibration profile. The Python bridge retains its earlier
+profile. Faster requested patterns can still be limited by the physical budget.
 A successful Home does not start waveform motion.
 
 The bridge never transmits an absolute position target of zero because that
@@ -203,9 +203,9 @@ before accepting it. Reconnecting requires Home again.
 
 RUN clears pending motion, checks stationary disabled readback, enables the
 drive and checks the enabled hold before sending bounded targets. The planner
-uses a browser maximum velocity of 294912 counts/s (360 nominal mm/s) and
-maximum acceleration of 1769472 counts/s² (2160 nominal mm/s²), with ten percent
-speed headroom below the drive's 600 RPM setting. The optional Python bridge
+uses a browser maximum velocity of 589824 counts/s (720 nominal mm/s) and
+maximum acceleration of 2949120 counts/s² (3600 nominal mm/s²), with ten percent
+speed headroom below the drive's 1200 RPM setting. The optional Python bridge
 retains 3822 counts/s and 8192 counts/s². It bounds position, speed and acceleration;
 **jerk limiting is not implemented**. Waveforms with abrupt corners therefore
 produce different requested and planned traces, and drive interpolation is
@@ -326,8 +326,8 @@ permitted adapter matches. Identical adapters require manual selection. First
 use still requires the browser chooser; automatic connection never starts motion
 or restores calibration. Home and Play remain explicit after reconnection.
 
-Browser homing uses 70 RPM / 150 RPM/s for the long endpoint searches and
-center parking. The short retreat and repeated contact checks retain 35 RPM /
+Browser homing uses 70 RPM / 150 RPM/s for the long endpoint searches.
+Center parking, short retreat and repeated contact checks retain 35 RPM /
 75 RPM/s. Output limit, contact confirmation, repeat agreement, search bounds
 and stop verification are unchanged. The faster homing profile has passed the connected rail check.
 
@@ -335,7 +335,7 @@ Stop verification now permits up to three seconds for inhibited feedback to sett
 Three stable encoder readings and disabled-output, speed, pending and PWM checks
 remain required. A failure includes the last feedback fields and encoder spread.
 
-The browser Rate control reaches 1 Hz. Wide high-rate patterns can still exceed
+The browser Rate control reaches 2 Hz. Wide high-rate patterns can still exceed
 the motion budget; the tested faster profile is described below.
 
 
@@ -351,18 +351,22 @@ The browser uses the same dedicated `0x7b` absolute-position command as the
 upstream OSSM-alt motor library. Its eight-byte reply carries the current encoder
 position (low word, then high word), not a target echo; this was checked on the
 connected drive with output inhibited and a distinct target. Full configuration,
-alarm, pending and output snapshots remain required at 100 ms intervals.
+alarm, pending and output snapshots remain required at 200 ms intervals.
 Homing retains the established bulk-register position commands.
 
-The stream requests a 33 ms cadence, subject to serial timing, with no catch-up
-queue. The drive ceiling is 600 RPM, internal acceleration is 20000 RPM/s,
-and the planner budgets 360 mm/s and 2160 mm/s². Both drive and planner ramps
-remain enabled. The vendor manual describes lag from the internal ramp when the
-external controller also ramps; higher drive acceleration reduces that overlap.
+The stream requests a 15 ms cadence with a 10 ms scheduling tick, subject to serial timing, with no catch-up
+queue. Successful exchanges use a 3 ms quiet gap at 19200 baud; startup/error
+recovery retains the longer quiet boundary. Hardware waveforms use continuous
+velocity tracking within the browser acceleration and rail bounds. Simulation
+and the optional Python bridge retain their original point planner.
 
-A bounded physical test completed 0.5 Hz and 1 Hz / 70% sine strokes, including
-Pause/Resume and verified stopping. At 1 Hz the encoder covered 98.1 mm versus
-98.4 mm commanded on this approximately 179.7 mm rail. This validates that
-operating point on the tested mechanism; phase lag remains. Other drive revisions
-must support the dedicated position command. Unsupported replies stop output;
-the transport never switches protocols or resends uncertain targets during a run.
+Stop confirmation observes at least 600 ms and requires three fresh stationary,
+inhibited readings within 0.1 mm. Following a confirmed stop, speed/demand-only
+settling discrepancies receive up to six read-only rechecks 100 ms apart, provided
+output and PWM stay zero and displacement stays within the fixed 1 mm limit.
+Persistent demand, speed, output, PWM, configuration or drift contradictions still
+fault. No motion targets are resent by settling recovery.
+
+Before Home or Play, inhibited speed feedback receives the same bounded read-only
+settling retries. Arming requires three stationary samples within a 1.5-second
+window; persistent inconsistent feedback still prevents motion.

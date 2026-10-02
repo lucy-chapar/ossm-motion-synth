@@ -220,3 +220,24 @@ test("higher hardware motion budget retains a broad one-hertz sine stroke", () =
  }
  assert.ok(high-low>.55, "planner should preserve the feasible 56% working-range stroke");
 });
+
+test("continuous hardware tracking follows a feasible sine without braking at every sample",()=>{
+ const e=new Engine({rate_hz:.57,stroke:1});e.reset({position:.5,vmax:589824/143949,amax:2949120/143949});
+ let sum=0,n=0,previous=0;
+ for(let i=0;i<1500;i++){
+  const s=e.step(.06,{running:true,tracking:true});
+  assert.ok(s.command>=.1&&s.command<=.9);assert.ok(Math.abs(s.velocity)<=e.trajectory.vmax+1e-9);
+  assert.ok(Math.abs(s.velocity-previous)<=e.trajectory.amax*.06+1e-8);previous=s.velocity;
+  if(i>250){sum+=(s.command-s.requested)**2;n++;}
+ }
+ assert.ok(Math.sqrt(sum/n)<.025,`tracking RMS ${Math.sqrt(sum/n)}`);
+});
+test("tracking remains bounded through abrupt waveform and rate changes",()=>{
+ const e=new Engine(); e.reset({position:.5,vmax:2,amax:12});let previous=0;
+ for(let i=0;i<2500;i++){
+  if(i%100===0)e.configure({shape:['sine','square','saw','triangle'][(i/100)%4],rate_hz:i%200?4:.02,stroke:1});
+  const s=e.step(.02,{running:true,tracking:true});
+  assert.ok(s.command>=.1&&s.command<=.9);assert.ok(Math.abs(s.velocity)<=2+1e-9);
+  assert.ok(Math.abs(s.velocity-previous)<=12*.02+1e-8);previous=s.velocity;
+ }
+});

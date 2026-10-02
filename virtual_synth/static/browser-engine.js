@@ -130,6 +130,7 @@
       position = number(position, "reset position", this.low, this.high);
       this.position = this.command = position;
       this.velocity = 0;
+      this.trackingTarget = position;
     }
 
     configure_bounds(low, high) {
@@ -167,6 +168,33 @@
       const coast_time = Math.max(0, (Math.abs(error) - accel_distance - brake_distance) / peak);
       segments.push([accel_time, direction * a], [coast_time, 0], [peak / a, -direction * a]);
       return segments;
+    }
+
+    track(target, dt) {
+      dt = number(dt, "Tracking dt", 0, MAX_DT);
+      target = number(target, "Tracking target", this.low, this.high);
+      if (!dt) return this.command;
+      const from = this.trackingTarget ?? this.position;
+      const feed = Math.abs(target - from) <= this.vmax * dt * 1.5 ? (target - from) / dt : 0;
+      const count = Math.ceil(dt / .002), h = dt / count;
+      for (let i = 0; i < count; i++) {
+        const reference = from + (target - from) * (i + 1) / count;
+        let wanted = clamp(feed + 6 * (reference - this.position), -this.vmax, this.vmax);
+        // Brake before a rail boundary, with one integration-step margin.
+        const upper = Math.max(0, Math.sqrt(2 * this.amax * Math.max(0, this.high - this.position)) - this.amax * h);
+        const lower = Math.max(0, Math.sqrt(2 * this.amax * Math.max(0, this.position - this.low)) - this.amax * h);
+        wanted = clamp(wanted, -lower, upper);
+        const next = this.velocity + clamp(wanted - this.velocity, -this.amax * h, this.amax * h);
+        const position = this.position + .5 * (this.velocity + next) * h;
+        const stopping = position + next * Math.abs(next) / (2 * this.amax);
+        if (position < this.low || position > this.high || stopping < this.low || stopping > this.high) {
+          // The exact bounded point planner handles a discontinuity near a limit.
+          this.update(clamp(reference, this.low, this.high), h);
+        } else { this.position = position; this.velocity = next; }
+      }
+      this.trackingTarget = target;
+      this.command = this.position;
+      return this.command;
     }
 
     update(target, dt) {
@@ -244,8 +272,8 @@
 
     step(dt, controls = {}) {
       dt = number(dt, "Engine dt", 0, MAX_DT);
-      const {gate = false, running = true} = options(controls, ["gate", "running"], "Step controls");
-      if (typeof gate !== "boolean" || typeof running !== "boolean") {
+      const {gate = false, running = true, tracking = false} = options(controls, ["gate", "running", "tracking"], "Step controls");
+      if (typeof gate !== "boolean" || typeof running !== "boolean" || typeof tracking !== "boolean") {
         throw new TypeError("gate and running must be booleans");
       }
       const previous_rate = this._effective()[0];
@@ -262,7 +290,7 @@
       const wave = direct_position === null ? carrier : direct_position;
       const requested = clamp(midpoint + amplitude * wave, low, high);
       let command;
-      if (running) command = this.trajectory.update(requested, dt);
+      if (running) command = tracking ? this.trajectory.track(requested, dt) : this.trajectory.update(requested, dt);
       else {
         this.trajectory.reset(this.trajectory.position);
         command = this.trajectory.command;
