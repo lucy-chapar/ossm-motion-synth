@@ -283,7 +283,7 @@
         const recoveriesBefore = this._communication_recoveries;
         const target = this._nonzero_target(this._low + (this._high - this._low) * normalized, this._low, this._high);
         const position = this._check_active(await this._read(), true);
-        // Feedback precedes the next 100 ms target. Allow one command interval
+        // Feedback precedes the next target (normally 60 ms). Allow one command interval
         // of travel, capped at ten percent of the calibrated working range.
         const trackingLimit = Math.min((this._high - this._low) * .1, 1024 + RUN_MAX_VELOCITY * .1);
         this._tracking_failures = Math.abs(position - this._target) > trackingLimit ? this._tracking_failures + 1 : 0;

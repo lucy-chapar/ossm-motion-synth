@@ -24,6 +24,10 @@
     const transportFactory = options.transportFactory || ((port) => new globalThis.MotionWebSerialTransport.MotorTransport(port, { allowMotion: true }));
     const engine = new engineAPI.Engine();
     const ports = new Map();
+    const storage = options.storage === undefined ? globalThis.localStorage : options.storage;
+    const adapterKey = "motion-synth.adapter";
+    const identity = port => JSON.stringify(port.getInfo?.() || {});
+    let paused = false;
     let nextPort = 1, transport = null, connectedPort = null, lastHardware = null;
     let mode = "simulation", armed = false, running = false, gate = false, fault = null;
     let unconfirmedStop = false, stoppingCount = 0, revision = 0, epoch = 0, busy = false, closed = false;
@@ -52,12 +56,12 @@
         endpoints: hw.homed && bounds ? { usable_low_raw: bounds[0], usable_high_raw: bounds[1] } : null };
     };
     function state() {
-      return copy({ mode, armed, running, gate, fault, params: engine.params, signal, history,
+      return copy({ mode, armed, running, paused, gate, fault, params: engine.params, signal, history,
         hardware: hardware(), allow_motion: supported, run_remaining_s: null,
         unconfirmed_stop: unconfirmedStop, stopping: stoppingCount > 0, control_revision: revision, homing: homing(), web_serial_supported: supported });
     }
     function fence() {
-      epoch++; revision++; running = armed = gate = false;
+      epoch++; revision++; paused = false; running = armed = gate = false;
       signal = engine.step(0, { running: false, gate: false });
     }
     function enqueue(task) {
@@ -100,8 +104,8 @@
       const activeHome = homing().active;
       if ((armed || activeHome) && now - lastHeartbeat > 1.5) await fail("Control tab heartbeat expired. Output stopped; rearm explicitly.");
       else if ((running && dt > 0.25) || (activeHome && dt > 1)) await fail("Motion scheduling deadline missed. No catch-up targets were sent.");
-      signal = engine.step(Math.min(dt, 0.25), { gate, running });
-      if (transport && now - lastIO >= (running || homing().active ? 0.1 : 0.5)) {
+      signal = engine.step(paused ? 0 : Math.min(dt, 0.25), { gate, running });
+      if (transport && now - lastIO >= (running ? 0.06 : homing().active ? 0.1 : 0.5)) {
         lastIO = now;
         const ioEpoch = epoch, recoveriesBefore = transport.status().communication_recoveries || 0;
         try {
@@ -182,6 +186,22 @@
           } catch (error) { await motionError("Cannot arm", error); }
         }
         armed = true; gate = false; lastHeartbeat = lastTick = clock();
+      } else if (name === "pause") {
+        if (!running) throw new Error("Start before pausing.");
+        fence(); await stopTransport();
+        if (fault || unconfirmedStop) throw new Error(fault || "Stop is unconfirmed.");
+        paused = true;
+      } else if (name === "resume") {
+        if (!paused || fault || unconfirmedStop) throw new Error("A healthy paused synth is required.");
+        if (transport) {
+          try {
+            await transport.arm(); await assertCurrent();
+            const hw = await transport.start(); await assertCurrent();
+            engine.trajectory.reset(hw.position_normalized);
+            signal = engine.step(0, { running: false, gate: false });
+          } catch (error) { await motionError("Cannot resume", error); }
+        }
+        paused = false; armed = running = true; lastTick = lastIO = lastHeartbeat = clock();
       } else if (name === "run") {
         if (!armed || running || fault) throw new Error("Arm a stopped, healthy synth before running.");
         if (transport) {
@@ -218,7 +238,8 @@
           await candidate.close(); lastHardware = null;
           throw new Error("Connection was stopped before it completed.");
         }
-        transport = candidate; connectedPort = ports.get(payload.port); mode = "hardware"; revision++; history = [];
+        transport = candidate; connectedPort = ports.get(payload.port);
+        try { storage?.setItem(adapterKey, identity(connectedPort)); } catch (_) { /* Storage may be unavailable. */ } mode = "hardware"; revision++; history = [];
         await assertCurrent();
         lastIO = lastTick = clock();
         const hw = hardware();
@@ -247,6 +268,17 @@
       const requestedEpoch = epoch;
       return enqueue(() => act(payload, requestedEpoch));
     }
+    async function autoConnect() {
+      if (!supported || transport || armed || running || closed) return false;
+      let saved; try { saved = storage?.getItem(adapterKey); } catch (_) { return false; }
+      if (!saved || saved === "{}") return false;
+      const available = await serial.getPorts();
+      const matches = available.filter(port => identity(port) === saved);
+      if (matches.length !== 1) return false;
+      await request("/api/action", { action: "connect", port: remember(matches[0]) });
+      return true;
+    }
+    function onConnect() { autoConnect().catch(() => {}); }
     function onDisconnect(event) {
       if (transport && (event.target === connectedPort || event.port === connectedPort)) {
         fence(); enqueue(async () => {
@@ -262,9 +294,10 @@
       }
     }
     serial?.addEventListener?.("disconnect", onDisconnect);
+    serial?.addEventListener?.("connect", onConnect);
     if (options.autoStart !== false) timer = setInterval(tick, 20);
-    return { request, choosePort, tick, state, stop, supported,
-      async close() { closed = true; clearInterval(timer); await stop(); if (transport) await transport.close(); serial?.removeEventListener?.("disconnect", onDisconnect); } };
+    return { request, choosePort, autoConnect, tick, state, stop, supported,
+      async close() { closed = true; clearInterval(timer); await stop(); if (transport) await transport.close(); serial?.removeEventListener?.("disconnect", onDisconnect); serial?.removeEventListener?.("connect", onConnect); } };
   }
   return { createRuntime };
 });

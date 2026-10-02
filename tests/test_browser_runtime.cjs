@@ -245,3 +245,58 @@ test("reply recovery pauses time instead of faulting or generating catch-up targ
  env.advance(.1);await env.runtime.tick();env.advance(.02);await env.runtime.tick();
  assert.equal(env.runtime.state().fault,null);assert.equal(env.runtime.state().running,true);await env.runtime.close();
 });
+
+
+test("pause verifies stop, freezes phase, and resumes with fresh encoder position", async () => {
+  const motor = fakeMotor(); motor.hw.homed = true;
+  const env = setup({ factory: () => motor });
+  await env.connect(); await env.action("arm"); await env.action("run");
+  env.advance(.1); await env.runtime.tick();
+  await env.action("pause");
+  assert.equal(env.runtime.state().paused, true);
+  assert.equal(env.runtime.state().running, false);
+  const phase = env.runtime.state().signal.phase;
+  env.advance(2); await env.runtime.tick();
+  assert.equal(env.runtime.state().signal.phase, phase);
+  motor.hw.position_normalized = .53;
+  await env.action("resume");
+  assert.equal(env.runtime.state().running, true);
+  assert.equal(env.runtime.state().paused, false);
+  assert.equal(env.runtime.state().signal.phase, phase);
+  env.advance(.06); await env.runtime.tick();
+  assert.ok(env.runtime.state().signal.command > .52);
+  await env.action("stop");
+  await assert.rejects(env.action("resume"), /paused/);
+});
+
+test("pause cannot resume when stop verification fails", async () => {
+  const motor = fakeMotor({ stopConfirmed: false }); motor.hw.homed = true;
+  const env = setup({ factory: () => motor });
+  await env.connect(); await env.action("arm"); await env.action("run");
+  await assert.rejects(env.action("pause"), /unconfirmed/);
+  assert.equal(env.runtime.state().paused, false);
+  await assert.rejects(env.action("resume"), /paused/);
+});
+
+test("automatic connection uses only a unique previously confirmed adapter", async () => {
+  const store = new Map();
+  const storage = { getItem: k => store.get(k), setItem: (k,v) => store.set(k,v) };
+  const port = { getInfo: () => ({ usbVendorId: 1027, usbProductId: 24577 }) };
+  let available = [port], choices = 0;
+  const motor = fakeMotor();
+  const runtime = createRuntime({ autoStart: false, storage,
+    serial: { getPorts: async () => available, requestPort: async () => { choices++; return port; } },
+    transportFactory: () => motor });
+  assert.equal(await runtime.autoConnect(), false);
+  const selected = await runtime.choosePort();
+  await runtime.request("/api/action", { action: "connect", port: selected });
+  await runtime.request("/api/action", { action: "disconnect" });
+  available = [port, { getInfo: port.getInfo }];
+  assert.equal(await runtime.autoConnect(), false);
+  available = [port];
+  assert.equal(await runtime.autoConnect(), true);
+  assert.equal(choices, 1);
+  assert.equal(runtime.state().armed, false);
+  assert.equal(runtime.state().running, false);
+  await runtime.close();
+});

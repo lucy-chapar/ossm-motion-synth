@@ -311,3 +311,24 @@ Stop verification tolerates a dropped status reply within its existing 1.5-secon
 deadline, then requires three fresh stable inhibited readings. Pressing Stop
 again after failed cleanup makes a new inhibit/verification attempt; it never
 restarts motion. The fault banner retains the original fault and cleanup error.
+
+
+### Browser pause and reconnection
+
+Play changes to Pause while running. Pause inhibits output and verifies the stop,
+then freezes the carrier, LFO and envelope phase. Resume takes fresh stationary
+encoder feedback, enables the drive, and approaches the paused pattern through
+the trajectory acceleration limiter. Stop output ends the paused session.
+
+After a successful connection, the browser remembers the adapter USB identity.
+On page load or USB attachment it reconnects only if exactly one previously
+permitted adapter matches. Identical adapters require manual selection. First
+use still requires the browser chooser; automatic connection never starts motion
+or restores calibration. Home and Arm remain explicit after reconnection.
+
+Running target cycles now request a 60 ms cadence instead of 100 ms. Each cycle
+still reads and validates feedback before sending the next absolute target. The
+actual rate depends on serial response time; no commands queue up to catch up.
+The drive retains its 1500 RPM/s acceleration ramp and the software planner's
+lower acceleration budget. This uses the existing drive position protocol rather
+than assuming an unsupported buffered trajectory command.

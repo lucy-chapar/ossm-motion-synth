@@ -131,7 +131,7 @@
     const epoch = motionEpoch;
     const run = async () => {
       try {
-        if (["arm", "run", "home_start", "connect"].includes(name) && epoch !== motionEpoch) return;
+        if (["arm", "run", "resume", "pause", "home_start", "connect"].includes(name) && epoch !== motionEpoch) return;
         if (name === "home_start") homeCancelledByTab = false;
         const result = await api("/api/action", { action: name, ...details });
         if (!acceptState(result)) await poll();
@@ -233,7 +233,7 @@
     $("mode-badge").classList.toggle("hardware", hw);
     $("connection-indicator").textContent = browserRuntime ? hw ? "USB–RS485 connected" : "Running in your browser" : online ? "Local app connected" : "Local app disconnected";
     $("scope-corner").textContent = hw ? "HARDWARE · ENCODER WHEN AVAILABLE" : "SIMULATED OUTPUT";
-    const runningLabel = state.stopping ? "STOPPING" : state.unconfirmed_stop ? "STOP UNCONFIRMED" : state.fault ? "FAULT" : isHoming() ? "HOMING" : state.running ? "RUNNING" : state.armed ? "ARMED" : "STOPPED";
+    const runningLabel = state.stopping ? "STOPPING" : state.unconfirmed_stop ? "STOP UNCONFIRMED" : state.fault ? "FAULT" : isHoming() ? "HOMING" : state.running ? "RUNNING" : state.paused ? "PAUSED" : state.armed ? "ARMED" : "STOPPED";
     $("run-status").replaceChildren();
     const runDot = document.createElement("span"); runDot.className = "status-dot";
     $("run-status").append(runDot, document.createTextNode(runningLabel));
@@ -241,7 +241,8 @@
     $("run-status").classList.toggle("armed", Boolean(state.armed && !state.running));
     $("arm-button").disabled = !online || isHoming() || !canMove || (hw && !state.homing?.valid) || Boolean(state.armed) || Boolean(state.fault || state.unconfirmed_stop);
     $("arm-button").setAttribute("aria-pressed", String(Boolean(state.armed)));
-    $("run-button").disabled = !online || !canMove || !state.armed || Boolean(state.running) || Boolean(state.fault || state.unconfirmed_stop);
+    $("run-button").textContent = state.running ? "Ⅱ Pause" : state.paused ? "▶ Resume" : "▶ Play";
+    $("run-button").disabled = !online || !canMove || (!state.armed && !state.paused) || (!browserRuntime && state.running) || Boolean(state.fault || state.unconfirmed_stop || state.stopping);
     $("stop-button").disabled = !token;
     $("gate-button").disabled = !online || isHoming();
     $("gate-button").setAttribute("aria-pressed", String(Boolean(state.gate)));
@@ -554,7 +555,7 @@
     if (epoch === motionEpoch) action(name).catch(() => {});
   }
   $("arm-button").addEventListener("click", () => requestMotion("arm"));
-  $("run-button").addEventListener("click", () => requestMotion("run"));
+  $("run-button").addEventListener("click", () => state?.running && browserRuntime ? action("pause").catch(() => {}) : requestMotion(state?.paused ? "resume" : "run"));
   $("stop-button").addEventListener("click", () => {
     motionEpoch++;
     muteAudio();
@@ -667,6 +668,10 @@
       if (typeof session.token !== "string" || !session.token) throw new Error("The local app did not provide a session token.");
       token = session.token;
       await poll();
+      if (browserRuntime) {
+        try { await browserRuntime.autoConnect(); await poll(); }
+        catch (error) { report(`Automatic connection: ${error.message}`, true); }
+      }
     } catch (error) {
       report(browserRuntime ? `Cannot start the browser synth: ${error.message}` : "Cannot connect to the local synth app. Keep this page open and check that the server is running.", true);
       setTimeout(initialize, 2000);
