@@ -1436,3 +1436,15 @@ test("settling allowance never accepts enabled output, PWM or speed", async () =
   await assert.rejects(transport.snapshot());assert.equal(transport.status().stop_confirmed,false);await transport.close();
  }
 });
+
+test("stop verification survives one lost readback within its deadline",async()=>{
+ const {transport,motor}=await running();motor.onRead=()=>{motor.onRead=null;throw droppedReply();};
+ assert.equal((await transport.stop()).stop_confirmed,true);await transport.close();
+});
+test("explicit Stop can verify recovery after a failed cleanup",async()=>{
+ const {transport,motor}=await running();motor.onRead=()=>new Uint8Array();
+ await assert.rejects(transport.stop());assert.equal(transport.status().stop_confirmed,false);
+ motor.onRead=null;const writes=motor.commands.length;
+ assert.equal((await transport.stop()).stop_confirmed,true);assert.equal(motor.commands.length,writes+2);
+ await transport.close();
+});

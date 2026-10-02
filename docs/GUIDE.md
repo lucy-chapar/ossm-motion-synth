@@ -306,3 +306,8 @@ LFO, and 0.2–5 seconds for Attack and Release. Stroke and Center retain their
 full percentage ranges. The underlying engine accepts the previous parameter
 range for compatibility. These control ranges improve adjustment resolution;
 wide strokes and combined modulation can still engage the motion limiter.
+
+Stop verification tolerates a dropped status reply within its existing 1.5-second
+deadline, then requires three fresh stable inhibited readings. Pressing Stop
+again after failed cleanup makes a new inhibit/verification attempt; it never
+restarts motion. The fault banner retains the original fault and cleanup error.

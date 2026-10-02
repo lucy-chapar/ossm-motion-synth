@@ -627,7 +627,13 @@
         try {
           const deadline = this._clock() + 1.5;
           while (this._clock() < deadline) {
-            const v = await this._read(Math.min(IO_TIMEOUT, deadline - this._clock()));
+            let v;
+            try { v = await this._read(Math.min(IO_TIMEOUT, deadline - this._clock())); }
+            catch (error) {
+              if (!error.recoverableResponse) throw error;
+              positions.length = 0; this._communication_recoveries++;
+              continue; // Read-only recovery stays within the stop deadline.
+            }
             const position = this._check_active(v, v[1] === 1);
             if (this._inhibited_feedback(v)) {
               positions.push(position);
@@ -644,7 +650,9 @@
       } finally { this._inCleanup = prior; }
     }
     async stop() {
-      this._require_connection(); await this._stop_impl();
+      this._require_connection();
+      if (this._owned && this._cleanup_attempted && !this._stop_confirmed) this._cleanup_attempted = false;
+      await this._stop_impl();
       if (this._cleanup_errors.length) throw new TransportError("Stop/inhibit unconfirmed: " + this._cleanup_errors.join("; "));
       return this.status();
     }

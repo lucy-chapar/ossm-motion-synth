@@ -72,8 +72,9 @@
         stoppingCount++;
         try {
           // Fence even a pending read-only preflight before it can claim motion.
-          try { await transport.stop(); } catch (error) { fault = String(error.message || error); }
+          try { await transport.stop(); } catch (error) { fault ||= String(error.message || error); }
           const after = hardware();
+          if (after.stop_confirmed === true) unconfirmedStop = false;
           if ((before.running || before.owned) && after.stop_confirmed !== true) {
             unconfirmedStop = true;
             fault ||= "Motor stop is unconfirmed. Use the independent physical stop.";

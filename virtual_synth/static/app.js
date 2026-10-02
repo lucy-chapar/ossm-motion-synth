@@ -246,7 +246,7 @@
     $("gate-button").disabled = !online || isHoming();
     $("gate-button").setAttribute("aria-pressed", String(Boolean(state.gate)));
     $("fault-notice").hidden = !(state.fault || state.unconfirmed_stop);
-    $("fault-text").textContent = state.unconfirmed_stop ? "Motor stop is unconfirmed. The software stop is not an emergency stop; use the independent physical stop or power isolation." : state.fault || "";
+    $("fault-text").textContent = state.unconfirmed_stop ? `Motor stop is unconfirmed. ${state.fault || hw?.fault || "No fresh feedback."} ${hw?.cleanup_errors?.join("; ") || ""} Use the independent physical stop or power isolation if moving.` : state.fault || "";
     $("reset-button").disabled = !online || isHoming() || Boolean(state.running || state.unconfirmed_stop);
     $("scope-empty").hidden = Boolean(state.running || (state.history && state.history.length > 1));
     $("actual-legend").hidden = !hw || !(state.history || []).some((sample) => Number.isFinite(sample.actual));
