@@ -112,7 +112,7 @@
       if (rx.length !== (tx[1] === 3 ? 57 : 8)) throw new TransportError("Response length mismatch");
       return rx;
     }
-    async _read(budget = null) {
+    async _read(budget = null, speedRecheck = false) {
       try {
         let response;
         try { response = await this._exchange(io.snapshotRequest(), budget ?? this._budget()); }
@@ -129,6 +129,14 @@
           if (this._origin === null) { this._configuration(this._values, false, this._baseline); position = io.signedPosition(this._values); }
           else position = this._check_active(this._values, false);
           const displacement = Math.abs(position - this._stop_position);
+          // A speed-only contradiction can be a transient estimator sample.
+          // Recheck once, read-only; output, demand, PWM and fixed drift remain strict.
+          if (!speedRecheck && !this._inCleanup && this._values[0] === 1 && this._values[1] === 0 &&
+              Math.abs(io.pending(this._values)) <= STOP_PENDING_TOLERANCE && this._values[19] === 0 &&
+              displacement <= STOP_CONFIRM_TOLERANCE && !this._stationary_speed(this._values)) {
+            await this._wait(.05);
+            return await this._read(budget, true);
+          }
           if (!this._inhibited_feedback(this._values) || displacement > STOP_SETTLE_TOLERANCE) {
             throw new TransportError(`Stopped feedback changed: position drift ${displacement} counts (limit ${STOP_SETTLE_TOLERANCE}), pending ${io.pending(this._values)}, actual speed ${this._signed_speed(this._values)}, PWM ${this._signed_pwm(this._values)}, output ${this._values[1]}`);
           }

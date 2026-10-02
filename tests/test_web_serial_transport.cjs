@@ -1507,3 +1507,13 @@ test("a later confirmed Stop permits clearing a settling fault after fresh stati
  assert.match(transport.status().fault,/did not settle/);
  assert.equal((await transport.reset_fault()).fault,null);await transport.close();
 });
+
+test("confirmed stop rechecks an isolated speed-only contradiction without motion writes",async()=>{
+ const {transport,motor}=await running();await transport.stop();const writes=motor.commands.length;let n=0;
+ motor.onRead=m=>{m.values[16]=n++===0?65280:0;};
+ assert.equal((await transport.snapshot()).stop_confirmed,true);
+ assert.equal(n,2);assert.equal(motor.commands.length,writes);motor.onRead=null;await transport.close();
+ const other=await running();await other.transport.stop();other.motor.values[16]=65280;
+ await assert.rejects(other.transport.snapshot(),/actual speed -256/);
+ assert.equal(other.transport.status().stop_confirmed,false);other.motor.values[16]=0;await other.transport.close();
+});
