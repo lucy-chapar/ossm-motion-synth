@@ -338,3 +338,7 @@ Browser homing uses 70 RPM / 150 RPM/s for the long endpoint searches and
 center parking. The short retreat and repeated contact checks retain 35 RPM /
 75 RPM/s. Output limit, contact confirmation, repeat agreement, search bounds
 and stop verification are unchanged. The faster profile requires a live check.
+
+Stop verification now permits up to three seconds for inhibited feedback to settle.
+Three stable encoder readings and disabled-output, speed, pending and PWM checks
+remain required. A failure includes the last feedback fields and encoder spread.

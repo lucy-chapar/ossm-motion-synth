@@ -449,7 +449,7 @@ test("Stop waits for transient coast feedback before confirming three stable inh
   const before = motor.commands.length, started = clock.now();
   const stopped = await transport.stop();
   assert.equal(stopped.stop_confirmed, true); assert.equal(stopped.fault, null);
-  assert.ok(reads >= 5); assert.ok(clock.now() - started <= 1.51);
+  assert.ok(reads >= 5); assert.ok(clock.now() - started <= 3.01);
   assert.deepEqual(motor.commands.slice(before), ["clear", "inhibit"]);
   assert.ok([-72153, -72152].includes(stopped.position_raw));
   assert.equal((await transport.snapshot()).stop_confirmed, true);
@@ -472,7 +472,7 @@ test("Stop never confirms persistent demand, speed, enabled output or encoder dr
     };
     const before = motor.commands.length, started = clock.now();
     await assert.rejects(transport.stop());
-    assert.ok(clock.now() - started <= 1.51, `unbounded stop for ${failure}`);
+    assert.ok(clock.now() - started <= 3.01, `unbounded stop for ${failure}`);
     assert.equal(transport.status().stop_confirmed, false); assert.ok(transport.status().fault);
     assert.deepEqual(motor.commands.slice(before), ["clear", "inhibit"]);
     assert.ok(reads >= 1);
@@ -1448,4 +1448,22 @@ test("explicit Stop can verify recovery after a failed cleanup",async()=>{
  motor.onRead=null;const writes=motor.commands.length;
  assert.equal((await transport.stop()).stop_confirmed,true);assert.equal(motor.commands.length,writes+2);
  await transport.close();
+});
+
+
+test("stop allows delayed mechanical settling without resending motion", async () => {
+  const { transport, motor, clock } = await running();
+  const began = clock.now(); let inhibited = false;
+  motor.onCommand = (_, operation) => { if (operation === "inhibit") inhibited = true; };
+  motor.onRead = m => {
+    if (!inhibited) return;
+    m.values[19] = 0; m.remaining(0);
+    m.values[16] = clock.now() - began < 2 ? 2 : 0;
+  };
+  const before = motor.commands.length;
+  assert.equal((await transport.stop()).stop_confirmed, true);
+  assert.ok(clock.now() - began >= 2);
+  assert.ok(clock.now() - began <= 3.01);
+  assert.deepEqual(motor.commands.slice(before), ["clear", "inhibit"]);
+  await transport.close();
 });

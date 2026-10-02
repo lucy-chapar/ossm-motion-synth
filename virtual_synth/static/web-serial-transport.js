@@ -630,8 +630,8 @@
           }
         }
         try {
-          const deadline = this._clock() + 1.5;
-          while (this._clock() < deadline) {
+          const deadline = this._clock() + 3;
+          for (let attempt = 0; attempt < 40 && this._clock() < deadline; attempt++) {
             let v;
             try { v = await this._read(Math.min(IO_TIMEOUT, deadline - this._clock())); }
             catch (error) {
@@ -647,7 +647,7 @@
             } else positions.length = 0;
             await this._wait(Math.min(.1, Math.max(0, deadline - this._clock())));
           }
-          if (positions.length !== 3 || spread(positions) > 4) throw new TransportError("Motor did not settle within 1.5 seconds after stop/inhibit");
+          if (positions.length !== 3 || spread(positions) > 4) throw new TransportError(`Motor did not settle within 3 seconds after stop/inhibit: output ${this._values?.[1]}, pending ${this._values ? io.pending(this._values) : "unknown"}, speed ${this._values ? this._signed_speed(this._values) : "unknown"}, PWM ${this._values?.[19]}, encoder spread ${positions.length ? spread(positions) : "no stationary samples"} counts`);
         } catch (error) { errors.push("readback: " + (error.message || error)); }
         this._cleanup_errors = errors; this._enabled_at = null; this._stop_confirmed = !errors.length;
         this._stop_position = this._stop_confirmed ? positions.at(-1) : null;
