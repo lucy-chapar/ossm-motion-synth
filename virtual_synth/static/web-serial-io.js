@@ -128,9 +128,11 @@
   }
 
   class WebSerialConnection {
-    constructor(port) {
+    constructor(port, { baudRate = 19200 } = {}) {
       if (!port || typeof port.open !== "function" || typeof port.close !== "function") throw new TransportError("An explicitly selected serial port is required.");
+      if (!Number.isInteger(baudRate) || ![19200, 38400, 115200].includes(baudRate)) throw new TransportError("Unsupported serial baud rate.");
       this.port = port;
+      this.baudRate = baudRate;
       this.poisoned = false;
       this.closeIncomplete = false;
       this._opened = this._opening = this._closing = false;
@@ -150,7 +152,7 @@
       if (this._opened || this._opening || this._closing || this.poisoned) throw new TransportError("Connection cannot be opened in its current state.");
       this._opening = true;
       try {
-        await this.port.open({ baudRate: 19200, dataBits: 8, stopBits: 1, parity: "none", flowControl: "none" });
+        await this.port.open({ baudRate: this.baudRate, dataBits: 8, stopBits: 1, parity: "none", flowControl: "none" });
         this._opened = true;
         if (!this.port.readable || !this.port.writable) throw new TransportError("Serial streams are unavailable.");
         this._reader = this.port.readable.getReader();

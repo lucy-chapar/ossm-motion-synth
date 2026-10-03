@@ -17,6 +17,8 @@
   "use strict";
   const { TransportError } = io;
   const IO_TIMEOUT = .2, MAX_RUN_SECONDS = null, HALF_WINDOW = 4096, PADDING = 128;
+  const BAUD_RATES = [19200, 38400, 115200], BAUD_PROBE_RATES = [19200, 115200, 38400];
+  const baudTimeout = error => error?.recoverableResponse === true && /^Response timeout(?:[ .:;]|$)/.test(error.message || "");
   const CONFIG = [0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 20, 21, 24, 25];
   const STREAM_STATUS_GROUPS = [[0, 7], [7, 7], [14, 7], [21, 5]];
   const STREAM_STATUS_MAX_AGE = .25;
@@ -49,9 +51,11 @@
 
   class MotorTransport {
     constructor(port, { allowMotion = false, connectionFactory = null, clock: now = clock,
-                        wait: sleep = wait, nativeHome = false, fastPositions = false, motionProfile = "streaming", portLabel = "Selected USB serial adapter" } = {}) {
+                        wait: sleep = wait, nativeHome = false, fastPositions = false, motionProfile = "streaming", baudRate = 19200, portLabel = "Selected USB serial adapter" } = {}) {
       if (!port) throw new TypeError("An explicitly selected SerialPort is required");
       if (typeof motionProfile !== "string" || !Object.hasOwn(MOTION_PROFILES, motionProfile)) throw new TypeError("Motion profile must be streaming or ramped");
+      if (baudRate !== "auto" && (!Number.isInteger(baudRate) || !BAUD_RATES.includes(baudRate))) throw new TypeError("Baud rate must be 19200, 38400, 115200, or auto");
+      this._requested_baud = baudRate; this._baud = baudRate === "auto" ? null : baudRate;
       this._motion_profile = motionProfile;
       this._run_accel_rpm_s = MOTION_PROFILES[motionProfile].driveAcceleration;
       this._run_max_acceleration = 32768 * MOTION_PROFILES[motionProfile].plannedAcceleration / 60 * .9;
@@ -87,7 +91,7 @@
       else if (this._running) notice = "Motor running.";
       else if (this._homed) notice = "Motor homed.";
       return {
-        port: this.port, baud: 19200, slave: 1, connected: this._connection !== null, owned: this._owned,
+        port: this.port, baud: this._baud, slave: 1, connected: this._connection !== null, owned: this._owned,
         motion_allowed: this.allow_motion, motion_profile: this._motion_profile, armed: this._armed, running: this._running,
         stop_confirmed: this._stop_confirmed, fault: this._fault, homing: this._homing, homed: this._homed,
         home_phase: this._home_phase, home_progress: this._home_progress, home_direction: this._home_direction,
@@ -125,12 +129,12 @@
       if (rx.length !== (tx[1] === 3 ? 5 + 2 * ((tx[4] << 8) | tx[5]) : 8)) throw new TransportError("Response length mismatch");
       return rx;
     }
-    async _read(budget = null, speedRecheck = 0) {
+    async _read(budget = null, speedRecheck = 0, baudProbe = false) {
       try {
         let response;
         try { response = await this._exchange(io.snapshotRequest(), budget ?? this._budget()); }
         catch (error) {
-          if (!error.recoverableResponse || this._inCleanup) throw error;
+          if (!error.recoverableResponse || this._inCleanup || (baudProbe && !baudTimeout(error))) throw error;
           this._checkCancelled();
           response = await this._exchange(io.snapshotRequest(), budget ?? this._budget());
           this._communication_recoveries++;
@@ -140,7 +144,7 @@
         this._status_group_at.fill(this._snapshot_at); this._status_group_next = 0; this._checkCancelled();
         // When electrically inhibited, let the speed estimator settle before
         // returning feedback. The eventual read must still pass every guard.
-        if (!this._inCleanup && speedRecheck < 6 && this._values[0] === 1 && this._values[1] === 0 &&
+        if (!baudProbe && !this._inCleanup && speedRecheck < 6 && this._values[0] === 1 && this._values[1] === 0 &&
             this._values[19] === 0 && Math.abs(io.pending(this._values)) <= STOP_PENDING_TOLERANCE &&
             !this._stationary_speed(this._values)) {
           await this._wait(.1);
@@ -232,15 +236,43 @@
     async connect() {
       if (this._connection) throw new TransportError("Transport is already connected");
       if (this._fault) throw new TransportError("Create a new transport after inspecting the latched fault");
+      // A new connection observes the drive without inheriting earlier Home,
+      // stopped feedback, or configuration assumptions.
+      for (const field of ["values", "baseline", "origin", "hold_position", "low", "high", "enabled_at", "target", "stop_position", "observed_at", "home_origin", "measured_endpoints", "measured_travel", "proposed_endpoints", "proposed_bounds"]) this["_" + field] = null;
+      this._homed = this._stop_confirmed = false;
+      this._home_phase = "idle"; this._home_progress = 0;
+      this._snapshot_at = -Infinity; this._status_group_at.fill(-Infinity); this._status_group_next = 0;
+      const candidates = this._requested_baud === "auto" ? BAUD_PROBE_RATES : [this._requested_baud];
       try {
-        this._connection = this._factory ? await this._factory(this._port) : new io.WebSerialConnection(this._port);
-        await this._connection.open(); await this._read(IO_TIMEOUT);
+        for (let index = 0; index < candidates.length; index++) {
+          this._checkCancelled();
+          const baudRate = candidates[index]; let opened = false;
+          try {
+            this._connection = this._factory ? await this._factory(this._port, {baudRate}) : new io.WebSerialConnection(this._port, {baudRate});
+            this._checkCancelled();
+            await this._connection.open(); opened = true; this._baud = baudRate;
+            this._checkCancelled();
+            // One full snapshot, with at most one timeout retry at this rate.
+            // Any valid state ends discovery; connect sends no configuration.
+            await this._read(IO_TIMEOUT, 0, true);
+            return this.status();
+          } catch (error) {
+            const connection = this._connection; this._connection = null;
+            const unsafeBeforeClose = connection?.poisoned || connection?.closeIncomplete;
+            this._values = this._observed_at = null; this._snapshot_at = -Infinity;
+            this._status_group_at.fill(-Infinity); this._status_group_next = 0;
+            try { if (connection) await connection.close(); }
+            catch (closeError) { throw new TransportError(`${error.message || error}; serial close failed: ${closeError.message || closeError}`); }
+            if (unsafeBeforeClose || connection?.poisoned || connection?.closeIncomplete) throw new TransportError(`${error.message || error}; serial connection cleanup is unconfirmed`);
+            this._checkCancelled();
+            // A failed open, corruption, or cancellation must never change
+            // the host baud. Close the previous connection fully first.
+            if (!opened || !baudTimeout(error) || index === candidates.length - 1) throw error;
+          }
+        }
       } catch (error) {
-        const connection = this._connection; this._connection = null;
-        try { if (connection) await connection.close(); } catch (_) { /* Retain the original failure. */ }
         await this._fault_and_cleanup(error);
       }
-      return this.status();
     }
     async reset_fault() {
       this._require_connection();

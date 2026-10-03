@@ -9,9 +9,7 @@
   if (typeof module === "object" && module.exports) module.exports = exported;
   else root.MotionBrowserRuntime = exported.createRuntime();
 })(globalThis, (engineAPI) => {
-  // At 19200 baud a short guard read plus a target fits this cycle without
-  // alternating fast bursts and long full-status stalls.
-  const HARDWARE_PERIOD = .05;
+  const HARDWARE_PERIOD = .05, FAST_HARDWARE_PERIOD = .025;
   const copy = (value) => structuredClone(value);
   const spanOf = (hw) => {
     const bounds = hw.raw_bounds;
@@ -25,7 +23,7 @@
     const clock = options.clock || (() => performance.now() / 1000);
     const serial = options.serial === undefined ? globalThis.navigator?.serial : options.serial;
     const transportFactory = options.transportFactory || ((port) => new globalThis.MotionWebSerialTransport.MotorTransport(port, {
-      allowMotion: true, fastPositions: true, motionProfile: "ramped",
+      allowMotion: true, fastPositions: true, motionProfile: "ramped", baudRate: "auto",
     }));
     const engine = new engineAPI.Engine();
     const ports = new Map();
@@ -42,6 +40,9 @@
     let connectionNotice = "", autoConnecting = null;
     let paused = false;
     let nextPort = 1, transport = null, connectedPort = null, lastHardware = null;
+    // Only a verified 115200-baud connection selects the finer trial cadence.
+    // 19200/38400 keep the established cycle; none of this changes drive baud.
+    const hardwarePeriod = () => transport?.status().baud === 115200 ? FAST_HARDWARE_PERIOD : HARDWARE_PERIOD;
     let mode = "simulation", armed = false, running = false, gate = false, fault = null;
     let unconfirmedStop = false, stoppingCount = 0, revision = 0, epoch = 0, busy = false, closed = false;
     let lastTick = clock(), began = lastTick, lastIO = lastTick, lastHeartbeat = lastTick;
@@ -146,14 +147,14 @@
             });
             // Keep wall-clock cycle deadlines; never wait a whole period AFTER
             // I/O or queue missed targets when a transaction runs long.
-            nextTargetCycle = Math.max(nextTargetCycle + HARDWARE_PERIOD, clock());
+            nextTargetCycle = Math.max(nextTargetCycle + hardwarePeriod(), clock());
           }
           else if (transport.status().connected && !fault) lastHardware = await transport.snapshot();
           // A bounded recovery pauses the planner. Do not advance through the
           // missed interval or send catch-up targets afterward.
           if ((lastHardware?.communication_recoveries || 0) > recoveriesBefore) {
             lastTick = lastIO = clock();
-            nextTargetCycle = lastTick + HARDWARE_PERIOD;
+            nextTargetCycle = lastTick + hardwarePeriod();
           }
         } catch (error) { if (ioEpoch === epoch) await fail(`RS485: ${error.message || error}`); }
       }
@@ -253,7 +254,7 @@
           } catch (error) { await motionError("Cannot resume", error); }
         }
         paused = false; armed = running = true; lastTick = lastIO = lastHeartbeat = clock();
-        nextTargetCycle = lastTick + HARDWARE_PERIOD;
+        nextTargetCycle = lastTick + hardwarePeriod();
       } else if (name === "run") {
         if (!armed || running || fault) throw new Error("Arm a stopped, healthy synth before running.");
         if (transport) {
@@ -263,7 +264,7 @@
           } catch (error) { await motionError("Cannot start", error); }
         }
         running = true; lastTick = lastIO = lastHeartbeat = clock();
-        nextTargetCycle = lastTick + HARDWARE_PERIOD;
+        nextTargetCycle = lastTick + hardwarePeriod();
       } else if (name === "gate") {
         if (typeof payload.value !== "boolean") throw new Error("Gate must be true or false.");
         if (payload.value && (!armed || !running || fault)) throw new Error("Start the armed synth before opening the envelope gate.");

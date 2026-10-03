@@ -32,7 +32,7 @@ class FakePort {
   async close() { this.closes++; }
 }
 
-test("construction is inert, open uses only the fixed serial profile, close releases locks", async () => {
+test("construction is inert, open preserves the default serial profile, close releases locks", async () => {
   const port = new FakePort(), connection = new WebSerialConnection(port);
   assert.equal(port.opens.length, 0);
   assert.equal(port.writes.length, 0);
@@ -47,6 +47,29 @@ test("construction is inert, open uses only the fixed serial profile, close rele
   assert.equal(port.writes.length, 0);
   await connection.close();
   assert.equal(port.closes, 1);
+});
+
+test("allowed host baud rates preserve the remaining serial profile without sending requests", async () => {
+  for (const baudRate of [19200, 38400, 115200]) {
+    const port = new FakePort(), connection = new WebSerialConnection(port, { baudRate });
+    assert.equal(port.opens.length, 0);
+    try {
+      await connection.open();
+      assert.deepEqual(port.opens, [{ baudRate, dataBits: 8, stopBits: 1, parity: "none", flowControl: "none" }]);
+      assert.equal(connection.baudRate, baudRate);
+      assert.equal(port.writes.length, 0);
+    } finally { await connection.close(); }
+  }
+});
+
+test("unsupported or noninteger host baud rates are rejected before opening the port", () => {
+  for (const baudRate of [9600, 57600, 0, -1, 19200.5, NaN, Infinity, "19200", null, true, {}, 115200n]) {
+    const port = new FakePort();
+    assert.throws(() => new WebSerialConnection(port, { baudRate }), error => error instanceof TransportError && /baud/.test(error.message));
+    assert.equal(port.opens.length, 0);
+    assert.equal(port.writes.length, 0);
+    assert.equal(port.closes, 0);
+  }
 });
 
 test("CRC and absolute packets use Modbus bytes and low-word-first signed positions", () => {

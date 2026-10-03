@@ -135,13 +135,39 @@ class FakeConnection {
   }
 }
 
-function make({motor = new FakeConnection(), allowed = true, nativeHome = true, fastPositions = false, motionProfile} = {}) {
-  const clock = new Clock(), selectedPort = {}, factories = [];
+function make({motor = new FakeConnection(), allowed = true, nativeHome = true, fastPositions = false, motionProfile, baudRate} = {}) {
+  const clock = new Clock(), selectedPort = {}, factories = [], factoryOptions = [];
   const transport = new MotorTransport(selectedPort, {
-    allowMotion: allowed, nativeHome, fastPositions, motionProfile, portLabel: "offline-test", clock: clock.now, wait: clock.wait,
-    connectionFactory: port => { factories.push(port); return motor; },
+    allowMotion: allowed, nativeHome, fastPositions, motionProfile, baudRate, portLabel: "offline-test", clock: clock.now, wait: clock.wait,
+    connectionFactory: (port, options) => { factories.push(port); factoryOptions.push(options); return motor; },
   });
-  return {transport, motor, clock, factories, selectedPort};
+  return {transport, motor, clock, factories, factoryOptions, selectedPort};
+}
+function baudProbe(motors, baudRate = "auto") {
+  const clock = new Clock(), selectedPort = {}, rates = [];
+  const transport = new MotorTransport(selectedPort, {
+    baudRate, allowMotion: false, clock: clock.now, wait: clock.wait,
+    connectionFactory: (port, options) => {
+      assert.equal(port, selectedPort); assert.deepEqual(Object.keys(options), ["baudRate"]);
+      if (rates.length) {
+        const previous = motors.get(rates.at(-1));
+        assert.equal(previous.opened, false, "close must finish before the next factory");
+        assert.equal(previous.closeCount, 1);
+      }
+      rates.push(options.baudRate);
+      const connection = motors.get(options.baudRate);
+      assert.ok(connection, "each rate needs its own connection");
+      return connection;
+    },
+  });
+  return {transport, rates};
+}
+function assertReadOnlyProbes(motors) {
+  for (const motor of motors.values()) {
+    assert.deepEqual(motor.commands, []); assert.deepEqual(motor.settings, []);
+    assert.deepEqual(motor.destinations, []);
+    for (const tx of motor.transmissions) assert.deepEqual(Array.from(tx.slice(0, 6)), [1, 3, 0, 0, 0, 26]);
+  }
 }
 async function running(options) {
   const context = make(options);
@@ -176,18 +202,203 @@ async function homeFault(context) {
 }
 
 test("construction and read-only connection never send motor controls", async () => {
-  const {transport, motor, factories, selectedPort} = make({allowed: false});
+  const {transport, motor, factories, factoryOptions, selectedPort} = make({allowed: false});
   assert.equal(factories.length, 0); assert.equal(motor.openCount, 0);
   assert.equal(transport.status().connected, false);
   assert.equal(transport.status().position_raw, null);
   const connected = await transport.connect();
   assert.deepEqual(factories, [selectedPort]); assert.equal(motor.openCount, 1);
+  assert.deepEqual(factoryOptions, [{baudRate:19200}]);
   assert.equal(connected.position_raw, 20000);
   assert.equal(connected.baud, 19200); assert.equal(connected.slave, 1);
   await assert.rejects(transport.arm());
   await transport.stop(); await transport.close();
   assert.deepEqual(motor.commands, []); assert.deepEqual(motor.settings, []);
   assert.equal(motor.transmissions.length, 1); assert.equal(motor.closeCount, 1);
+});
+
+test("supported explicit baud rates reach the factory and status without probing other rates", async () => {
+  for (const baudRate of [19200, 38400, 115200]) {
+    const {transport, motor, factoryOptions} = make({baudRate, allowed:false});
+    assert.equal(transport.status().baud, baudRate);
+    assert.equal((await transport.connect()).baud, baudRate);
+    assert.deepEqual(factoryOptions, [{baudRate}]); assert.equal(motor.readCount, 1);
+    await transport.close(); assertReadOnlyProbes(new Map([[baudRate, motor]]));
+  }
+});
+
+test("invalid baud rates are rejected before any connection is created", () => {
+  for (const baudRate of [0, 9600, 57600, 19200.5, NaN, Infinity, "19200", "AUTO", "", null, true, {}, []]) {
+    let created = 0;
+    assert.throws(() => new MotorTransport({}, {baudRate, connectionFactory:()=>{created++;}}), /Baud rate must/);
+    assert.equal(created, 0);
+  }
+});
+
+test("auto baud discovery closes a timed-out probe and selects a fresh 115200 connection read-only", async () => {
+  const slow = new FakeConnection(), fast = new FakeConnection();
+  slow.onRead = () => { throw Object.assign(new TransportError("Response timeout; no retry was sent."), {recoverableResponse:true}); };
+  fast.position(-123456);
+  const motors = new Map([[19200,slow], [115200,fast]]), {transport, rates} = baudProbe(motors);
+  assert.equal(transport.status().baud, null);
+  const status = await transport.connect();
+  assert.deepEqual(rates, [19200,115200]); assert.equal(slow.readCount, 2); assert.equal(slow.closeCount, 1);
+  assert.equal(fast.openCount, 1); assert.equal(fast.readCount, 1);
+  assert.equal(status.baud, 115200); assert.equal(status.position_raw, -123456);
+  assert.equal(status.connected, true); assert.equal(status.owned, false); assert.equal(status.homed, false);
+  assert.equal(status.raw_bounds, null); assert.equal(status.fault, null);
+  assertReadOnlyProbes(motors); await transport.close();
+});
+
+test("auto baud discovery tries 38400 last and makes at most two reads per failed rate", async () => {
+  const motors = new Map([19200,115200,38400].map(rate => [rate,new FakeConnection()]));
+  for (const rate of [19200,115200]) motors.get(rate).onRead = () => { throw droppedReply(); };
+  const {transport, rates} = baudProbe(motors);
+  assert.equal((await transport.connect()).baud, 38400);
+  assert.deepEqual(rates, [19200,115200,38400]);
+  assert.deepEqual(Array.from(motors.values(), m=>m.readCount), [2,2,1]);
+  assertReadOnlyProbes(motors); await transport.close();
+});
+
+test("exhausted auto baud discovery closes all three read-only probes", async () => {
+  const motors = new Map([19200,115200,38400].map(rate => [rate,new FakeConnection()]));
+  for (const motor of motors.values()) motor.onRead = () => { throw droppedReply(); };
+  const {transport, rates} = baudProbe(motors);
+  await assert.rejects(transport.connect(), /Response timeout/);
+  assert.deepEqual(rates, [19200,115200,38400]);
+  for (const motor of motors.values()) { assert.equal(motor.readCount,2); assert.equal(motor.closeCount,1); }
+  assert.equal(transport.status().connected,false); assert.equal(transport.status().position_raw,null);
+  assertReadOnlyProbes(motors);
+});
+
+test("a recoverable timeout can recover at the same baud without discovery fallback", async () => {
+  const motor = new FakeConnection(); motor.onRead = () => { motor.onRead = null; throw droppedReply(); };
+  const motors = new Map([[19200,motor]]), {transport, rates} = baudProbe(motors);
+  const status = await transport.connect();
+  assert.deepEqual(rates,[19200]); assert.equal(motor.readCount,2);
+  assert.equal(status.communication_recoveries,1); assert.equal(status.baud,19200);
+  assertReadOnlyProbes(motors); await transport.close();
+});
+
+test("any valid snapshot ends baud discovery even when alarm, mode, output, or speed is unsuitable", async () => {
+  for (const [index,value] of [[14,9], [0,7], [1,1], [16,100]]) {
+    const motor = new FakeConnection(); motor.values[index] = value;
+    const motors = new Map([[19200,motor]]), {transport,rates} = baudProbe(motors);
+    const status = await transport.connect();
+    assert.deepEqual(rates,[19200]); assert.equal(motor.readCount,1);
+    assert.equal(status.baud,19200); assert.equal(status.fault,null); assert.equal(status.owned,false);
+    assert.equal(transport._values[index],value); assertReadOnlyProbes(motors); await transport.close();
+  }
+});
+
+test("baud discovery does not fallback for CRC, exception, or nonrecoverable response failures", async () => {
+  for (const fail of [
+    () => Uint8Array.from([1,3,52,0,0]),
+    () => { throw Object.assign(new TransportError("Response CRC mismatch"), {recoverableResponse:true}); },
+    () => frame([1,0x83,2]),
+    () => { throw new TransportError("Response timeout"); },
+    () => { throw Object.assign(new TransportError("Response function mismatch"), {recoverableResponse:true}); },
+  ]) {
+    const motor = new FakeConnection(); motor.onRead = fail;
+    const motors = new Map([[19200,motor]]), {transport,rates} = baudProbe(motors);
+    await assert.rejects(transport.connect());
+    assert.deepEqual(rates,[19200]); assert.equal(motor.readCount,1); assert.equal(motor.closeCount,1);
+    assert.equal(transport.status().connected,false); assertReadOnlyProbes(motors);
+  }
+});
+
+test("a failed open never falls back even if its error resembles a recoverable timeout", async () => {
+  const motor = new FakeConnection(); motor.open = async () => { motor.openCount++; throw droppedReply(); };
+  const motors = new Map([[19200,motor]]), {transport,rates} = baudProbe(motors);
+  await assert.rejects(transport.connect(), /Response timeout/);
+  assert.deepEqual(rates,[19200]); assert.equal(motor.readCount,0); assert.equal(motor.closeCount,1);
+  assertReadOnlyProbes(motors);
+});
+
+test("failed or unconfirmed connection closure ends baud discovery", async () => {
+  for (const unsafe of ["close error", "poisoned", "closeIncomplete", "closeIncomplete after close"]) {
+    const motor = new FakeConnection(); motor.onRead = () => { throw droppedReply(); };
+    if (unsafe === "close error") motor.close = async () => { motor.closeCount++; throw new TransportError("Adapter did not close"); };
+    else if (unsafe === "closeIncomplete after close") {
+      const close = motor.close.bind(motor); motor.close = async () => { await close(); motor.closeIncomplete=true; };
+    } else motor[unsafe] = true;
+    const motors = new Map([[19200,motor]]), {transport,rates} = baudProbe(motors);
+    await assert.rejects(transport.connect(), /close failed|cleanup is unconfirmed/);
+    assert.deepEqual(rates,[19200]); assert.equal(motor.closeCount,1);
+    assert.equal(transport.status().connected,false); assert.ok(transport.status().fault);
+    assertReadOnlyProbes(motors);
+  }
+});
+
+test("the previous baud connection must finish closing before the next connection is created", async () => {
+  const slow = new FakeConnection(), fast = new FakeConnection(), closing = deferred(), release = deferred();
+  slow.onRead = () => { throw droppedReply(); };
+  const close = slow.close.bind(slow);
+  slow.close = async () => { closing.resolve(); await release.promise; await close(); };
+  const motors = new Map([[19200,slow],[115200,fast]]), {transport,rates} = baudProbe(motors);
+  const connecting = transport.connect(); await closing.promise;
+  assert.deepEqual(rates,[19200]); assert.equal(slow.opened,true); assert.equal(fast.openCount,0);
+  release.resolve(); assert.equal((await connecting).baud,115200);
+  assertReadOnlyProbes(motors); await transport.close();
+});
+
+test("Stop cancels a blocked baud probe before retry or another baud and leaves no motor writes", async () => {
+  const motor = new FakeConnection(), entered = deferred(), release = deferred();
+  motor.onRead = async () => { entered.resolve(); await release.promise; throw droppedReply(); };
+  const motors = new Map([[19200,motor]]), {transport,rates} = baudProbe(motors);
+  const connecting = assert.rejects(transport.connect(), /cancel/i); await entered.promise;
+  const stopping = assert.rejects(transport.stop(), /Connect an explicitly selected/);
+  release.resolve(); await connecting; await stopping;
+  assert.deepEqual(rates,[19200]); assert.equal(motor.readCount,1); assert.equal(motor.closeCount,1);
+  assert.equal(transport.status().fault,null); assert.equal(transport.status().connected,false);
+  assertReadOnlyProbes(motors);
+});
+
+test("Stop during a probe close prevents the next host baud from opening", async () => {
+  const motor = new FakeConnection(), entered = deferred(), release = deferred();
+  motor.onRead = () => { throw droppedReply(); };
+  const close = motor.close.bind(motor);
+  motor.close = async () => { entered.resolve(); await release.promise; await close(); };
+  const motors = new Map([[19200,motor]]), {transport,rates} = baudProbe(motors);
+  const connecting = assert.rejects(transport.connect(), /cancel/i); await entered.promise;
+  const stopping = assert.rejects(transport.stop(), /Connect an explicitly selected/);
+  release.resolve(); await connecting; await stopping;
+  assert.deepEqual(rates,[19200]); assert.equal(motor.closeCount,1); assert.equal(transport.status().fault,null);
+  assertReadOnlyProbes(motors);
+});
+
+test("Stop during a serial open closes the connection without reading or changing baud", async () => {
+  const motor = new FakeConnection(), entered = deferred(), release = deferred();
+  const open = motor.open.bind(motor);
+  motor.open = async () => { entered.resolve(); await release.promise; await open(); };
+  const motors = new Map([[19200,motor]]), {transport,rates} = baudProbe(motors);
+  const connecting = assert.rejects(transport.connect(), /cancel/i); await entered.promise;
+  const stopping = assert.rejects(transport.stop(), /Connect an explicitly selected/);
+  release.resolve(); await connecting; await stopping;
+  assert.deepEqual(rates,[19200]); assert.equal(motor.readCount,0); assert.equal(motor.closeCount,1);
+  assert.equal(transport.status().fault,null); assertReadOnlyProbes(motors);
+});
+
+test("a rejected connect on an existing owned connection preserves its stop and Home state", async () => {
+  const {transport,motor} = await running();
+  transport._homed=true; transport._measured_endpoints=[1000,40000];
+  const before = transport.status(), frames = motor.transmissions.length;
+  await assert.rejects(transport.connect(), /already connected/);
+  assert.deepEqual(transport.status(),before); assert.equal(motor.transmissions.length,frames);
+  await transport.stop(); await transport.close();
+});
+
+test("reconnecting read-only discards previous Home calibration and stopped feedback", async () => {
+  const {transport,motor} = make({allowed:false}); await transport.connect(); await transport.close();
+  transport._homed=true; transport._measured_endpoints=[1000,40000]; transport._measured_travel=39000;
+  transport._origin=20000; transport._low=2000; transport._high=39000; transport._baseline=motor.values.slice();
+  transport._stop_confirmed=true; transport._stop_position=20000;
+  motor.position(90000); motor.values[14]=7;
+  const status = await transport.connect();
+  assert.equal(status.homed,false); assert.equal(status.stop_confirmed,false);
+  assert.equal(status.measured_endpoints_raw,null); assert.equal(status.measured_travel_raw,null);
+  assert.equal(status.origin_raw,null); assert.equal(status.raw_bounds,null); assert.equal(status.alarm,7);
+  assertReadOnlyProbes(new Map([[19200,motor]])); await transport.close();
 });
 
 test("motion profiles retain streaming defaults and expose the bounded ramped acceleration", () => {

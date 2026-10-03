@@ -85,6 +85,24 @@ test("connect is read-only; home completes before hardware can arm", async () =>
   assert.ok(command[1] > .5);
   assert.ok(command[1] - .5 <= .5 * motor.hw.max_acceleration_raw_s2 / 19660 * .1 ** 2);
 });
+
+test("only verified 115200 baud selects finer target deadlines, including Resume", async () => {
+  for (const baud of [undefined, 19200, 38400, 115200]) {
+    const motor = fakeMotor(); motor.hw.homed = true; motor.hw.baud = baud;
+    const env = setup({factory: () => motor}), period = baud === 115200 ? .025 : .05;
+    await env.connect(); await env.action("play");
+    const count = () => motor.calls.filter(Array.isArray).length;
+    env.advance(period - .001); await env.runtime.tick(); assert.equal(count(), 0);
+    env.advance(.001); await env.runtime.tick(); assert.equal(count(), 1);
+    env.advance(period); await env.runtime.tick(); assert.equal(count(), 2);
+    await env.action("pause"); env.advance(.5); await env.runtime.tick(); assert.equal(count(), 2);
+    await env.action("resume");
+    env.advance(period - .001); await env.runtime.tick(); assert.equal(count(), 2);
+    env.advance(.001); await env.runtime.tick(); assert.equal(count(), 3);
+    await env.action("stop"); env.advance(period); await env.runtime.tick(); assert.equal(count(), 3);
+    assert.equal(env.runtime.state().fault, null); await env.runtime.close();
+  }
+});
 test("Stop fences queued and in-flight start and cannot re-enable output", async () => {
   const motor = fakeMotor(); motor.hw.homed = true;
   let finishStart;

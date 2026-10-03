@@ -124,3 +124,43 @@ cannot sign off smoothness. The 2000 RPM/s ramped profile can follow the two
 slow/moderate patterns above, but the previous 1.5 Hz / 70% pattern exceeds its
 acceleration budget. Retain the current live release until connected comparison
 supports a production profile.
+
+## October 3 continuation
+
+Two further ten-second ramped sines reported complete encoder strokes and final
+inhibition through the native serial pipe. The user reported no visible motion,
+then restarted the machine. These runs therefore do not establish physical
+movement or improved smoothness; a watched repeat is required.
+
+Measured complete guard-plus-target cycles took 39.84 ms median / 43.62 ms
+maximum for the slow sine and 38.29 ms median / 49.21 ms maximum for the moderate
+sine. Raising the target rate at 19200 baud would exhaust the observed budget.
+Fresh read-only snapshots after the restart found normal step/direction startup
+mode, enabled holding output, zero speed/PWM/pending demand/alarm, and a stable
+encoder. Home/calibration from the earlier connection is invalid.
+
+The host now supports 19200, 38400 and 115200. Browser Connect tries read-only
+status at those rates, closes completely between attempts, and changes rate only
+after response timeouts. A valid snapshot ends discovery even if it reports an
+alarm or unusual configuration. Corruption, cancellation, opening/closing
+failures and uncertain cleanup do not trigger fallback. No motor baud or saved
+configuration is changed by Connect.
+
+At verified 115200, the local runtime requests 25 ms deadlines instead of 50 ms.
+The same conservative serial model with 10 ms adapter overhead per exchange
+delivers approximately 29.73 ms intervals, without a catch-up queue or stale
+guards. This model is not a physical cadence claim. A connected 115200 trial is
+still required before choosing the production rate/profile.
+
+Changing the motor's baud is a separate persistent commissioning operation,
+effective after a power cycle. The [vendor manual, page 18](https://www.robotanno.com/web/userfiles/download/ACCESSORIES/IntegratedServoMotor/YZ-AIMManual_v2_55.pdf)
+has inconsistent register numbers; its page 11 map and the
+[upstream driver](https://github.com/ossm-rs/ossm-rs/blob/main/ossm-rs/src/motor/m57aimxx/mod.rs#L284-L296)
+identify mode/acceleration/weak-magnetism addresses as 0/3/4. No commissioning
+sequence has been transmitted to this machine.
+
+All 206 browser tests pass with files run sequentially. The final check includes
+baud opening profiles, bounded read-only
+discovery, closing/cancellation failures, calibration invalidation, and selected
+cadence across Play/Pause/Resume/Stop. Python tests are retained from the earlier
+run, not rerun for these JavaScript changes.

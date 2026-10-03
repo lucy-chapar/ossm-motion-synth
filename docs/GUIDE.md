@@ -178,7 +178,10 @@ one connected drive, not every motor or adapter. The subsequent 35 RPM /
 The laptop connects to the existing motor through a **USB–RS485 adapter** and
 the separately powered motor drive. Select the exact device in the interface;
 the application never guesses a port or opens one on startup. Connect sends
-FC03 status reads only at the existing 19200 baud, 8N1, slave 1.
+FC03 status reads only, with 8N1 and slave 1. The local browser first checks
+19200 baud, then 115200 and 38400 only if the previous rate times out. Each
+attempt closes before the next opens. Any valid status ends discovery, including
+an alarm or unexpected drive state. Connect does not change the motor's baud.
 It drains stale adapter input on opening and requires a quiet receive boundary
 between commands; response CRC errors still fail the transaction without a
 command retry. It does not
@@ -213,8 +216,10 @@ retains 3822 counts/s and 8192 counts/s². It bounds position, speed and acceler
 produce different requested and planned traces, and drive interpolation is
 not modeled. Physical performance is not established by the simulation.
 
-Browser target cycles use 50 ms wall-clock deadlines (20 Hz), independent of
-animation. Each cycle reads one short group of status registers before generating
+Browser target cycles use 50 ms wall-clock deadlines (20 Hz) at 19200/38400 baud.
+A verified 115200 connection selects a local 25 ms trial deadline (40 Hz), still
+limited by actual serial completion. This finer cadence has not been physically
+validated. Each cycle reads one short group of status registers before generating
 the current position target; the four groups cover every register checked by the
 earlier full snapshots. A guard group older than 250 ms prevents the next target.
 Connect, Home, arming and Stop still use complete snapshots. The planner advances
@@ -364,7 +369,7 @@ connected drive with output inhibited and a distinct target. Streaming checks
 rotate through four short status groups, with every guard at most 250 ms old.
 Homing retains the established bulk-register position commands.
 
-The stream uses 50 ms deadlines (20 Hz), subject to serial timing, with no catch-up
+The stream uses the baud-dependent deadlines above, subject to serial timing, with no catch-up
 queue. Successful exchanges use a 3 ms quiet gap at 19200 baud; startup/error
 recovery retains the longer quiet boundary. Hardware waveforms use continuous
 velocity tracking within the browser acceleration and rail bounds. Simulation

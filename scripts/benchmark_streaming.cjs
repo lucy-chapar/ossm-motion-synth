@@ -7,7 +7,10 @@ const {createRuntime} = require("../virtual_synth/static/browser-runtime.js");
 const {MotorTransport} = require("../virtual_synth/static/web-serial-transport.js");
 const {frame} = require("../virtual_synth/static/web-serial-io.js");
 
-const BAUD = 19200, QUIET_SECONDS = .003, ADAPTER_SECONDS = .010, PERIOD = .05;
+const baudIndex = process.argv.indexOf("--baud");
+const BAUD = baudIndex < 0 ? 19200 : Number(process.argv[baudIndex + 1]);
+if (![19200, 38400, 115200].includes(BAUD)) throw new Error("Use --baud 19200, 38400, or 115200");
+const QUIET_SECONDS = .003, ADAPTER_SECONDS = .010, PERIOD = BAUD === 115200 ? .025 : .05;
 const rounded = value => Math.round(value * 1e6) / 1e6;
 
 class ModelDrive {
@@ -53,7 +56,7 @@ class ModelDrive {
 async function main() {
   const clock = {elapsed: 0, now() { return this.elapsed; }, async wait(seconds) { this.elapsed += seconds; }};
   const motor = new ModelDrive(clock), port = {getInfo: () => ({usbVendorId: 1, usbProductId: 2})};
-  const transport = new MotorTransport(port, {allowMotion: true, fastPositions: true,
+  const transport = new MotorTransport(port, {allowMotion: true, fastPositions: true, baudRate: BAUD,
     connectionFactory: () => motor, clock: () => clock.now(), wait: seconds => clock.wait(seconds)});
   const runtime = createRuntime({serial: {requestPort: async () => port, getPorts: async () => [port]},
     clock: () => clock.now(), autoStart: false, storage: null, transportFactory: () => transport});
