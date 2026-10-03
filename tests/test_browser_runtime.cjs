@@ -32,6 +32,41 @@ function fakeMotor({ stopConfirmed = true } = {}) {
     async close() { calls.push("close"); hw.connected = false; return this.status(); } };
 }
 
+test("production browser factory uses one host trajectory budget without the slow drive ramp", async () => {
+  const {MotorTransport} = require("../virtual_synth/static/web-serial-transport.js");
+  const previous = globalThis.MotionWebSerialTransport;
+  const motor = fakeMotor(); motor.hw.homed = true; motor.hw.raw_bounds = [1000, 146000];
+  const port = {getInfo: () => ({usbVendorId: 1, usbProductId: 2})};
+  let now = 0, configured;
+  globalThis.MotionWebSerialTransport = {MotorTransport: class {
+    constructor(selectedPort, options) {
+      assert.equal(selectedPort, port);
+      const profile = new MotorTransport(selectedPort, options).status();
+      configured = profile;
+      Object.assign(motor.hw, {max_velocity_raw_s: profile.max_velocity_raw_s,
+        max_acceleration_raw_s2: profile.max_acceleration_raw_s2});
+      return motor;
+    }
+  }};
+  const runtime = createRuntime({autoStart: false, clock: () => now, storage: null,
+    serial: {requestPort: async () => port, getPorts: async () => [port]}});
+  const action = (name, fields = {}) => runtime.request("/api/action", {action: name, ...fields});
+  try {
+    await action("connect", {port: await runtime.choosePort()});
+    assert.equal(configured.motion_profile, "streaming");
+    assert.equal(configured.max_acceleration_raw_s2 / 819.2, 6000);
+    assert.equal(configured.max_velocity_raw_s / 819.2, 1080);
+    await action("configure", {params: {rate_hz: 1.5, stroke: .7}});
+    await action("play"); now += .1; await runtime.tick();
+    assert.equal(runtime.state().signal.rate_limited, false, "ordinary fast sine fits the production budget");
+    assert.equal(runtime.state().signal.planned_rate_hz, 1.5);
+  } finally {
+    await runtime.close();
+    if (previous === undefined) delete globalThis.MotionWebSerialTransport;
+    else globalThis.MotionWebSerialTransport = previous;
+  }
+});
+
 test("startup, state and enumeration never choose or open a device", async () => {
   const env = setup();
   assert.equal((await env.runtime.request("/api/session")).token, "browser-session");
@@ -89,7 +124,7 @@ test("connect is read-only; home completes before hardware can arm", async () =>
 test("only verified 115200 baud selects finer target deadlines, including Resume", async () => {
   for (const baud of [undefined, 19200, 38400, 115200]) {
     const motor = fakeMotor(); motor.hw.homed = true; motor.hw.baud = baud;
-    const env = setup({factory: () => motor}), period = baud === 115200 ? .025 : .05;
+    const env = setup({factory: () => motor}), period = baud === 115200 ? .020 : .05;
     await env.connect(); await env.action("play");
     const count = () => motor.calls.filter(Array.isArray).length;
     env.advance(period - .001); await env.runtime.tick(); assert.equal(count(), 0);
@@ -102,6 +137,29 @@ test("only verified 115200 baud selects finer target deadlines, including Resume
     await env.action("stop"); env.advance(period); await env.runtime.tick(); assert.equal(count(), 3);
     assert.equal(env.runtime.state().fault, null); await env.runtime.close();
   }
+});
+
+test("Pause and Resume retain the retimed hardware phase rather than the faster ideal phase", async () => {
+  const motor = fakeMotor(); motor.hw.homed = true;
+  motor.hw.raw_bounds = [1000, 148456];
+  motor.hw.max_velocity_raw_s = 1080 * 819.2;
+  motor.hw.max_acceleration_raw_s2 = 6000 * 819.2;
+  const env = setup({factory: () => motor});
+  await env.connect(); await env.action("configure", {params: {rate_hz: 4, stroke: .7}});
+  await env.action("play");
+  env.advance(.17); await env.runtime.tick();
+  const before = env.runtime.state().signal;
+  assert.equal(before.rate_limited, true);
+  assert.ok(Math.abs(before.reference_phase - before.phase) > .1);
+  await env.action("pause"); env.advance(1); await env.runtime.tick();
+  const paused = env.runtime.state().signal;
+  assert.equal(paused.reference_phase, before.reference_phase);
+  assert.equal(paused.planned_rate_hz, null);
+  await env.action("resume");
+  assert.equal(env.runtime.state().signal.reference_phase, before.reference_phase);
+  env.advance(.05); await env.runtime.tick();
+  const after = env.runtime.state().signal;
+  assert.ok(Math.abs(after.reference_phase - ((before.reference_phase + before.planned_rate_hz * .05) % 1)) < 1e-9);
 });
 test("Stop fences queued and in-flight start and cannot re-enable output", async () => {
   const motor = fakeMotor(); motor.hw.homed = true;

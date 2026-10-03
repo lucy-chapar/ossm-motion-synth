@@ -26,9 +26,12 @@
   const HOME_SEEK_SECONDS = 30, HOME_TOTAL_SECONDS = 360, COUNTS_PER_MM = 32768 / 40;
   const HOME_SEARCH_COUNTS = 409600, HOME_MIN_SPAN = 16384, HOME_INSET = 1638;
   const HOME_RETOUCH_OVERTRAVEL = 819;
+  // Register 3 above 60000 encodes feedforward, not RPM/s. Physical limits
+  // belong to the host planner; do not derive acceleration from that register.
+  // Keep the established streaming budget until a faster physical test passes.
   const MOTION_PROFILES = Object.freeze({
-    streaming: Object.freeze({ driveAcceleration: 60098, plannedAcceleration: 10000 }),
-    ramped: Object.freeze({ driveAcceleration: 2000, plannedAcceleration: 2000 }),
+    streaming: Object.freeze({ driveAccelerationSetting: 60098, maxAccelerationMmS2: 6000 }),
+    ramped: Object.freeze({ driveAccelerationSetting: 2000, maxAccelerationMmS2: 1200 }),
   });
   const RUN_SPEED_RPM = 1800;
   const RUN_MAX_VELOCITY = 32768 * RUN_SPEED_RPM / 60 * .9;
@@ -57,8 +60,8 @@
       if (baudRate !== "auto" && (!Number.isInteger(baudRate) || !BAUD_RATES.includes(baudRate))) throw new TypeError("Baud rate must be 19200, 38400, 115200, or auto");
       this._requested_baud = baudRate; this._baud = baudRate === "auto" ? null : baudRate;
       this._motion_profile = motionProfile;
-      this._run_accel_rpm_s = MOTION_PROFILES[motionProfile].driveAcceleration;
-      this._run_max_acceleration = 32768 * MOTION_PROFILES[motionProfile].plannedAcceleration / 60 * .9;
+      this._run_accel_setting = MOTION_PROFILES[motionProfile].driveAccelerationSetting;
+      this._run_max_acceleration = COUNTS_PER_MM * MOTION_PROFILES[motionProfile].maxAccelerationMmS2;
       this.port = portLabel; this._port = port; this.allow_motion = allowMotion === true;
       this._nativeHome = nativeHome === true;
       this._fastPositions = fastPositions === true; this._snapshot_at = -Infinity;
@@ -101,7 +104,12 @@
         position_raw: position, pending_raw: v ? io.pending(v) : null, output_raw: output,
         output_enabled: v && ((v[0] === 1 && [0, 1].includes(output)) || (v[0] === 0 && [0, 2, 3, 6, 7, 10, 11, 14, 15].includes(output))) ? Boolean(output & 1) : null,
         alarm: v?.[14] ?? null, mode: v?.[0] ?? null, speed_rpm: v?.[2] ?? null,
-        acceleration_rpm_s: v?.[3] ?? null, current_raw: v?.[15] ?? null,
+        acceleration_setting_raw: v?.[3] ?? null,
+        acceleration_rpm_s: v && v[3] < 60000 ? v[3] : null,
+        acceleration_mode: !v ? null : v[3] < 60000 ? "ramp"
+          : v[3] <= 60098 ? "position_feedforward" : "unknown",
+        position_feedforward_pct: v && v[3] >= 60000 && v[3] <= 60098 ? v[3] - 60000 : null,
+        current_raw: v?.[15] ?? null,
         output_limit_stall_raw: v?.[24] ?? null, pwm_raw: v?.[19] ?? null,
         origin_raw: this._origin, raw_bounds: this._origin !== null ? [this._low, this._high] : null,
         position_normalized: position !== null && this._origin !== null ? (position - this._low) / (this._high - this._low) : null,
@@ -171,7 +179,18 @@
       } catch (error) { this._stop_confirmed = false; throw error; }
     }
     async _read_stream_guards() {
-      const group = this._status_group_next, [start, count] = STREAM_STATUS_GROUPS[group];
+      this._checkCancelled();
+      // Faster target replies do not need another status transaction every time.
+      // Refresh the oldest group with 100 ms left to drain the other groups;
+      // every target still passes the unchanged 250 ms native-write fence.
+      // Slower baud rates retain one read per cycle at the established cadence.
+      let group = this._status_group_next;
+      for (let offset = 1; offset < STREAM_STATUS_GROUPS.length; offset++) {
+        const candidate = (this._status_group_next + offset) % STREAM_STATUS_GROUPS.length;
+        if (this._status_group_at[candidate] < this._status_group_at[group]) group = candidate;
+      }
+      if (this._baud === 115200 && this._clock() - this._status_group_at[group] < STREAM_STATUS_MAX_AGE - .1) return this._values;
+      const [start, count] = STREAM_STATUS_GROUPS[group];
       let response;
       try { response = await this._exchange(io.statusRequest(start, count), this._budget()); }
       catch (error) {
@@ -213,7 +232,7 @@
       if (!equalPrefix(rx, tx, 6)) throw new TransportError("Absolute-position acknowledgement address/count mismatch; no retry");
     }
     _configuration(v, enabled, baseline = null) {
-      if (v[0] !== 1 || v[1] !== Number(enabled) || v[2] !== RUN_SPEED_RPM || v[3] !== this._run_accel_rpm_s || v[10] !== 0 || v[14] !== 0 || v[20] !== 0 || v[21] !== 1 || v[25] !== 0) throw new TransportError("Require mode1, scalar output " + Number(enabled) + `, speed/acceleration${RUN_SPEED_RPM}/${this._run_accel_rpm_s}, gear0, alarm0, save0, address1, special0`);
+      if (v[0] !== 1 || v[1] !== Number(enabled) || v[2] !== RUN_SPEED_RPM || v[3] !== this._run_accel_setting || v[10] !== 0 || v[14] !== 0 || v[20] !== 0 || v[21] !== 1 || v[25] !== 0) throw new TransportError("Require mode1, scalar output " + Number(enabled) + `, speed/acceleration${RUN_SPEED_RPM}/${this._run_accel_setting}, gear0, alarm0, save0, address1, special0`);
       if (baseline && CONFIG.some(i => v[i] !== baseline[i])) throw new TransportError("Motor configuration changed after arming");
     }
     _check_active(v, enabled, hold = false) {
@@ -427,7 +446,7 @@
       this._home_actions = actions.slice(); this._home_following = following; this._home_stage(actions[0][0], progress);
     }
     async _write_home_setting(register, value) {
-      const permitted = { 0: [0, 1], 2: [RUN_SPEED_RPM, HOME_SPEED_RPM, HOME_RECHECK_SPEED_RPM, 80], 3: [15, this._run_accel_rpm_s, HOME_ACCEL_RPM_S, HOME_RECHECK_ACCEL_RPM_S], 9: [0, 1], 10: [0], 24: [89, this._home_reference[24]], 25: [0, 1] };
+      const permitted = { 0: [0, 1], 2: [RUN_SPEED_RPM, HOME_SPEED_RPM, HOME_RECHECK_SPEED_RPM, 80], 3: [15, this._run_accel_setting, HOME_ACCEL_RPM_S, HOME_RECHECK_ACCEL_RPM_S], 9: [0, 1], 10: [0], 24: [89, this._home_reference[24]], 25: [0, 1] };
       if (!permitted[register]?.includes(value)) throw new TransportError("Setting is outside the fixed native homing profile");
       const tx = io.configRequest(register, value), rx = await this._exchange(tx, HOME_IO_TIMEOUT);
       if (!equalPrefix(rx, tx, 6)) throw new TransportError("Homing setting acknowledgement mismatch; no retry");
@@ -672,7 +691,7 @@
         } else if (phase === "verify_stop") {
           const v = await this._home_read(false);
           if (Math.abs(io.signedPosition(v) - this._home_park) > PARK_STOP_TOLERANCE) throw new TransportError(`Encoder drifted after centering by ${Math.abs(io.signedPosition(v) - this._home_park)} counts (limit ${PARK_STOP_TOLERANCE})`);
-          if (this._home_stationary(v, STOP_PENDING_TOLERANCE, true)) this._home_queue([["restoring_run_speed", 2, RUN_SPEED_RPM], ["restoring_run_acceleration", 3, this._run_accel_rpm_s], ["restoring_output", 24, this._home_reference[24]]], "verify_complete", .95);
+          if (this._home_stationary(v, STOP_PENDING_TOLERANCE, true)) this._home_queue([["restoring_run_speed", 2, RUN_SPEED_RPM], ["restoring_run_acceleration", 3, this._run_accel_setting], ["restoring_output", 24, this._home_reference[24]]], "verify_complete", .95);
         } else if (phase === "verify_complete") {
           const v = await this._home_read(false), position = io.signedPosition(v);
           if (Math.abs(position - this._home_park) > PARK_STOP_TOLERANCE || !this._inhibited_feedback(v)) throw new TransportError("Final homing stop was not confirmed");
@@ -714,7 +733,7 @@
           if (v[0] !== 1 || v[1] !== 0 || !this._stationary_speed(v) || Math.abs(io.signedPosition(v) - positions.at(-1)) > 4) throw new TransportError("Native cancellation Modbus takeover was not stationary and inhibited");
           await this._write_home_setting(10, 0);
           await this._write("clear", IO_TIMEOUT);
-          for (const [register, value] of [[2, RUN_SPEED_RPM], [3, this._run_accel_rpm_s], [24, this._home_reference[24]]]) await this._write_home_setting(register, value);
+          for (const [register, value] of [[2, RUN_SPEED_RPM], [3, this._run_accel_setting], [24, this._home_reference[24]]]) await this._write_home_setting(register, value);
           positions = [];
           for (let i = 0; i < 3; i++) {
             if (i) await this._wait(.1); v = await this._home_read(false);

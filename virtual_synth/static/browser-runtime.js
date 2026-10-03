@@ -9,7 +9,7 @@
   if (typeof module === "object" && module.exports) module.exports = exported;
   else root.MotionBrowserRuntime = exported.createRuntime();
 })(globalThis, (engineAPI) => {
-  const HARDWARE_PERIOD = .05, FAST_HARDWARE_PERIOD = .025;
+  const HARDWARE_PERIOD = .05, FAST_HARDWARE_PERIOD = .02;
   const copy = (value) => structuredClone(value);
   const spanOf = (hw) => {
     const bounds = hw.raw_bounds;
@@ -23,7 +23,7 @@
     const clock = options.clock || (() => performance.now() / 1000);
     const serial = options.serial === undefined ? globalThis.navigator?.serial : options.serial;
     const transportFactory = options.transportFactory || ((port) => new globalThis.MotionWebSerialTransport.MotorTransport(port, {
-      allowMotion: true, fastPositions: true, motionProfile: "ramped", baudRate: "auto",
+      allowMotion: true, fastPositions: true, motionProfile: "streaming", baudRate: "auto",
     }));
     const engine = new engineAPI.Engine();
     const ports = new Map();
@@ -40,7 +40,9 @@
     let connectionNotice = "", autoConnecting = null;
     let paused = false;
     let nextPort = 1, transport = null, connectedPort = null, lastHardware = null;
-    // Only a verified 115200-baud connection selects the finer trial cadence.
+    // Only a verified 115200-baud connection selects the finer cadence. Serial
+    // completion can reduce the achieved rate; this is a deadline, not a claim
+    // of deterministic 50 Hz delivery through every USB adapter.
     // 19200/38400 keep the established cycle; none of this changes drive baud.
     const hardwarePeriod = () => transport?.status().baud === 115200 ? FAST_HARDWARE_PERIOD : HARDWARE_PERIOD;
     let mode = "simulation", armed = false, running = false, gate = false, fault = null;
@@ -77,7 +79,7 @@
     }
     function fence() {
       epoch++; revision++; paused = false; running = armed = gate = false;
-      signal = engine.step(0, { running: false, gate: false });
+      signal = engine.step(0, { running: false, gate: false, tracking: mode === "hardware" });
     }
     function enqueue(task) {
       const run = async () => { busy = true; try { return await task(); } finally { busy = false; } };
@@ -233,7 +235,7 @@
             const span = spanOf(hw);
             if (![hw.max_velocity_raw_s, hw.max_acceleration_raw_s2].every(v => Number.isFinite(v) && v > 0)) throw new Error("Motor motion limits are unavailable.");
             engine.reset({ position: hw.position_normalized, vmax: hw.max_velocity_raw_s / span, amax: hw.max_acceleration_raw_s2 / span });
-            signal = engine.step(0, { running: false });
+            signal = engine.step(0, { running: false, tracking: true });
           } catch (error) { await motionError("Cannot arm", error); }
         }
         armed = true; gate = false; lastHeartbeat = lastTick = clock();
@@ -250,7 +252,7 @@
             await transport.arm(); await assertCurrent();
             const hw = await transport.start(); await assertCurrent();
             engine.trajectory.reset(hw.position_normalized);
-            signal = engine.step(0, { running: false, gate: false });
+            signal = engine.step(0, { running: false, gate: false, tracking: true });
           } catch (error) { await motionError("Cannot resume", error); }
         }
         paused = false; armed = running = true; lastTick = lastIO = lastHeartbeat = clock();
@@ -260,7 +262,7 @@
         if (transport) {
           try {
             const hw = await transport.start(); await assertCurrent();
-            engine.reset({ position: hw.position_normalized }); signal = engine.step(0, { running: false });
+            engine.reset({ position: hw.position_normalized }); signal = engine.step(0, { running: false, tracking: true });
           } catch (error) { await motionError("Cannot start", error); }
         }
         running = true; lastTick = lastIO = lastHeartbeat = clock();

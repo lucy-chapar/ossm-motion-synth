@@ -404,8 +404,8 @@ test("reconnecting read-only discards previous Home calibration and stopped feed
 test("motion profiles retain streaming defaults and expose the bounded ramped acceleration", () => {
   const streaming = make().transport.status(), ramped = make({motionProfile:"ramped"}).transport.status();
   assert.equal(streaming.motion_profile, "streaming"); assert.equal(ramped.motion_profile, "ramped");
-  assert.equal(streaming.max_acceleration_raw_s2, 32768 * 10000 / 60 * .9);
-  assert.equal(ramped.max_acceleration_raw_s2, 32768 * 2000 / 60 * .9);
+  assert.equal(streaming.max_acceleration_raw_s2, 6000 * 32768 / 40);
+  assert.equal(ramped.max_acceleration_raw_s2, 1200 * 32768 / 40);
   assert.equal(ramped.max_velocity_raw_s, streaming.max_velocity_raw_s);
   assert.equal(ramped.max_velocity_raw_s, 32768 * 1800 / 60 * .9);
   for (const motionProfile of ["", "fast", "constructor", "toString", null, 2000, {}]) {
@@ -1650,7 +1650,9 @@ test("native Home restores saved output despite a temporary inhibited output set
  const context = await homing(false,motor);
  const result = await advance(context);
  assert.equal(result.homed,true);assert.equal(result.output_limit_stall_raw,540);
- assert.equal(result.speed_rpm,1800);assert.equal(result.acceleration_rpm_s,60098);
+ assert.equal(result.speed_rpm,1800);assert.equal(result.acceleration_setting_raw,60098);
+ assert.equal(result.acceleration_rpm_s,null);assert.equal(result.acceleration_mode,"position_feedforward");
+ assert.equal(result.position_feedforward_pct,98);
 });
 
 test("direct Home measures both directions without native coordinate reset", async () => {
@@ -1769,6 +1771,165 @@ test("fast stream interleaves every guard group and uses encoder replies", async
   assert.deepEqual(streamed.map(tx => tx[1]), Array.from({length:8}, () => [3, 0x7b]).flat());
   await transport.stop();
   assert.ok(motor.transmissions.slice(before + streamed.length).filter(tx => tx[1] === 3).every(tx => tx[3] === 0 && tx[5] === 26));
+  await transport.close();
+});
+
+test("verified 115200 streaming skips redundant reads and refreshes every group before its deadline", async () => {
+  const {transport, motor, clock} = await running({fastPositions:true, baudRate:115200});
+  const before = motor.transmissions.length, began = clock.now(), snapshotAt = transport._status_group_at.slice();
+  for (let i = 0; i < 7; i++) {
+    if (i) await clock.wait(.02);
+    await transport.command(.5);
+  }
+  assert.deepEqual(transport._status_group_at, snapshotAt, "target replies must not refresh unread configuration groups");
+  assert.ok(motor.transmissions.slice(before).every(tx => tx[1] === 0x7b));
+  await clock.wait(.04);
+  for (let group = 0; group < 4; group++) {
+    if (group) await clock.wait(.02);
+    const result = await transport.command(.5);
+    assert.ok(result.status_check_age_s <= .25);
+    assert.ok(Math.abs(transport._status_group_at[group] - (began + .16 + group * .02)) < 1e-9);
+  }
+  assert.deepEqual(motor.transmissions.slice(before).filter(tx => tx[1] === 3).map(tx => [tx[3], tx[5]]),
+    [[0,7], [7,7], [14,7], [21,5]]);
+  await transport.stop(); await transport.close();
+});
+
+test("adaptive streaming refreshes the oldest group rather than a fresher round-robin group", async () => {
+  const {transport, motor, clock} = await running({fastPositions:true, baudRate:115200});
+  const now = clock.now(), ages = [.03, .04, .16, .12];
+  transport._status_group_at = ages.map(age => now - age); transport._status_group_next = 0;
+  const before = motor.transmissions.length;
+  await transport.command(.5);
+  assert.deepEqual(motor.transmissions.slice(before).map(tx => [tx[1], tx[3], tx[5]]), [[3,14,7], [0x7b,0,32]]);
+  assert.equal(transport._status_group_at[2], now);
+  for (const group of [0,1,3]) assert.equal(transport._status_group_at[group], now - ages[group]);
+  await transport.stop(); await transport.close();
+});
+
+test("adaptive streaming keeps checking cached guards when a status read is unnecessary", async () => {
+  const {transport, motor} = await running({fastPositions:true, baudRate:115200});
+  transport._values[14] = 1; let resolved = false;
+  await assert.rejects(transport.command(() => { resolved = true; return .51; }), /Require/);
+  assert.equal(resolved, false); assert.deepEqual(motor.destinations, []);
+  assert.equal(transport.status().stop_confirmed, true); await transport.close();
+});
+
+test("each overdue adaptive guard refuses changed configuration, output or alarm before resolving a target", async () => {
+  for (const [group, register, value] of [[0,3,2000], [0,1,0], [1,8,1], [2,14,1], [3,21,2]]) {
+    const {transport, motor, clock} = await running({fastPositions:true, baudRate:115200});
+    transport._status_group_at[group] = clock.now() - .16;
+    const original = motor.values[register]; motor.values[register] = value;
+    let resolved = false;
+    await assert.rejects(transport.command(() => { resolved = true; return .51; }), /Require|configuration changed/);
+    assert.equal(resolved, false); assert.deepEqual(motor.destinations, []);
+    motor.values[register] = original; motor.values[1] = 0;
+    await transport.stop(); await transport.close();
+  }
+});
+
+test("adaptive status deadlines remain bounded through modeled 20 ms and 10 ms target scheduling", async () => {
+  for (const period of [.02, .01]) {
+    const {transport, motor, clock} = await running({fastPositions:true, baudRate:115200});
+    const exchange = motor.exchange.bind(motor), guardGroups = [0,0,0,0], targetTimes = [];
+    const starts = [0,7,14,21], began = clock.now();
+    motor.exchange = async (request, timeout, beforeWrite) => {
+      await clock.wait(.003);
+      const checkedWrite = () => {
+        beforeWrite?.();
+        if (request[1] === 0x7b) {
+          for (const receivedAt of transport._status_group_at) assert.ok(clock.now() - receivedAt <= .25);
+          targetTimes.push(clock.now());
+        }
+      };
+      const response = await exchange(request, timeout, checkedWrite);
+      await clock.wait(.010 + (request.length + response.length) * 10 / 115200);
+      if (request[1] === 3) guardGroups[starts.indexOf(request[3])]++;
+      return response;
+    };
+    for (let index = 0; index < 300; index++) {
+      clock.elapsed = Math.max(clock.now(), began + (index + 1) * period);
+      const result = await transport.command(.5);
+      assert.equal(result.fault, null); assert.ok(result.status_check_age_s <= .25);
+    }
+    assert.equal(targetTimes.length, 300); assert.ok(guardGroups.every(count => count > 0));
+    assert.ok(guardGroups.reduce((sum, count) => sum + count, 0) < 180, "finer target scheduling should reduce status transactions");
+    await transport.stop(); await transport.close();
+  }
+});
+
+test("a stalled adaptive cycle or native quiet gap refuses expired guard data without a target", async () => {
+  for (const nativeGap of [false, true]) {
+    const {transport, motor, clock} = await running({fastPositions:true, baudRate:115200});
+    if (nativeGap) {
+      const exchange = motor.exchange.bind(motor);
+      motor.exchange = async (request, timeout, beforeWrite) => {
+        if (request[1] === 0x7b) await clock.wait(.251);
+        return exchange(request, timeout, beforeWrite);
+      };
+    } else await clock.wait(.251);
+    let resolved = false;
+    await assert.rejects(transport.command(() => { resolved = true; return .51; }), /status checks are stale/);
+    assert.equal(resolved, nativeGap); assert.deepEqual(motor.destinations, []);
+    assert.equal(transport.status().stop_confirmed, true); await transport.close();
+  }
+});
+
+test("adaptive guard latency cannot expire another group before resolving a target", async () => {
+  const {transport, motor, clock} = await running({fastPositions:true, baudRate:115200});
+  await clock.wait(.16); let resolved = false;
+  motor.onRead = async () => { motor.onRead = null; await clock.wait(.1); };
+  await assert.rejects(transport.command(() => { resolved = true; return .51; }), /status checks are stale/);
+  assert.equal(resolved, false); assert.deepEqual(motor.destinations, []);
+  assert.equal(transport.status().stop_confirmed, true); await transport.close();
+});
+
+test("Stop cancels adaptive targets waiting to write even when no status read is due", async () => {
+  const {transport, motor} = await running({fastPositions:true, baudRate:115200});
+  const entered = deferred(), release = deferred(), exchange = motor.exchange.bind(motor);
+  let resolved = 0;
+  motor.exchange = async (request, timeout, beforeWrite) => {
+    if (request[1] === 0x7b) { entered.resolve(); await release.promise; }
+    return exchange(request, timeout, beforeWrite);
+  };
+  const active = assert.rejects(transport.command(() => { resolved++; return .51; }), /cancel/i);
+  await entered.promise;
+  const queued = assert.rejects(transport.command(() => { resolved++; return .52; }), /cancel/i);
+  const stopping = transport.stop(); release.resolve();
+  await Promise.all([active, queued, stopping]);
+  assert.equal(resolved, 1, "only the target resolved before Stop may be evaluated");
+  assert.deepEqual(motor.destinations, []); assert.equal(transport.status().fault, null);
+  assert.equal(transport.status().stop_confirmed, true); await transport.close();
+});
+
+test("adaptive guard recovery validates a complete snapshot and refreshes every receipt timestamp", async () => {
+  const {transport, motor, clock} = await running({fastPositions:true, baudRate:115200});
+  await clock.wait(.16); const before = motor.transmissions.length;
+  motor.onRead = () => { motor.onRead = null; throw droppedReply(); };
+  const result = await transport.command(.51);
+  assert.equal(result.communication_recoveries, 1); assert.equal(result.running, true);
+  assert.deepEqual(motor.transmissions.slice(before).map(tx => [tx[1], tx[1] === 3 ? tx[5] : null]), [[3,7], [3,26], [0x7b,null]]);
+  assert.ok(transport._status_group_at.every(time => time === clock.now()));
+  const resumed = motor.transmissions.length;
+  await transport.command(.52);
+  assert.deepEqual(motor.transmissions.slice(resumed).map(tx => tx[1]), [0x7b]);
+  assert.equal(motor.destinations.length, 2); await transport.stop(); await transport.close();
+});
+
+test("adaptive target replies still stop a stuck encoder without any overdue status read", async () => {
+  const {transport, motor} = await running({fastPositions:true, baudRate:115200});
+  transport._low = 20000 - 57344; transport._high = 20000 + 57344;
+  const before = motor.transmissions.length;
+  motor.onCommand = (m, operation) => {
+    if (operation !== "absolute") return;
+    m.position(20000);
+    return frame([1,0x7b,0x4e,0x20,0,0]);
+  };
+  await transport.command(.665); await transport.command(.83); await transport.command(.995);
+  await assert.rejects(transport.command(.995), /Tracking error exceeded/);
+  assert.equal(motor.destinations.length, 4); assert.equal(transport.status().stop_confirmed, true);
+  const firstStatus = motor.transmissions.slice(before).findIndex(tx => tx[1] === 3);
+  assert.equal(firstStatus, 6, "all four target replies precede clear/inhibit and full stop reads");
   await transport.close();
 });
 

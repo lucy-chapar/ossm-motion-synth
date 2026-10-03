@@ -1,5 +1,9 @@
 # Browser motion smoothing — 2026-10-02
 
+The later [motion planner audit](MOTION_PLANNER_AUDIT.md) supersedes the ramped
+browser default below. These entries retain the actual earlier attempts and
+their validation limits.
+
 Local development against `0ad919ebf362c7a617ffeb46c92cbaffa42aa5dd`.
 This revision is local and has not been deployed. Connected tests are recorded
 below; steady command timing alone did not remove the user-observed pulsing.

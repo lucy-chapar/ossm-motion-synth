@@ -13,9 +13,9 @@
     gesture: "Load an envelope-shaped gesture. Turn Gate on to build the stroke, then off to release it. Arm and Run separately.",
   };
   const PARAMS = {
-    rate_hz: "Set the base movement speed in cycles per second. At 1 Hz, the wave repeats once per second. The planned motion may be slower when limited.",
+    rate_hz: "Set the requested movement rate in cycles per second. At 1 Hz, the wave repeats once per second. Planned rate shows the phase clock after motion limits; it may be slower to preserve the stroke.",
     stroke: "Set the wave's span around Center, as a percentage of the available room inside the travel window. Zero stroke requests the center position.",
-    center: "Move the wave's midpoint within the travel window. A center near either edge leaves less room for the stroke.",
+    center: "Move the wave's midpoint within the travel window. Stroke shrinks near either end so the wave fits on both sides of Center. Center at 50% gives the largest span; requested travel below shows the resulting distance.",
     shape: "Choose the base movement waveform. Sharp corners and jumps are softened by the motion limits; a Position patch replaces this waveform.",
     lfo_rate_hz: "Set how quickly the low-frequency oscillator repeats. Patch this source into a destination to create a repeating change in the movement.",
     attack_s: "Set the time for the envelope to rise from zero to full level after Gate turns on.",

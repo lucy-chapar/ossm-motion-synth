@@ -10,7 +10,7 @@ const {frame} = require("../virtual_synth/static/web-serial-io.js");
 const baudIndex = process.argv.indexOf("--baud");
 const BAUD = baudIndex < 0 ? 19200 : Number(process.argv[baudIndex + 1]);
 if (![19200, 38400, 115200].includes(BAUD)) throw new Error("Use --baud 19200, 38400, or 115200");
-const QUIET_SECONDS = .003, ADAPTER_SECONDS = .010, PERIOD = BAUD === 115200 ? .025 : .05;
+const QUIET_SECONDS = .003, ADAPTER_SECONDS = .010, PERIOD = BAUD === 115200 ? .02 : .05;
 const rounded = value => Math.round(value * 1e6) / 1e6;
 
 class ModelDrive {
@@ -21,6 +21,7 @@ class ModelDrive {
     this.values[11] = 800; this.values[21] = 1;
     this.position(200000);
     this.targetTimes = [];
+    this.statusReads = 0; this.fullReads = 0;
   }
   position(value) { this.values[22] = value & 65535; this.values[23] = value >>> 16 & 65535; }
   async open() {}
@@ -31,6 +32,7 @@ class ModelDrive {
     let reply;
     if (tx[1] === 3) {
       const start = tx[2] << 8 | tx[3], count = tx[4] << 8 | tx[5];
+      if (count === 26) this.fullReads++; else this.statusReads++;
       reply = frame([1, 3, count * 2, ...this.values.slice(start, start + count).flatMap(value => [value >>> 8, value & 255])]);
     } else if (tx[1] === 0x7b) {
       this.targetTimes.push(this.clock.elapsed);
@@ -66,7 +68,7 @@ async function main() {
     // Seed a calibrated model rail; the benchmark does not simulate Home.
     transport._homed = true; transport._origin = 200000; transport._low = 126000; transport._high = 274000;
     await action("play");
-    const began = clock.now();
+    const began = clock.now(), initialStatusReads = motor.statusReads, initialFullReads = motor.fullReads;
     let oldestStatus = 0;
     for (let index = 0; index < 200; index++) {
       clock.elapsed = Math.max(clock.elapsed, began + (index + 1) * PERIOD);
@@ -78,7 +80,9 @@ async function main() {
     console.log(JSON.stringify({model: {physical_test: false, baud: BAUD, bits_per_byte: 10,
       quiet_gap_ms: QUIET_SECONDS * 1000, adapter_overhead_ms_per_exchange: ADAPTER_SECONDS * 1000,
       cycle_ms: PERIOD * 1000, browser_timer_jitter_modeled: false, servo_dynamics_modeled: false},
-      result: {targets: motor.targetTimes.length, interval_min_ms: rounded(intervals[0]),
+      result: {targets: motor.targetTimes.length, targets_per_second: rounded(motor.targetTimes.length / (clock.now() - began)),
+        streamed_status_reads: motor.statusReads - initialStatusReads, streamed_full_reads: motor.fullReads - initialFullReads,
+        interval_min_ms: rounded(intervals[0]),
         interval_median_ms: rounded(intervals[Math.floor(intervals.length * .5)]),
         interval_p95_ms: rounded(intervals[Math.floor(intervals.length * .95)]),
         interval_max_ms: rounded(intervals.at(-1)), oldest_guard_age_ms: rounded(oldestStatus * 1000), fault: null}}, null, 2));

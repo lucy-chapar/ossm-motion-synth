@@ -222,6 +222,39 @@
     $("shape-path").setAttribute("d", paths[shape] || paths.sine);
   }
 
+  function renderMotionReadout(params, signal) {
+    const center = clamp(finite(signal.effective_center, params.center));
+    const stroke = clamp(finite(signal.effective_stroke, params.stroke));
+    const span = Number.isFinite(signal.requested_span_normalized)
+      ? clamp(signal.requested_span_normalized)
+      : 2 * stroke * Math.min(center, 1 - center) * (params.upper - params.lower);
+    const hardware = isHardware() ? state.hardware || {} : {};
+    const bounds = hardware.raw_bounds, scale = hardware.nominal_counts_per_mm;
+    const calibrated = Array.isArray(bounds) && bounds.length === 2
+      && bounds.every(Number.isFinite) && bounds[1] > bounds[0]
+      && Number.isFinite(scale) && scale > 0;
+    const travel = calibrated ? `≈ ${format(span * (bounds[1] - bounds[0]) / scale, 1)} mm`
+      : `${format(span * 100, 1)}%`;
+    const planned = Number.isFinite(signal.planned_rate_hz);
+    const rate = planned ? signal.planned_rate_hz : finite(signal.effective_rate_hz, params.rate_hz);
+    const timing = signal.position_patched ? "Position patch controls motion"
+      : `${planned ? "Planned" : "Requested"} rate ${format(rate, 2)} Hz`;
+    $("motion-readout").textContent = `Requested travel ${travel} · ${timing}`;
+
+    const rateLimited = signal.rate_limited === true;
+    const centerLimited = typeof signal.center_limited_stroke === "boolean"
+      ? signal.center_limited_stroke : stroke > 0 && Math.abs(center - .5) > 1e-7;
+    const reasons = [];
+    if (rateLimited) reasons.push("Rate reduced to preserve stroke");
+    else if (signal.limited) reasons.push("Motion limited at transitions");
+    if (centerLimited) reasons.push("Center near an end reduces stroke");
+    $("motion-limit-reason").textContent = reasons.join(" · ");
+    $("motion-limit-reason").hidden = reasons.length === 0;
+    $("limiter-status").textContent = rateLimited ? "RATE LIMITED"
+      : signal.limited ? "TRANSITION LIMITED" : "COMMAND IN RANGE";
+    $("limiter-status").classList.toggle("limited", rateLimited || Boolean(signal.limited));
+  }
+
   function render() {
     if (!state || rendering) return;
     rendering = true;
@@ -263,8 +296,7 @@
     $("carriage-readout").replaceChildren(document.createTextNode(format(command * 100, 1)));
     const percent = document.createElement("span"); percent.textContent = "%"; $("carriage-readout").append(percent);
     $("carriage-track").setAttribute("aria-label", `Command position ${format(command * 100, 1)} percent`);
-    $("limiter-status").textContent = signal.limited ? "COMMAND LIMITED" : "COMMAND IN RANGE";
-    $("limiter-status").classList.toggle("limited", Boolean(signal.limited));
+    renderMotionReadout(params, signal);
     $("lfo-value").textContent = `${finite(signal.lfo) >= 0 ? "+" : ""}${format(finite(signal.lfo) * 5, 2)} V eq.`;
     $("lfo-value").title = "Virtual ±5 V equivalent signal; no electrical output";
     $("envelope-value").textContent = `${format(clamp(finite(signal.envelope)) * 5, 2)} V eq.`;

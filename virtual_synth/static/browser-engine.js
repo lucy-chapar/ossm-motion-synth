@@ -170,10 +170,26 @@
       return segments;
     }
 
-    track(target, dt) {
+    track(target, dt, strokeBounds = null) {
       dt = number(dt, "Tracking dt", 0, MAX_DT);
       target = number(target, "Tracking target", this.low, this.high);
       if (!dt) return this.command;
+      let low = this.low, high = this.high;
+      if (strokeBounds !== null) {
+        if (!Array.isArray(strokeBounds) || strokeBounds.length !== 2) throw new TypeError("Stroke bounds need two positions");
+        const [strokeLow, strokeHigh] = strokeBounds;
+        number(strokeLow, "Lower stroke bound", this.low, this.high);
+        number(strokeHigh, "Upper stroke bound", this.low, this.high);
+        if (strokeLow >= strokeHigh || target < strokeLow || target > strokeHigh) throw new RangeError("Stroke bounds must contain the tracking target");
+        const stop = this.position + this.velocity * Math.abs(this.velocity) / (2 * this.amax);
+        // An abrupt center/stroke change cannot erase an existing stopping
+        // distance. Use the rail bounds during that transition, then enforce
+        // the intended stroke as soon as both position and stopping point fit.
+        if (this.position >= strokeLow - 1e-10 && this.position <= strokeHigh + 1e-10
+            && stop >= strokeLow - 1e-10 && stop <= strokeHigh + 1e-10) {
+          low = strokeLow; high = strokeHigh;
+        }
+      }
       const from = this.trackingTarget ?? this.position;
       const feed = Math.abs(target - from) <= this.vmax * dt * 1.5 ? (target - from) / dt : 0;
       const count = Math.ceil(dt / .002), h = dt / count;
@@ -185,13 +201,13 @@
         const predicted = this.position + this.velocity * h / 2;
         let wanted = clamp(feed + 6 * (reference - predicted), -this.vmax, this.vmax);
         // Brake before a rail boundary, with one integration-step margin.
-        const upper = Math.max(0, Math.sqrt(2 * this.amax * Math.max(0, this.high - this.position)) - this.amax * h);
-        const lower = Math.max(0, Math.sqrt(2 * this.amax * Math.max(0, this.position - this.low)) - this.amax * h);
+        const upper = Math.max(0, Math.sqrt(2 * this.amax * Math.max(0, high - this.position)) - this.amax * h);
+        const lower = Math.max(0, Math.sqrt(2 * this.amax * Math.max(0, this.position - low)) - this.amax * h);
         wanted = clamp(wanted, -lower, upper);
         const next = this.velocity + clamp(wanted - this.velocity, -this.amax * h, this.amax * h);
         const position = this.position + .5 * (this.velocity + next) * h;
         const stopping = position + next * Math.abs(next) / (2 * this.amax);
-        if (position < this.low || position > this.high || stopping < this.low || stopping > this.high) {
+        if (position < low || position > high || stopping < low || stopping > high) {
           // The exact bounded point planner handles a discontinuity near a limit.
           const endpoint = from + (target - from) * (i + 1) / count;
           this.update(clamp(endpoint, this.low, this.high), h);
@@ -230,11 +246,27 @@
     }
   }
 
+  function restMoveTime(distance, vmax, amax) {
+    return distance <= vmax * vmax / amax ? 2 * Math.sqrt(distance / amax) : distance / vmax + vmax / amax;
+  }
+
+  function restMovePosition(distance, duration, elapsed, amax) {
+    // Symmetric trapezoid that uses the available duration, rather than
+    // chasing a moving point with an arbitrary proportional response gain.
+    const speed = 2 * distance / (duration + Math.sqrt(Math.max(0, duration * duration - 4 * distance / amax)));
+    const ramp = speed / amax;
+    if (elapsed < ramp) return .5 * amax * elapsed * elapsed;
+    if (elapsed > duration - ramp) return distance - .5 * amax * (duration - elapsed) ** 2;
+    return .5 * amax * ramp * ramp + speed * (elapsed - ramp);
+  }
+
   class Engine {
     constructor(params = null) {
       this.params = validateParams(params === null ? {} : params);
       this.trajectory = new Trajectory({low: this.params.lower, high: this.params.upper});
       this.phase = this.lfo_phase = this.envelope = 0;
+      this.reference_phase = 0;
+      this._planned_rate = null;
     }
 
     configure(full_or_changes) {
@@ -254,6 +286,8 @@
       });
       this.trajectory = trajectory;
       this.phase = this.lfo_phase = this.envelope = 0;
+      this.reference_phase = 0;
+      this._planned_rate = null;
     }
 
     _source(patch, bipolar = true) {
@@ -304,23 +338,92 @@
       if (this.params.env_to_stroke && direct_position === null) stroke *= this.envelope;
       const low = this.params.lower, high = this.params.upper;
       const midpoint = low + center * (high - low);
-      const amplitude = stroke * Math.min(midpoint - low, high - midpoint);
+      let amplitude = stroke * Math.min(midpoint - low, high - midpoint);
+      if (tracking && midpoint - amplitude === midpoint + amplitude) amplitude = 0;
       const carrier = waveform(this.params.shape, this.phase);
       const wave = direct_position === null ? carrier : direct_position;
       const requested = clamp(midpoint + amplitude * wave, low, high);
+      let plannedRate = rate, maximumSineRate = null, reference = requested, moveTime = 0;
+      // A minimum-time continuous reference using every bit of acceleration
+      // cannot be caught after starting at rest or changing parameters. Reserve
+      // 10% for capture by the same tracker; its output still has one hard V/A
+      // budget. Square point moves need no separate reference capture.
+      const referenceVmax = this.trajectory.vmax * .9;
+      const referenceAmax = this.trajectory.amax * .9;
+      if (tracking && running && direct_position === null) {
+        // One physical budget owns the streamed trajectory. A clock that keeps
+        // outrunning that budget makes a pursuit limiter shrink the stroke.
+        // Retiming a sine preserves its geometry: v_peak=2*pi*f*A and
+        // a_peak=(2*pi*f)^2*A, in the same normalized units as the trajectory.
+        if (amplitude > 0) {
+          maximumSineRate = Math.min(this.trajectory.vmax / (2 * Math.PI * amplitude),
+            Math.sqrt(this.trajectory.amax) / Math.sqrt(amplitude) / (2 * Math.PI));
+          if (this.params.shape === "sine") plannedRate = Math.min(rate, maximumSineRate);
+          else {
+            // Each non-sine stroke needs a finite rest-to-rest transition.
+            // Ideal triangle corners and saw/square jumps demand infinite
+            // acceleration; their bounded references allocate real time.
+            const distance = 2 * amplitude;
+            const vmax = this.params.shape === "square" ? this.trajectory.vmax : referenceVmax;
+            const amax = this.params.shape === "square" ? this.trajectory.amax : referenceAmax;
+            moveTime = restMoveTime(distance, vmax, amax);
+            plannedRate = Math.min(rate, 1 / (2 * moveTime));
+          }
+        }
+        this.reference_phase = wrapped(this.reference_phase
+          + .5 * ((this._planned_rate ?? plannedRate) + plannedRate) * dt);
+        this._planned_rate = plannedRate;
+        reference = clamp(midpoint + amplitude * waveform(this.params.shape, this.reference_phase), low, high);
+        if (amplitude > 0 && this.params.shape === "triangle") {
+          const phase = wrapped(this.reference_phase + .25), forward = phase < .5;
+          const elapsed = (forward ? phase : phase - .5) / plannedRate;
+          const position = restMovePosition(2 * amplitude, .5 / plannedRate, elapsed, referenceAmax);
+          reference = midpoint - amplitude + (forward ? position : 2 * amplitude - position);
+        } else if (amplitude > 0 && this.params.shape === "saw") {
+          const elapsed = this.reference_phase / plannedRate, forwardTime = 1 / plannedRate - moveTime;
+          const position = elapsed < forwardTime
+            ? restMovePosition(2 * amplitude, forwardTime, elapsed, referenceAmax)
+            : 2 * amplitude - restMovePosition(2 * amplitude, moveTime, elapsed - forwardTime, referenceAmax);
+          reference = midpoint - amplitude + position;
+        }
+        reference = clamp(reference, low, high);
+      } else if (!tracking) {
+        this.reference_phase = this.phase;
+        this._planned_rate = null;
+      } else if (!running) this._planned_rate = null;
       let command;
-      if (running) command = tracking ? this.trajectory.track(requested, dt) : this.trajectory.update(requested, dt);
+      if (running) {
+        // A square requests endpoints, rather than a continuously moving
+        // reference. The exact point planner reaches them at the available
+        // velocity/acceleration; a fixed pursuit gain approaches them slowly.
+        const pointMove = tracking && direct_position === null && this.params.shape === "square";
+        const strokeLow = clamp(midpoint - amplitude, low, high), strokeHigh = clamp(midpoint + amplitude, low, high);
+        const strokeBounds = strokeLow < strokeHigh ? [strokeLow, strokeHigh] : null;
+        reference = clamp(reference, strokeLow, strokeHigh);
+        command = tracking && !pointMove ? this.trajectory.track(reference, dt, strokeBounds) : this.trajectory.update(reference, dt);
+      }
       else {
         this.trajectory.reset(this.trajectory.position);
         command = this.trajectory.command;
       }
-      return {
+      const signal = {
         requested, command, velocity: this.trajectory.velocity, envelope: this.envelope,
         lfo: Math.sin(2 * Math.PI * this.lfo_phase), phase: this.phase,
         limited: Boolean(running && Math.abs(command - requested) > 1e-7),
         effective_rate_hz: rate, effective_stroke: stroke, effective_center: center, carrier,
         position_patched: direct_position !== null, envelope_bypassed: Boolean(env_bypassed),
       };
+      if (tracking) Object.assign(signal, {
+        reference_phase: this.reference_phase,
+        planned_reference: reference,
+        planned_rate_hz: running && direct_position === null ? plannedRate : null,
+        rate_limited: running && direct_position === null && plannedRate < rate - 1e-10,
+        requested_span_normalized: 2 * amplitude * (direct_position === null ? 1
+          : Math.abs(this.params.patches.find(patch => patch.target === "position").depth)),
+        center_limited_stroke: stroke > 0 && 2 * amplitude < stroke * (high - low) - 1e-10,
+        max_sine_rate_hz: direct_position === null && this.params.shape === "sine" ? maximumSineRate : null,
+      });
+      return signal;
     }
   }
 

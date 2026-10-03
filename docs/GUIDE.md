@@ -33,6 +33,11 @@ enumerate or connect a USB–RS485 adapter.
    center. Stop before editing the lower/upper command window.
 
 The scope separates the **requested** waveform and the **planned command**.
+The browser shows the resulting requested travel and planned phase rate. A
+fixed wave that exceeds the velocity/acceleration budget runs at a feasible
+planned rate to preserve stroke. Square transitions, triangle corners and saw
+flyback receive finite acceleration time. Position patches show their own
+control mode. See the [motion planner audit](MOTION_PLANNER_AUDIT.md).
 In hardware mode, a third trace is actual encoder feedback. Simulation does
 not invent measured motor feedback. Normalized travel is a fraction of the
 selected raw-count window, not a calibrated millimetre or force measurement.
@@ -126,14 +131,16 @@ at the midpoint of the two contacts, verifies arrival, then inhibits output
 and restores the previous output/stall setting. The waveform planner uses
 this measured working span, keeping its existing physical velocity and
 acceleration limits when converting normalized positions to encoder counts.
-After parking, browser Home restores a 1800 RPM ceiling and the documented
-2000 RPM/s internal acceleration ramp. The local browser attempt retains its
-acceleration-limited continuous trajectory, with nominal 1080 mm/s velocity
-and 1200 mm/s² acceleration ceilings. The transport's optional `streaming`
-profile uses 60098 (98% feedforward, no internal ramp) and 6000 mm/s².
+After parking, browser Home restores a 1800 RPM ceiling and the selected
+profile. The local browser selects `streaming`: 60098 (98% position feedforward,
+no internal acceleration ramp), with host ceilings of nominal 1080 mm/s and
+6000 mm/s². The optional `ramped` profile retains the earlier 2000 RPM/s drive
+ramp and 1200 mm/s² host ceiling for comparison. Faster requested fixed waves
+are retimed to fit their selected budget. These local changes still need fast
+physical validation and have not been deployed.
 Centering uses the slower
 35 RPM / 75 RPM/s calibration profile. The Python bridge retains its earlier
-profile. Faster requested patterns can still be limited by the physical budget.
+profile. Modulated patterns can still be limited by the physical budget.
 A successful Home does not start waveform motion.
 
 The bridge never transmits an absolute position target of zero because that
