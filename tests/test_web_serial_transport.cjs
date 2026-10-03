@@ -17,7 +17,7 @@ class Clock {
 class FakeConnection {
   constructor({native = false, homeIgnored = false} = {}) {
     this.values = Array(26).fill(0);
-    this.values[0] = 1; this.values[2] = 1200; this.values[3] = 60098;
+    this.values[0] = 1; this.values[2] = 1800; this.values[3] = 60098;
     this.values[11] = 800; this.values[21] = 1;
     this.position(20000);
     this.native = native; this.homeIgnored = homeIgnored;
@@ -627,7 +627,7 @@ test("both native directions measure repeatable endpoints and center in one coor
       sign * (3277 - 409600 - 819), sign * -158925, sign * -161382, center]);
     assert.equal(motor.settings.filter(([r, v]) => r === 25 && v === 1).length, 1);
     assert.ok(motor.settings.every(([r]) => r !== 20 && r !== 21));
-    assert.deepEqual(motor.values.slice(0, 4), [1, 0, 1200, 60098]);
+    assert.deepEqual(motor.values.slice(0, 4), [1, 0, 1800, 60098]);
     assert.equal(motor.values[24], 0); assert.equal(motor.values[25], 0);
     for (const [index, state] of motor.absoluteStates.entries()) {
       const recheck = [1, 2, 4, 5, 6].includes(index);
@@ -744,14 +744,14 @@ function contactSpringback(context, amount = 180) {
   return releases;
 }
 
-test("180-count inward springback preserves loaded endpoints and clears before reenabling", async () => {
+test("648-count inward springback preserves loaded endpoints and clears before reenabling", async () => {
   for (const reverse of [false, true]) {
     const motor = new FakeConnection({native: true});
     motor.contacts = reverse ? [-110243, 53597] : [-53597, 110243];
-    const context = await homing(reverse, motor), releases = contactSpringback(context);
+    const context = await homing(reverse, motor), releases = contactSpringback(context,648);
     const result = await advance(context);
     assert.equal(releases.length, 4);
-    assert.ok(releases.every(({loaded, released}) => Math.abs(loaded - released) === 180));
+    assert.ok(releases.every(({loaded, released}) => Math.abs(loaded - released) === 648));
     assert.deepEqual(result.measured_endpoints_raw, motor.contacts);
     assert.equal(result.measured_travel_raw, 163840); assert.equal(result.position_normalized, .5);
     assert.equal(result.homed, true); assert.equal(result.stop_confirmed, true);
@@ -759,10 +759,10 @@ test("180-count inward springback preserves loaded endpoints and clears before r
   }
 });
 
-test("contact inhibition rejects inward release beyond512 and outward movement beyond128", async () => {
+test("contact inhibition rejects inward release beyond819 and outward movement beyond128", async () => {
   for (const reverse of [false, true]) {
     for (const side of ["first", "second"]) {
-      for (const amount of [513, -129]) {
+      for (const amount of [820, -129]) {
         const context = await homing(reverse), {motor, transport} = context;
         await advance(context, `${side}_contact`);
         await advance(context, "inhibiting_contact");
@@ -864,7 +864,7 @@ test("center inhibition accepts53-count relaxation and retains the actual confir
   for (const reverse of [false, true]) {
     const context = await homing(reverse), {transport, motor} = context;
     await advance(context, "inhibiting_center");
-    const commanded = motor.target, settled = commanded + (reverse ? 53 : -53);
+    const commanded = motor.target, settled = commanded + (reverse ? 148 : -148);
     motor.onCommand = (m, operation) => {
       if (operation === "inhibit" && transport.status().home_phase === "inhibiting_center") m.position(settled);
     };
@@ -879,11 +879,11 @@ test("center inhibition accepts53-count relaxation and retains the actual confir
   }
 });
 
-test("center inhibition beyond128 counts never publishes a homed range", async () => {
+test("center inhibition beyond409 counts never publishes a homed range", async () => {
   for (const reverse of [false, true]) {
     const context = await homing(reverse), {transport, motor} = context;
     await advance(context, "inhibiting_center");
-    const settled = motor.target + (reverse ? 129 : -129);
+    const settled = motor.target + (reverse ? 410 : -410);
     motor.onCommand = (m, operation) => {
       if (operation === "inhibit" && transport.status().home_phase === "inhibiting_center") m.position(settled);
     };
@@ -1190,7 +1190,7 @@ test("native reset flags and defaults may settle before three stationary complet
   }
   assert.equal(transport.status().home_origin_raw, -18);
   assert.equal((await advance(context)).homed, true);
-  assert.deepEqual(motor.values.slice(0, 4), [1, 0, 1200, 60098]);
+  assert.deepEqual(motor.values.slice(0, 4), [1, 0, 1800, 60098]);
   await transport.close();
 });
 
@@ -1372,7 +1372,7 @@ test("native Home restores saved output despite a temporary inhibited output set
  const context = await homing(false,motor);
  const result = await advance(context);
  assert.equal(result.homed,true);assert.equal(result.output_limit_stall_raw,540);
- assert.equal(result.speed_rpm,1200);assert.equal(result.acceleration_rpm_s,60098);
+ assert.equal(result.speed_rpm,1800);assert.equal(result.acceleration_rpm_s,60098);
 });
 
 test("direct Home measures both directions without native coordinate reset", async () => {

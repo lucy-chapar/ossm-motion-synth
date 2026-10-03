@@ -117,7 +117,7 @@ the same way. The measured interval must be at least 20 mm and no more than
 500 mm under the configured gearing assumption. Time and distance limits stop
 a search that does not find an end.
 
-After inhibition, the browser allows up to 512 counts of inward springback
+After inhibition, the browser allows up to 819 counts (1 mm) of inward springback
 before the 2 mm retreat. The loaded contact repeat tolerance remains 128
 counts. It clears pending demand while inhibited before enabling each stage.
 
@@ -126,10 +126,10 @@ at the midpoint of the two contacts, verifies arrival, then inhibits output
 and restores the previous output/stall setting. The waveform planner uses
 this measured working span, keeping its existing physical velocity and
 acceleration limits when converting normalized positions to encoder counts.
-After parking, browser Home restores a 1200 RPM ceiling and the documented
+After parking, browser Home restores a 1800 RPM ceiling and the documented
 60098 streaming setting (98% position feedforward, no additional internal ramp).
 The browser retains its acceleration-limited continuous trajectory, with nominal
-720 mm/s velocity and 3600 mm/s² acceleration ceilings. Centering uses the slower
+1080 mm/s velocity and 6000 mm/s² acceleration ceilings. Centering uses the slower
 35 RPM / 75 RPM/s calibration profile. The Python bridge retains its earlier
 profile. Faster requested patterns can still be limited by the physical budget.
 A successful Home does not start waveform motion.
@@ -203,9 +203,9 @@ before accepting it. Reconnecting requires Home again.
 
 RUN clears pending motion, checks stationary disabled readback, enables the
 drive and checks the enabled hold before sending bounded targets. The planner
-uses a browser maximum velocity of 589824 counts/s (720 nominal mm/s) and
-maximum acceleration of 2949120 counts/s² (3600 nominal mm/s²), with ten percent
-speed headroom below the drive's 1200 RPM setting. The optional Python bridge
+uses a browser maximum velocity of 884736 counts/s (1080 nominal mm/s) and
+maximum acceleration of 4915200 counts/s² (6000 nominal mm/s²), with ten percent
+speed headroom below the drive's 1800 RPM setting. The optional Python bridge
 retains 3822 counts/s and 8192 counts/s². It bounds position, speed and acceleration;
 **jerk limiting is not implemented**. Waveforms with abrupt corners therefore
 produce different requested and planned traces, and drive interpolation is
@@ -335,7 +335,7 @@ Stop verification now permits up to three seconds for inhibited feedback to sett
 Three stable encoder readings and disabled-output, speed, pending and PWM checks
 remain required. A failure includes the last feedback fields and encoder spread.
 
-The browser Rate control reaches 2 Hz. Wide high-rate patterns can still exceed
+The browser Rate control reaches 2.5 Hz. Wide high-rate patterns can still exceed
 the motion budget; the tested faster profile is described below.
 
 
@@ -370,3 +370,7 @@ fault. No motion targets are resent by settling recovery.
 Before Home or Play, inhibited speed feedback receives the same bounded read-only
 settling retries. Arming requires three stationary samples within a 1.5-second
 window; persistent inconsistent feedback still prevents motion.
+
+Center parking permits up to 409 counts (0.5 mm) of post-inhibit settling around
+the fixed center target. Three stationary readings and inhibited output remain
+required; this does not change the loaded endpoint repeat tolerance.

@@ -23,15 +23,15 @@
   const HOME_SEARCH_COUNTS = 409600, HOME_MIN_SPAN = 16384, HOME_INSET = 1638;
   const HOME_RETOUCH_OVERTRAVEL = 819;
   // External acceleration-limited trajectory; drive streaming feedforward is 98%.
-  const RUN_SPEED_RPM = 1200, RUN_ACCEL_RPM_S = 60098, PLANNED_ACCEL_RPM_S = 6000;
+  const RUN_SPEED_RPM = 1800, RUN_ACCEL_RPM_S = 60098, PLANNED_ACCEL_RPM_S = 10000;
   const RUN_MAX_VELOCITY = 32768 * RUN_SPEED_RPM / 60 * .9;
   const RUN_MAX_ACCELERATION = 32768 * PLANNED_ACCEL_RPM_S / 60 * .9;
   const HOME_SPEED_RPM = 70, HOME_ACCEL_RPM_S = 150;
   const HOME_RECHECK_SPEED_RPM = 35, HOME_RECHECK_ACCEL_RPM_S = 75;
   const HOME_COUNTS_PER_SECOND = 32768 * HOME_SPEED_RPM / 60;
   const CONTACT_PWM = 1966, CONTACT_ERROR = 512, CONTACT_SECONDS = .5, CONTACT_REPEAT_TOLERANCE = 128;
-  const CONTACT_RELEASE_TOLERANCE = 512;
-  const PARK_STOP_TOLERANCE = 128, STOP_PENDING_TOLERANCE = 2;
+  const CONTACT_RELEASE_TOLERANCE = Math.floor(COUNTS_PER_MM); // 1 mm inward springback after inhibition.
+  const PARK_STOP_TOLERANCE = Math.floor(COUNTS_PER_MM * .5), STOP_PENDING_TOLERANCE = 2;
   const STOP_CONFIRM_TOLERANCE = Math.ceil(COUNTS_PER_MM * .1); // 0.1 mm of disabled mechanical settling.
   const STOP_SETTLE_TOLERANCE = Math.ceil(COUNTS_PER_MM); // 1 mm from the confirmed stop; never a rolling reference.
   const OUTPUT_STATUSES = [0, 1, 2, 3, 6, 7, 10, 11, 14, 15];
@@ -170,7 +170,7 @@
       if (!equalPrefix(rx, tx, 6)) throw new TransportError("Absolute-position acknowledgement address/count mismatch; no retry");
     }
     _configuration(v, enabled, baseline = null) {
-      if (v[0] !== 1 || v[1] !== Number(enabled) || v[2] !== RUN_SPEED_RPM || v[3] !== RUN_ACCEL_RPM_S || v[10] !== 0 || v[14] !== 0 || v[20] !== 0 || v[21] !== 1 || v[25] !== 0) throw new TransportError("Require mode1, scalar output " + Number(enabled) + ", speed/acceleration1200/60098, gear0, alarm0, save0, address1, special0");
+      if (v[0] !== 1 || v[1] !== Number(enabled) || v[2] !== RUN_SPEED_RPM || v[3] !== RUN_ACCEL_RPM_S || v[10] !== 0 || v[14] !== 0 || v[20] !== 0 || v[21] !== 1 || v[25] !== 0) throw new TransportError("Require mode1, scalar output " + Number(enabled) + ", speed/acceleration1800/60098, gear0, alarm0, save0, address1, special0");
       if (baseline && CONFIG.some(i => v[i] !== baseline[i])) throw new TransportError("Motor configuration changed after arming");
     }
     _check_active(v, enabled, hold = false) {
@@ -584,11 +584,11 @@
           const v = await this._home_read(false), position = io.signedPosition(v);
           const inward = this._home_contact_phase.startsWith("first") ? this._home_inward() : -this._home_inward();
           const release = (position - this._home_contact_position) * inward;
-          if (release < -CONTACT_REPEAT_TOLERANCE || release > CONTACT_RELEASE_TOLERANCE) throw new TransportError("Encoder moved beyond the contact release allowance after inhibition");
+          if (release < -CONTACT_REPEAT_TOLERANCE || release > CONTACT_RELEASE_TOLERANCE) throw new TransportError(`Encoder contact release ${release} counts exceeded allowance -${CONTACT_REPEAT_TOLERANCE}..${CONTACT_RELEASE_TOLERANCE} after inhibition`);
           if (this._home_stationary(v, STOP_PENDING_TOLERANCE, true)) this._after_contact_stop(position);
         } else if (phase === "verify_stop") {
           const v = await this._home_read(false);
-          if (Math.abs(io.signedPosition(v) - this._home_park) > PARK_STOP_TOLERANCE) throw new TransportError("Encoder drifted after centering");
+          if (Math.abs(io.signedPosition(v) - this._home_park) > PARK_STOP_TOLERANCE) throw new TransportError(`Encoder drifted after centering by ${Math.abs(io.signedPosition(v) - this._home_park)} counts (limit ${PARK_STOP_TOLERANCE})`);
           if (this._home_stationary(v, STOP_PENDING_TOLERANCE, true)) this._home_queue([["restoring_run_speed", 2, RUN_SPEED_RPM], ["restoring_run_acceleration", 3, RUN_ACCEL_RPM_S], ["restoring_output", 24, this._home_reference[24]]], "verify_complete", .95);
         } else if (phase === "verify_complete") {
           const v = await this._home_read(false), position = io.signedPosition(v);
