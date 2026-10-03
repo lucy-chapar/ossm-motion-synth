@@ -249,10 +249,10 @@ test("timed-out reply fragments arriving during recovery do not corrupt cleanup"
 });
 
 test("continuous response noise bounds recovery and prevents another write", async () => {
-  let noise;
+  const noise = [];
   const port = new FakePort((_, port) => {
     port.emit([1, 6, 0]);
-    noise = setInterval(() => port.emit([99]), 2);
+    noise.push(setInterval(() => port.emit([99]), 2));
   });
   const connection = new WebSerialConnection(port); await connection.open();
   try {
@@ -263,7 +263,7 @@ test("continuous response noise bounds recovery and prevents another write", asy
     assert.equal(port.writes.length, 1);
     assert.equal(connection.poisoned, false);
   } finally {
-    clearInterval(noise);
+    for (const interval of noise) clearInterval(interval);
     await connection.close();
   }
 });

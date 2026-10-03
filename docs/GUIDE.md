@@ -127,9 +127,11 @@ and restores the previous output/stall setting. The waveform planner uses
 this measured working span, keeping its existing physical velocity and
 acceleration limits when converting normalized positions to encoder counts.
 After parking, browser Home restores a 1800 RPM ceiling and the documented
-60098 streaming setting (98% position feedforward, no additional internal ramp).
-The browser retains its acceleration-limited continuous trajectory, with nominal
-1080 mm/s velocity and 6000 mm/s² acceleration ceilings. Centering uses the slower
+2000 RPM/s internal acceleration ramp. The local browser attempt retains its
+acceleration-limited continuous trajectory, with nominal 1080 mm/s velocity
+and 1200 mm/s² acceleration ceilings. The transport's optional `streaming`
+profile uses 60098 (98% feedforward, no internal ramp) and 6000 mm/s².
+Centering uses the slower
 35 RPM / 75 RPM/s calibration profile. The Python bridge retains its earlier
 profile. Faster requested patterns can still be limited by the physical budget.
 A successful Home does not start waveform motion.
@@ -204,7 +206,7 @@ before accepting it. Reconnecting requires Home again.
 RUN clears pending motion, checks stationary disabled readback, enables the
 drive and checks the enabled hold before sending bounded targets. The planner
 uses a browser maximum velocity of 884736 counts/s (1080 nominal mm/s) and
-maximum acceleration of 4915200 counts/s² (6000 nominal mm/s²), with ten percent
+maximum acceleration of 983040 counts/s² (1200 nominal mm/s²), with ten percent
 speed headroom below the drive's 1800 RPM setting. The optional Python bridge
 retains 3822 counts/s and 8192 counts/s². It bounds position, speed and acceleration;
 **jerk limiting is not implemented**. Waveforms with abrupt corners therefore
@@ -221,7 +223,7 @@ the final current target. Delays never create a queue of missed positions.
 The optional Python bridge retains its 10 Hz hardware cycle. Browser runs continue
 until Stop, a disconnect or a monitored fault. The browser allows 200 ms per
 19200-baud transaction; a fast UI or oscillator does not imply high motor bandwidth.
-Browser tracking error beyond one command interval of travel plus 1024 counts,
+Browser tracking error beyond 100 ms of ceiling-speed travel plus 1024 counts,
 capped at ten percent of the working span, for three fresh samples, drive faults, configuration
 changes, persistent communication failures and missed scheduling deadlines latch a fault.
 Targets are never retried after an ambiguous write acknowledgment.
@@ -358,15 +360,24 @@ inhibits output. Connecting and homing never automatically start a pattern.
 The browser uses the same dedicated `0x7b` absolute-position command as the
 upstream OSSM-alt motor library. Its eight-byte reply carries the current encoder
 position (low word, then high word), not a target echo; this was checked on the
-connected drive with output inhibited and a distinct target. Full configuration,
-alarm, pending and output snapshots remain required at 200 ms intervals.
+connected drive with output inhibited and a distinct target. Streaming checks
+rotate through four short status groups, with every guard at most 250 ms old.
 Homing retains the established bulk-register position commands.
 
-The stream requests a 15 ms cadence with a 10 ms scheduling tick, subject to serial timing, with no catch-up
+The stream uses 50 ms deadlines (20 Hz), subject to serial timing, with no catch-up
 queue. Successful exchanges use a 3 ms quiet gap at 19200 baud; startup/error
 recovery retains the longer quiet boundary. Hardware waveforms use continuous
 velocity tracking within the browser acceleration and rail bounds. Simulation
 and the optional Python bridge retain their original point planner.
+The immediate encoder reply is checked against the preceding accepted target,
+matching the connected drive's observed response timing. A stuck or excessively
+lagging encoder still faults after three fresh samples.
+
+The local browser attempt selects the fixed `ramped` profile, with internal
+acceleration at 2000 RPM/s and a corresponding 1200 nominal mm/s² planner ceiling.
+Ten-second slow and moderate sine trials completed with confirmed Stop. This
+ramp adds following lag and limits faster patterns; improved perceived
+smoothness is still being assessed. See [motion results](MOTION_SMOOTHING.md).
 
 Stop confirmation observes at least 600 ms and requires three fresh stationary,
 inhibited readings within 0.1 mm. Following a confirmed stop, speed/demand-only

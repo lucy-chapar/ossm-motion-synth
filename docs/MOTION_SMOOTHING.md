@@ -1,7 +1,8 @@
 # Browser motion smoothing — 2026-10-02
 
 Local development against `0ad919ebf362c7a617ffeb46c92cbaffa42aa5dd`.
-This revision has not been deployed or tested on a connected motor.
+This revision is local and has not been deployed. Connected tests are recorded
+below; steady command timing alone did not remove the user-observed pulsing.
 
 The previous live QA recorded 21.5 ms median target intervals, with 64.1 ms
 at the 95th percentile and 74.8 ms maximum. A complete status exchange needs
@@ -23,20 +24,29 @@ could already be stale when transmitted. See [retained physical QA](QA-2026-10-0
 - Hardware waveform and modulation advance internally in steps of at most 2 ms.
   Reference and planned position are compared at the same midpoint, avoiding
   cadence-dependent overshoot. Only the final current point is transmitted.
-- Fresh fast-position feedback is compared with the current transmitted target.
-  Comparing with the previous target could falsely fault a correctly following
-  fast stroke at the new steady cadence. The tracking tolerance and three-sample
-  fault rule are unchanged. The vendor does not specify the encoder capture time,
-  so this alignment still requires physical validation.
+- Fresh fast-position feedback is compared with the preceding accepted target.
+  Connected replies followed that point before the servo could reach the newly
+  sent point. Comparing with the new point caused a false fault during the fast
+  sine trial. Captured replies and a stuck-encoder case now cover this behavior;
+  the tracking tolerance and three-sample fault rule remain unchanged.
+- A fixed `ramped` transport profile enables the drive's internal acceleration
+  ramp at 2000 RPM/s and reports a matching 1200 nominal mm/s² planner ceiling.
+  The local browser selects this trial profile; `streaming` remains the transport
+  default for explicit callers. Profile checks
+  are exact; Home and cancellation restore the selected profile while inhibited.
 
-Drive mode, baud, velocity/acceleration ceilings, calibrated travel guards and
-stationary Stop verification are retained. This does not add a jerk limit or
+Drive mode, baud, velocity ceiling, calibrated travel guards and stationary Stop
+verification are retained. The ramped profile lowers the acceleration ceiling.
+This does not add a jerk limit or
 establish the drive's interpolation behavior between targets.
 
 ## Offline results
 
-183 browser tests and all 132 Python tests pass. Python server tests required
-loopback socket access. The standalone browser export and its asset hashes were
+187 browser tests pass with test files run sequentially. A concurrent rerun hit
+the existing timer-sensitive continuous-noise fixture; its timer cleanup now
+releases every interval even when an assertion fails. The final sequential run
+passed all assertions. The earlier 132-test Python pass is retained; Python
+server tests required loopback socket access. The standalone browser export and its asset hashes were
 verified. New coverage includes irregular waveform timing, amplitude fidelity,
 stopping bounds, short-response framing, all status groups, stale guards,
 read-only recovery, transaction-aligned tracking and Stop during pending writes.
@@ -60,19 +70,57 @@ timer jitter and servo dynamics, and does not establish a measured motor cadence
 Reproduce from the repository root:
 
 ```sh
-node --test tests/*.cjs
+node --test --test-concurrency=1 tests/*.cjs
 python3 -m unittest discover -s tests
 node scripts/benchmark_tracking.cjs --baseline 0ad919e
 node scripts/benchmark_streaming.cjs
 python3 scripts/export_web.py --output dist/web
 ```
 
-## Connected validation still required
+## Connected results
 
-Compare the old and new revisions with the same adapter, motor, rail and settings.
+The production JavaScript runtime, transport and serial framing were connected
+to the USB–RS485 adapter through a private native serial pipe. This exercises
+the connected drive but does not measure a browser's event-loop timing.
+Fresh direct Home measured 181.39 nominal mm of travel.
+
+| Streaming trial | Duration | Median target interval | P95 interval | Maximum interval | Final Stop |
+| --- | ---: | ---: | ---: | ---: | --- |
+| 0.25 Hz / 30% sine | 10 s | 49.94 ms | 52.72 ms | 53.88 ms | Confirmed |
+| 0.5 Hz / 70% sine | 10 s | 49.90 ms | 53.03 ms | 54.65 ms | Confirmed |
+| Ramped 0.25 Hz / 30% sine | 10 s | 50.17 ms | 52.94 ms | 54.32 ms | Confirmed |
+| Ramped 0.5 Hz / 70% sine | 10 s | 50.02 ms | 53.32 ms | 54.45 ms | Confirmed |
+
+The broad trial also completed a one-second Pause and five-second Resume with
+frozen phase during Pause. Neither trial had communication recovery. The user
+reported that the slow sine still pulsed or jittered. The 1.5 Hz trial stopped
+on the incorrect new-target feedback comparison described above, with output,
+pending demand, PWM, speed and alarm all zero afterward. It does not establish
+fast-pattern performance.
+
+The ramped attempt repeated fresh Home, measuring 181.45 nominal mm. Both
+ten-second runs completed without a fault or communication recovery, with
+maximum status-check ages below 192 ms. Final output, pending demand, PWM and
+alarm were zero; the speed estimate was -1 RPM, within the existing stationary
+tolerance. The adapter was closed and released. These are operation and Stop
+checks; they do not establish improved perceived smoothness.
+
+Compared with streaming, encoder error relative to the preceding accepted
+target increased from 0.088 to 0.482 mm RMS for the slow sine and from 0.386 to
+6.067 mm for the moderate sine after excluding the first two seconds. The drive
+ramp therefore changes motion and adds following lag. Target-to-reply latency
+remained approximately 13 ms in both profiles. Faster requested patterns can be
+limited by the lower acceleration ceiling.
+
+## Further connected validation
+
+Compare the profiles with the same adapter, motor, rail and settings.
 Begin with a supervised ten-second slow sine and confirm Stop. Then test the
 1.5 Hz / 70% and 2.5 Hz / 30% patterns in separate ten-second runs, including
 Pause/Resume and confirmed final inhibition. Record actual command intervals,
 encoder span and lag, overshoot, status ages and any communication recovery.
 Judge motion from the physical run and encoder trace; the offline curves alone
-cannot sign off smoothness. Retain the current live release until that check.
+cannot sign off smoothness. The 2000 RPM/s ramped profile can follow the two
+slow/moderate patterns above, but the previous 1.5 Hz / 70% pattern exceeds its
+acceleration budget. Retain the current live release until connected comparison
+supports a production profile.

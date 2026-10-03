@@ -135,10 +135,10 @@ class FakeConnection {
   }
 }
 
-function make({motor = new FakeConnection(), allowed = true, nativeHome = true, fastPositions = false} = {}) {
+function make({motor = new FakeConnection(), allowed = true, nativeHome = true, fastPositions = false, motionProfile} = {}) {
   const clock = new Clock(), selectedPort = {}, factories = [];
   const transport = new MotorTransport(selectedPort, {
-    allowMotion: allowed, nativeHome, fastPositions, portLabel: "offline-test", clock: clock.now, wait: clock.wait,
+    allowMotion: allowed, nativeHome, fastPositions, motionProfile, portLabel: "offline-test", clock: clock.now, wait: clock.wait,
     connectionFactory: port => { factories.push(port); return motor; },
   });
   return {transport, motor, clock, factories, selectedPort};
@@ -188,6 +188,65 @@ test("construction and read-only connection never send motor controls", async ()
   await transport.stop(); await transport.close();
   assert.deepEqual(motor.commands, []); assert.deepEqual(motor.settings, []);
   assert.equal(motor.transmissions.length, 1); assert.equal(motor.closeCount, 1);
+});
+
+test("motion profiles retain streaming defaults and expose the bounded ramped acceleration", () => {
+  const streaming = make().transport.status(), ramped = make({motionProfile:"ramped"}).transport.status();
+  assert.equal(streaming.motion_profile, "streaming"); assert.equal(ramped.motion_profile, "ramped");
+  assert.equal(streaming.max_acceleration_raw_s2, 32768 * 10000 / 60 * .9);
+  assert.equal(ramped.max_acceleration_raw_s2, 32768 * 2000 / 60 * .9);
+  assert.equal(ramped.max_velocity_raw_s, streaming.max_velocity_raw_s);
+  assert.equal(ramped.max_velocity_raw_s, 32768 * 1800 / 60 * .9);
+  for (const motionProfile of ["", "fast", "constructor", "toString", null, 2000, {}]) {
+    const motor = new FakeConnection();
+    assert.throws(() => make({motor, motionProfile}), /Motion profile must be streaming or ramped/);
+    assert.equal(motor.openCount, 0); assert.deepEqual(motor.transmissions, []);
+  }
+});
+
+test("each motion profile requires its exact drive acceleration before arming", async () => {
+  for (const [motionProfile, acceleration, expected] of [["streaming",2000,60098], ["ramped",60098,2000]]) {
+    const motor = new FakeConnection(); motor.values[3] = acceleration;
+    const {transport} = make({motor, motionProfile});
+    await transport.connect(); await assert.rejects(transport.arm(), new RegExp(`speed/acceleration1800/${expected}`));
+    assert.deepEqual(motor.commands, []); assert.deepEqual(motor.settings, []); await transport.close();
+  }
+  const motor = new FakeConnection(); motor.values[3] = 2000;
+  const {transport} = await running({motor, motionProfile:"ramped", fastPositions:true});
+  assert.equal(transport.status().motion_profile, "ramped"); assert.equal(transport.status().acceleration_rpm_s, 2000);
+  motor.values[3] = 60098;
+  await assert.rejects(transport.command(.51), /speed\/acceleration1800\/2000/);
+  assert.deepEqual(motor.destinations, []);
+  motor.values[3] = 2000; await transport.stop(); await transport.close();
+});
+
+test("successful Home restores the selected ramped profile before arming", async () => {
+  for (const nativeHome of [false, true]) {
+    const simulatedMotor = new FakeConnection({native:true}); simulatedMotor.contacts = [-140563,23277];
+    const context = make({motor:simulatedMotor, motionProfile:"ramped", nativeHome});
+    const {transport, motor} = context;
+    await transport.connect(); await transport.begin_home(); const result = await advance(context);
+    assert.equal(result.homed, true); assert.equal(result.stop_confirmed, true);
+    assert.equal(result.motion_profile, "ramped"); assert.ok(Math.abs(result.max_acceleration_raw_s2 - 983040) < 1e-8);
+    assert.deepEqual(motor.values.slice(0, 4), [1,0,1800,2000]);
+    assert.deepEqual(motor.settings.filter(([register]) => register === 3).at(-1), [3,2000]);
+    assert.ok(!motor.settings.some(([register,value]) => register === 3 && value === 60098));
+    await transport.arm(); await transport.start(); await transport.command(.51); await transport.stop(); await transport.close();
+  }
+});
+
+test("cancelled Home restores the selected ramped profile while inhibited", async () => {
+  for (const nativeHome of [false, true]) {
+    const simulatedMotor = new FakeConnection({native:true}); simulatedMotor.contacts = [-140563,23277];
+    const context = make({motor:simulatedMotor, motionProfile:"ramped", nativeHome});
+    const {transport, motor} = context;
+    await transport.connect(); await transport.begin_home(); await advance(context, "first_contact");
+    const result = await transport.stop();
+    assert.equal(result.stop_confirmed, true); assert.equal(result.homed, false); assert.equal(result.motion_profile, "ramped");
+    assert.deepEqual(motor.values.slice(0, 4), [1,0,1800,2000]);
+    assert.deepEqual(motor.settings.filter(([register]) => register === 3).at(-1), [3,2000]);
+    await transport.close();
+  }
 });
 
 test("normal motion matches Python transport status and exact control-frame trace", async () => {
@@ -1502,37 +1561,46 @@ test("fast stream interleaves every guard group and uses encoder replies", async
   await transport.close();
 });
 
-test("fast reply tracking compares the current trajectory point when motion advances beyond ten percent per cycle", async () => {
+test("captured fast encoder replies follow the preceding accepted target without false tracking failures", async () => {
   const {transport, motor, clock} = await running({fastPositions:true});
-  // A 140 mm working span, with 23.1 mm of smooth travel per 50 ms. This
-  // stays below the configured speed ceiling but exceeds the 14 mm tracking
-  // tolerance relative to a point from the preceding command interval.
-  transport._low = 20000 - 57344; transport._high = 20000 + 57344;
-  for (const normalized of [.665, .83, .995]) {
+  transport._low = -253000; transport._high = -108000;
+  transport._target = -161548; motor.position(transport._target);
+  transport._values = motor.values.slice();
+  // Actual connected-drive reply pairs from a 1.5 Hz / 70% sine: encoder
+  // error relative to the preceding point was 0.90/1.72 mm, while the new
+  // point was 22.28/23.43 mm away and had not yet been traversed by the servo.
+  for (const [prior, target, encoder] of [[-161548, -179061, -160812], [-179061, -196842, -177650]]) {
+    assert.equal(transport._target, prior);
     await clock.wait(.05);
-    const position = Math.round(transport._low + (transport._high - transport._low) * normalized);
-    // Fresh feedback represents a servo following the current waveform as
-    // time advances, rather than an instantaneous response to the new write.
-    motor.onRead = m => { m.position(position); };
+    motor.onRead = m => { m.position(encoder); };
+    const normalized = (target - transport._low) / (transport._high - transport._low);
     const result = await transport.command(normalized);
-    assert.equal(result.position_raw, position); assert.equal(result.fault, null);
+    assert.equal(result.position_raw, encoder); assert.equal(result.fault, null);
     assert.equal(result.running, true);
+    assert.equal(transport._tracking_failures, 0);
+    assert.equal(result.target_raw, target);
   }
-  motor.onRead = null; assert.equal(motor.destinations.length, 3);
+  motor.onRead = null; assert.equal(motor.destinations.length, 2);
   await transport.stop(); await transport.close();
 });
 
-test("one-cycle-old fast encoder feedback still faults at the unchanged current tracking tolerance", async () => {
+test("a stuck fast encoder faults after three samples beyond the unchanged preceding-target budget", async () => {
   const {transport, motor, clock} = await running({fastPositions:true});
   transport._low = 20000 - 57344; transport._high = 20000 + 57344;
-  // The default fake reports the preceding target. At this cadence that is
-  // persistently 23.1 mm behind the current trajectory, beyond the same 14 mm
-  // threshold used above. A previous-target comparison would miss all three.
+  // The first command begins at the observed position. If the encoder then
+  // remains there, its error from each preceding accepted target exceeds the
+  // same 10%-of-range budget (14 mm here), so three fresh failures must stop.
+  motor.onRead = m => { m.position(20000); };
   await clock.wait(.05); await transport.command(.665);
+  assert.equal(transport._tracking_failures, 0);
   await clock.wait(.05); await transport.command(.83);
+  assert.equal(transport._tracking_failures, 1);
+  await clock.wait(.05); await transport.command(.995);
+  assert.equal(transport._tracking_failures, 2);
   await clock.wait(.05);
   await assert.rejects(transport.command(.995), /Tracking error exceeded/);
-  assert.equal(motor.destinations.length, 3); assert.equal(transport.status().stop_confirmed, true);
+  assert.equal(motor.destinations.length, 4); assert.equal(transport.status().stop_confirmed, true);
+  motor.onRead = null;
   await transport.close();
 });
 

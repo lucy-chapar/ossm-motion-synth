@@ -24,7 +24,9 @@
   function createRuntime(options = {}) {
     const clock = options.clock || (() => performance.now() / 1000);
     const serial = options.serial === undefined ? globalThis.navigator?.serial : options.serial;
-    const transportFactory = options.transportFactory || ((port) => new globalThis.MotionWebSerialTransport.MotorTransport(port, { allowMotion: true, fastPositions: true }));
+    const transportFactory = options.transportFactory || ((port) => new globalThis.MotionWebSerialTransport.MotorTransport(port, {
+      allowMotion: true, fastPositions: true, motionProfile: "ramped",
+    }));
     const engine = new engineAPI.Engine();
     const ports = new Map();
     const storage = options.storage === undefined ? globalThis.localStorage : options.storage;

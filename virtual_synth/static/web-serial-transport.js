@@ -24,10 +24,12 @@
   const HOME_SEEK_SECONDS = 30, HOME_TOTAL_SECONDS = 360, COUNTS_PER_MM = 32768 / 40;
   const HOME_SEARCH_COUNTS = 409600, HOME_MIN_SPAN = 16384, HOME_INSET = 1638;
   const HOME_RETOUCH_OVERTRAVEL = 819;
-  // External acceleration-limited trajectory; drive streaming feedforward is 98%.
-  const RUN_SPEED_RPM = 1800, RUN_ACCEL_RPM_S = 60098, PLANNED_ACCEL_RPM_S = 10000;
+  const MOTION_PROFILES = Object.freeze({
+    streaming: Object.freeze({ driveAcceleration: 60098, plannedAcceleration: 10000 }),
+    ramped: Object.freeze({ driveAcceleration: 2000, plannedAcceleration: 2000 }),
+  });
+  const RUN_SPEED_RPM = 1800;
   const RUN_MAX_VELOCITY = 32768 * RUN_SPEED_RPM / 60 * .9;
-  const RUN_MAX_ACCELERATION = 32768 * PLANNED_ACCEL_RPM_S / 60 * .9;
   const HOME_SPEED_RPM = 70, HOME_ACCEL_RPM_S = 150;
   const HOME_RECHECK_SPEED_RPM = 35, HOME_RECHECK_ACCEL_RPM_S = 75;
   const HOME_COUNTS_PER_SECOND = 32768 * HOME_SPEED_RPM / 60;
@@ -47,8 +49,12 @@
 
   class MotorTransport {
     constructor(port, { allowMotion = false, connectionFactory = null, clock: now = clock,
-                        wait: sleep = wait, nativeHome = false, fastPositions = false, portLabel = "Selected USB serial adapter" } = {}) {
+                        wait: sleep = wait, nativeHome = false, fastPositions = false, motionProfile = "streaming", portLabel = "Selected USB serial adapter" } = {}) {
       if (!port) throw new TypeError("An explicitly selected SerialPort is required");
+      if (typeof motionProfile !== "string" || !Object.hasOwn(MOTION_PROFILES, motionProfile)) throw new TypeError("Motion profile must be streaming or ramped");
+      this._motion_profile = motionProfile;
+      this._run_accel_rpm_s = MOTION_PROFILES[motionProfile].driveAcceleration;
+      this._run_max_acceleration = 32768 * MOTION_PROFILES[motionProfile].plannedAcceleration / 60 * .9;
       this.port = portLabel; this._port = port; this.allow_motion = allowMotion === true;
       this._nativeHome = nativeHome === true;
       this._fastPositions = fastPositions === true; this._snapshot_at = -Infinity;
@@ -82,12 +88,12 @@
       else if (this._homed) notice = "Motor homed.";
       return {
         port: this.port, baud: 19200, slave: 1, connected: this._connection !== null, owned: this._owned,
-        motion_allowed: this.allow_motion, armed: this._armed, running: this._running,
+        motion_allowed: this.allow_motion, motion_profile: this._motion_profile, armed: this._armed, running: this._running,
         stop_confirmed: this._stop_confirmed, fault: this._fault, homing: this._homing, homed: this._homed,
         home_phase: this._home_phase, home_progress: this._home_progress, home_direction: this._home_direction,
         home_origin_raw: this._home_origin, measured_endpoints_raw: this._measured_endpoints?.slice() ?? null,
         measured_travel_raw: this._measured_travel, nominal_counts_per_mm: COUNTS_PER_MM,
-        max_velocity_raw_s: RUN_MAX_VELOCITY, max_acceleration_raw_s2: RUN_MAX_ACCELERATION,
+        max_velocity_raw_s: RUN_MAX_VELOCITY, max_acceleration_raw_s2: this._run_max_acceleration,
         position_raw: position, pending_raw: v ? io.pending(v) : null, output_raw: output,
         output_enabled: v && ((v[0] === 1 && [0, 1].includes(output)) || (v[0] === 0 && [0, 2, 3, 6, 7, 10, 11, 14, 15].includes(output))) ? Boolean(output & 1) : null,
         alarm: v?.[14] ?? null, mode: v?.[0] ?? null, speed_rpm: v?.[2] ?? null,
@@ -203,7 +209,7 @@
       if (!equalPrefix(rx, tx, 6)) throw new TransportError("Absolute-position acknowledgement address/count mismatch; no retry");
     }
     _configuration(v, enabled, baseline = null) {
-      if (v[0] !== 1 || v[1] !== Number(enabled) || v[2] !== RUN_SPEED_RPM || v[3] !== RUN_ACCEL_RPM_S || v[10] !== 0 || v[14] !== 0 || v[20] !== 0 || v[21] !== 1 || v[25] !== 0) throw new TransportError("Require mode1, scalar output " + Number(enabled) + ", speed/acceleration1800/60098, gear0, alarm0, save0, address1, special0");
+      if (v[0] !== 1 || v[1] !== Number(enabled) || v[2] !== RUN_SPEED_RPM || v[3] !== this._run_accel_rpm_s || v[10] !== 0 || v[14] !== 0 || v[20] !== 0 || v[21] !== 1 || v[25] !== 0) throw new TransportError("Require mode1, scalar output " + Number(enabled) + `, speed/acceleration${RUN_SPEED_RPM}/${this._run_accel_rpm_s}, gear0, alarm0, save0, address1, special0`);
       if (baseline && CONFIG.some(i => v[i] !== baseline[i])) throw new TransportError("Motor configuration changed after arming");
     }
     _check_active(v, enabled, hold = false) {
@@ -361,10 +367,10 @@
             this._values[22] = (rx[2] << 8) | rx[3]; this._values[23] = (rx[4] << 8) | rx[5];
             this._observed_at = this._clock();
             const actual = this._check_active(this._values, true);
-            // This fresh reply belongs to the current trajectory transaction.
-            // Comparing with the previous target adds a whole command interval
-            // of phase error even when the encoder follows the current curve.
-            this._tracking_failures = Math.abs(actual - target) > trackingLimit ? this._tracking_failures + 1 : 0;
+            // The immediate reply samples the encoder before the servo can
+            // reach the newly submitted point. Live replies followed the
+            // preceding accepted target; use that point for the same lag bound.
+            this._tracking_failures = Math.abs(actual - this._target) > trackingLimit ? this._tracking_failures + 1 : 0;
             if (this._tracking_failures >= 3) throw new TransportError("Tracking error exceeded the motion budget for three fresh samples");
           } else await this._absolute(target, this._budget());
         }
@@ -389,7 +395,7 @@
       this._home_actions = actions.slice(); this._home_following = following; this._home_stage(actions[0][0], progress);
     }
     async _write_home_setting(register, value) {
-      const permitted = { 0: [0, 1], 2: [RUN_SPEED_RPM, HOME_SPEED_RPM, HOME_RECHECK_SPEED_RPM, 80], 3: [15, RUN_ACCEL_RPM_S, HOME_ACCEL_RPM_S, HOME_RECHECK_ACCEL_RPM_S], 9: [0, 1], 10: [0], 24: [89, this._home_reference[24]], 25: [0, 1] };
+      const permitted = { 0: [0, 1], 2: [RUN_SPEED_RPM, HOME_SPEED_RPM, HOME_RECHECK_SPEED_RPM, 80], 3: [15, this._run_accel_rpm_s, HOME_ACCEL_RPM_S, HOME_RECHECK_ACCEL_RPM_S], 9: [0, 1], 10: [0], 24: [89, this._home_reference[24]], 25: [0, 1] };
       if (!permitted[register]?.includes(value)) throw new TransportError("Setting is outside the fixed native homing profile");
       const tx = io.configRequest(register, value), rx = await this._exchange(tx, HOME_IO_TIMEOUT);
       if (!equalPrefix(rx, tx, 6)) throw new TransportError("Homing setting acknowledgement mismatch; no retry");
@@ -634,7 +640,7 @@
         } else if (phase === "verify_stop") {
           const v = await this._home_read(false);
           if (Math.abs(io.signedPosition(v) - this._home_park) > PARK_STOP_TOLERANCE) throw new TransportError(`Encoder drifted after centering by ${Math.abs(io.signedPosition(v) - this._home_park)} counts (limit ${PARK_STOP_TOLERANCE})`);
-          if (this._home_stationary(v, STOP_PENDING_TOLERANCE, true)) this._home_queue([["restoring_run_speed", 2, RUN_SPEED_RPM], ["restoring_run_acceleration", 3, RUN_ACCEL_RPM_S], ["restoring_output", 24, this._home_reference[24]]], "verify_complete", .95);
+          if (this._home_stationary(v, STOP_PENDING_TOLERANCE, true)) this._home_queue([["restoring_run_speed", 2, RUN_SPEED_RPM], ["restoring_run_acceleration", 3, this._run_accel_rpm_s], ["restoring_output", 24, this._home_reference[24]]], "verify_complete", .95);
         } else if (phase === "verify_complete") {
           const v = await this._home_read(false), position = io.signedPosition(v);
           if (Math.abs(position - this._home_park) > PARK_STOP_TOLERANCE || !this._inhibited_feedback(v)) throw new TransportError("Final homing stop was not confirmed");
@@ -676,7 +682,7 @@
           if (v[0] !== 1 || v[1] !== 0 || !this._stationary_speed(v) || Math.abs(io.signedPosition(v) - positions.at(-1)) > 4) throw new TransportError("Native cancellation Modbus takeover was not stationary and inhibited");
           await this._write_home_setting(10, 0);
           await this._write("clear", IO_TIMEOUT);
-          for (const [register, value] of [[2, RUN_SPEED_RPM], [3, RUN_ACCEL_RPM_S], [24, this._home_reference[24]]]) await this._write_home_setting(register, value);
+          for (const [register, value] of [[2, RUN_SPEED_RPM], [3, this._run_accel_rpm_s], [24, this._home_reference[24]]]) await this._write_home_setting(register, value);
           positions = [];
           for (let i = 0; i < 3; i++) {
             if (i) await this._wait(.1); v = await this._home_read(false);
