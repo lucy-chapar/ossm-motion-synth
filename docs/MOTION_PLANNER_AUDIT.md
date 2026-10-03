@@ -218,3 +218,22 @@ following error, fresh status ages, and confirmed final inhibition. Start with
 one watched bounded pattern and increase only after that observation. Higher
 acceleration and persistent baud commissioning remain separate physical steps.
 The earlier smooth 0.25 Hz result must not be used as evidence for fast motion.
+
+## Connected speed comparison — 2026-10-03
+
+With the user watching, fresh Home measured 181.549 nominal mm and confirmed
+stationary inhibited output. The production browser engine/runtime and serial
+transport then ran separate six-second centered 70% sines at 19200 baud, with
+the streaming drive setting 60098 and host acceleration 6000 mm/s².
+
+| Requested rate | Sent targets | Target rate | Sampled encoder travel | Planned peak speed | Largest target interval |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 0.5 Hz | 120 | 20.00/s | 99.11 mm | 156.03 mm/s | 55.66 ms |
+| 1 Hz | 119 | 19.83/s | 98.18 mm | 310.14 mm/s | 62.77 ms |
+| 1.5 Hz | 119 | 19.83/s | 98.63 mm | 469.05 mm/s | 55.77 ms |
+
+All three runs completed without a fault and confirmed output inhibited with zero
+pending demand, speed, PWM and alarm. Encoder travel is based on sparse rotating
+status reads and may miss extrema; planned peak speed is not measured motor
+speed. The physical smoothness observation is still pending. No higher
+acceleration budget or persistent baud change has been applied in this comparison.
