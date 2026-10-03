@@ -18,6 +18,8 @@
   const { TransportError } = io;
   const IO_TIMEOUT = .2, MAX_RUN_SECONDS = null, HALF_WINDOW = 4096, PADDING = 128;
   const CONFIG = [0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 20, 21, 24, 25];
+  const STREAM_STATUS_GROUPS = [[0, 7], [7, 7], [14, 7], [21, 5]];
+  const STREAM_STATUS_MAX_AGE = .25;
   const HOME_IO_TIMEOUT = .5;
   const HOME_SEEK_SECONDS = 30, HOME_TOTAL_SECONDS = 360, COUNTS_PER_MM = 32768 / 40;
   const HOME_SEARCH_COUNTS = 409600, HOME_MIN_SPAN = 16384, HOME_INSET = 1638;
@@ -50,6 +52,7 @@
       this.port = portLabel; this._port = port; this.allow_motion = allowMotion === true;
       this._nativeHome = nativeHome === true;
       this._fastPositions = fastPositions === true; this._snapshot_at = -Infinity;
+      this._status_group_at = STREAM_STATUS_GROUPS.map(() => -Infinity); this._status_group_next = 0;
       this._factory = connectionFactory; this._clock = now; this._wait = sleep;
       for (const field of ["connection", "values", "baseline", "origin", "hold_position", "low", "high", "enabled_at", "target", "stop_position", "fault", "observed_at", "home_origin", "home_started", "home_phase_started", "home_reference", "home_expected", "home_initial", "home_park", "home_motion_timeout", "home_move_phase", "home_move_from", "home_move_target", "home_contact_phase", "home_contact_position", "home_hold_position", "proposed_endpoints", "proposed_bounds", "measured_endpoints", "measured_travel"]) this["_" + field] = null;
       for (const field of ["owned", "cleanup_attempted", "armed", "running", "stop_confirmed", "homing", "homed", "home_activity"]) this["_" + field] = false;
@@ -93,6 +96,7 @@
         origin_raw: this._origin, raw_bounds: this._origin !== null ? [this._low, this._high] : null,
         position_normalized: position !== null && this._origin !== null ? (position - this._low) / (this._high - this._low) : null,
         communication_recoveries: this._communication_recoveries,
+        status_check_age_s: this._values ? Math.max(0, this._clock() - Math.min(...this._status_group_at)) : null,
         target_raw: this._target, observed_at: this._observed_at,
         run_seconds: this._running && this._enabled_at !== null ? Math.max(0, this._clock() - this._enabled_at) : 0,
         max_run_seconds: MAX_RUN_SECONDS, cleanup_errors: this._cleanup_errors.slice(), notice,
@@ -105,11 +109,14 @@
     }
     async _exchange(tx, budget) {
       this._checkCancelled();
-      const rx = await this._connection.exchange(tx, budget);
+      const rx = await this._connection.exchange(tx, budget, () => {
+        this._checkCancelled();
+        if (this._fastPositions && tx[1] === 0x7b) this._require_fresh_stream_guards();
+      });
       if (!(rx instanceof Uint8Array) || rx.length < 5 || io.crc16(rx.slice(0, -2)) !== (rx.at(-2) | rx.at(-1) << 8)) throw new TransportError("Response CRC or length mismatch");
       if (rx[0] !== 1 || (rx[1] !== tx[1] && rx[1] !== (tx[1] | 128))) throw new TransportError("Response slave/function mismatch");
       if (rx[1] === (tx[1] | 128)) throw new TransportError("Drive returned Modbus exception " + rx[2]);
-      if (rx.length !== (tx[1] === 3 ? 57 : 8)) throw new TransportError("Response length mismatch");
+      if (rx.length !== (tx[1] === 3 ? 5 + 2 * ((tx[4] << 8) | tx[5]) : 8)) throw new TransportError("Response length mismatch");
       return rx;
     }
     async _read(budget = null, speedRecheck = 0) {
@@ -123,7 +130,8 @@
           this._communication_recoveries++;
         }
         this._values = io.parseSnapshot(response);
-        this._observed_at = this._snapshot_at = this._clock(); this._checkCancelled();
+        this._observed_at = this._snapshot_at = this._clock();
+        this._status_group_at.fill(this._snapshot_at); this._status_group_next = 0; this._checkCancelled();
         // When electrically inhibited, let the speed estimator settle before
         // returning feedback. The eventual read must still pass every guard.
         if (!this._inCleanup && speedRecheck < 6 && this._values[0] === 1 && this._values[1] === 0 &&
@@ -151,6 +159,31 @@
         }
         return this._values;
       } catch (error) { this._stop_confirmed = false; throw error; }
+    }
+    async _read_stream_guards() {
+      const group = this._status_group_next, [start, count] = STREAM_STATUS_GROUPS[group];
+      let response;
+      try { response = await this._exchange(io.statusRequest(start, count), this._budget()); }
+      catch (error) {
+        if (!error.recoverableResponse) throw error;
+        // A failed guard read is safe to replace with a complete read-only
+        // snapshot. It must never turn into a retry of a position command.
+        this._checkCancelled();
+        const values = await this._read(); this._communication_recoveries++;
+        return values;
+      }
+      this._checkCancelled();
+      const values = io.parseStatus(response, count);
+      this._values.splice(start, count, ...values);
+      this._observed_at = this._status_group_at[group] = this._clock();
+      this._status_group_next = (group + 1) % STREAM_STATUS_GROUPS.length;
+      return this._values;
+    }
+    _require_fresh_stream_guards() {
+      const oldestAge = this._clock() - Math.min(...this._status_group_at);
+      if (!Number.isFinite(oldestAge) || oldestAge > STREAM_STATUS_MAX_AGE) {
+        throw new TransportError(`Streaming status checks are stale (${oldestAge.toFixed(3)} seconds; limit ${STREAM_STATUS_MAX_AGE}); no target sent`);
+      }
     }
     async _write(operation, budget = null) {
       if (!["clear", "enable", "inhibit"].includes(operation)) throw new TransportError("Unsupported transport operation");
@@ -304,22 +337,34 @@
       this._require_clear_fault();
       if (!this.allow_motion || !this._armed || !this._running) throw new TransportError("ARM and START are required before sending a target");
       try {
-        if (typeof normalized !== "number" || !Number.isFinite(normalized) || normalized < 0 || normalized > 1) throw new TransportError("Position must be finite and normalized0..1");
+        const resolveTarget = typeof normalized === "function" ? normalized : null;
+        if (!resolveTarget && (typeof normalized !== "number" || !Number.isFinite(normalized) || normalized < 0 || normalized > 1)) throw new TransportError("Position must be finite and normalized0..1");
         const recoveriesBefore = this._communication_recoveries;
-        const target = this._nonzero_target(this._low + (this._high - this._low) * normalized, this._low, this._high);
-        const position = this._check_active(!this._fastPositions || this._clock() - this._snapshot_at >= .2 ? await this._read() : this._values, true);
+        const position = this._check_active(this._fastPositions ? await this._read_stream_guards() : await this._read(), true);
         // Encoder feedback arrives with each dedicated target reply. Allow 100 ms
         // of travel, capped at ten percent of the calibrated working range.
         const trackingLimit = Math.min((this._high - this._low) * .1, 1024 + RUN_MAX_VELOCITY * .1);
         if (!this._fastPositions) this._tracking_failures = Math.abs(position - this._target) > trackingLimit ? this._tracking_failures + 1 : 0;
         if (this._tracking_failures >= 3) throw new TransportError("Tracking error exceeded the motion budget for three fresh samples");
+        this._checkCancelled();
+        if (this._fastPositions) this._require_fresh_stream_guards();
+        // Resolve a live waveform only after the serial guard transaction, so
+        // its target uses the actual send time rather than a stale queued time.
+        if (resolveTarget) normalized = resolveTarget();
+        this._checkCancelled();
+        if (typeof normalized !== "number" || !Number.isFinite(normalized) || normalized < 0 || normalized > 1) throw new TransportError("Position must be finite and normalized0..1");
+        if (this._fastPositions) this._require_fresh_stream_guards();
+        const target = this._nonzero_target(this._low + (this._high - this._low) * normalized, this._low, this._high);
         try {
           if (this._fastPositions) {
             const rx = await this._exchange(io.fastPositionRequest(target), this._budget());
             this._values[22] = (rx[2] << 8) | rx[3]; this._values[23] = (rx[4] << 8) | rx[5];
             this._observed_at = this._clock();
             const actual = this._check_active(this._values, true);
-            this._tracking_failures = Math.abs(actual - this._target) > trackingLimit ? this._tracking_failures + 1 : 0;
+            // This fresh reply belongs to the current trajectory transaction.
+            // Comparing with the previous target adds a whole command interval
+            // of phase error even when the encoder follows the current curve.
+            this._tracking_failures = Math.abs(actual - target) > trackingLimit ? this._tracking_failures + 1 : 0;
             if (this._tracking_failures >= 3) throw new TransportError("Tracking error exceeded the motion budget for three fresh samples");
           } else await this._absolute(target, this._budget());
         }

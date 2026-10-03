@@ -30,6 +30,15 @@
     return Uint8Array.from([...data, crc & 255, crc >>> 8]);
   }
   function snapshotRequest() { return frame([1, 3, 0, 0, 0, 26]); }
+  // Fixed rotating guard groups cover the same registers as a full snapshot.
+  // Keeping each reply short avoids a 57-byte pause in the target stream.
+  const STATUS_GROUPS = [[0, 7], [7, 7], [14, 7], [21, 5]];
+  function statusRequest(start, count) {
+    if (!STATUS_GROUPS.some(([address, size]) => start === address && count === size)) {
+      throw new TransportError("Status read outside the fixed streaming guard groups.");
+    }
+    return frame([1, 3, 0, start, 0, count]);
+  }
   function validateCRC(data) {
     if (data.length < 5 || crc16(data.slice(0, -2)) !== (data.at(-2) | data.at(-1) << 8)) throw new TransportError("Response CRC mismatch.");
   }
@@ -42,13 +51,17 @@
     }
   }
   function parseSnapshot(value) {
+    return parseStatus(value, 26);
+  }
+  function parseStatus(value, count) {
+    if (![5, 7, 26].includes(count)) throw new TransportError("Invalid status register count.");
     const data = bytes(value);
-    if (data.length < 5 || data.length > 57) throw new TransportError("Snapshot response length is invalid.");
+    if (data.length < 5 || data.length > 5 + count * 2) throw new TransportError("Snapshot response length is invalid.");
     validateCRC(data);
     if (data[0] !== 1) throw new TransportError("Response slave mismatch.");
     exception(data, 3);
-    if (data[1] !== 3 || data[2] !== 52 || data.length !== 57) throw new TransportError("Snapshot function, byte count or length mismatch.");
-    return Array.from({ length: 26 }, (_, i) => data[3 + i * 2] * 256 + data[4 + i * 2]);
+    if (data[1] !== 3 || data[2] !== count * 2 || data.length !== 5 + count * 2) throw new TransportError("Snapshot function, byte count or length mismatch.");
+    return Array.from({ length: count }, (_, i) => data[3 + i * 2] * 256 + data[4 + i * 2]);
   }
   function signedWords(values, low) {
     if (!values || ![values[low], values[low + 1]].every(value => Number.isInteger(value) && value >= 0 && value <= 65535)) throw new TransportError("Missing or invalid position words.");
@@ -79,7 +92,8 @@
     validateCRC(tx);
     if (tx[0] === 1 && tx[1] === 0x7b && tx.length === 8 && tx.slice(2, 6).some(v => v !== 0)) return tx;
     if (tx[0] !== 1 || tx[2] !== 0) throw new TransportError("Only fixed slave 1 registers are supported.");
-    if (tx[1] === 3 && tx.length === 8 && tx[3] === 0 && tx[4] === 0 && tx[5] === 26) return tx;
+    if (tx[1] === 3 && tx.length === 8 && tx[4] === 0 &&
+        ((tx[3] === 0 && tx[5] === 26) || STATUS_GROUPS.some(([start, count]) => tx[3] === start && tx[5] === count))) return tx;
     if (tx[1] === 6 && tx.length === 8 && (CONFIG_REGISTERS.has(tx[3]) || (tx[3] === 1 && tx[4] === 0 && tx[5] <= 1))) return tx;
     if (tx[1] === 16 && tx.length === 13 && tx[4] === 0 && tx[5] === 2 && tx[6] === 4) {
       if (tx[3] === 12 && tx.slice(7, 11).every(value => value === 0)) return tx;
@@ -92,7 +106,7 @@
     if (rx[0] !== tx[0]) throw new TransportError("Response slave mismatch.");
     exception(rx, tx[1]);
     if (rx[1] !== tx[1]) throw new TransportError("Response function mismatch.");
-    if (tx[1] === 3) { parseSnapshot(rx); return rx; }
+    if (tx[1] === 3) { parseStatus(rx, tx[5]); return rx; }
     if (rx.length !== 8) throw new TransportError("Acknowledgement length mismatch.");
     if (tx[1] === 0x7b) return rx; // Reply contains encoder low word, then high word.
     // Output acknowledgements may contain pre-update status flags. The caller
@@ -209,17 +223,18 @@
         await delay(Math.max(1, Math.min(10, wakeAt - time)));
       }
     }
-    async exchange(value, timeoutSeconds = 0.15) {
+    async exchange(value, timeoutSeconds = 0.15, beforeWrite = null) {
       const tx = validateRequest(value);
+      if (beforeWrite !== null && typeof beforeWrite !== "function") throw new TransportError("Invalid pre-write guard.");
       if (!Number.isFinite(timeoutSeconds) || timeoutSeconds <= 0 || timeoutSeconds > 10) throw new TransportError("Invalid exchange timeout.");
       this._requireOpen();
       if (this._queued >= 8) throw new TransportError("Serial command queue is full.");
       this._queued++;
-      const operation = this._queue.then(() => this._exchange(tx, timeoutSeconds));
+      const operation = this._queue.then(() => this._exchange(tx, timeoutSeconds, beforeWrite));
       this._queue = operation.catch(() => {});
       try { return await operation; } finally { this._queued--; }
     }
-    async _exchange(tx, timeoutSeconds) {
+    async _exchange(tx, timeoutSeconds, beforeWrite) {
       this._requireOpen();
       // Drain late, unsolicited bytes between complete transactions. Never
       // discard or retry a response after this request has been written.
@@ -228,6 +243,9 @@
       // 3 ms exceeds the 3.5-character Modbus gap at 19200 baud.
       await this._resync(recovering ? 10 : 3);
       this._requireOpen();
+      // Stop can arrive while the quiet boundary is awaited. Recheck intent
+      // at the last synchronous boundary before the native write is submitted.
+      beforeWrite?.();
       const deadline = now() + timeoutSeconds * 1000;
       let writeSettled = false;
       const write = this._writer.write(tx);
@@ -253,8 +271,8 @@
         if (head[1] === (tx[1] | 0x80)) length = 5;
         else if (head[1] !== tx[1]) throw new TransportError("Response function mismatch.");
         else if (tx[1] === 3) {
-          if (head[2] !== 52) throw new TransportError("Snapshot byte count mismatch.");
-          length = 57;
+          if (head[2] !== tx[5] * 2) throw new TransportError("Snapshot byte count mismatch.");
+          length = 5 + tx[5] * 2;
         } else length = 8;
         const tail = await this._readExactly(length - 3, deadline);
         if (this._buffer.length) throw new TransportError("Unexpected trailing response bytes.");
@@ -302,5 +320,5 @@
       }
     }
   }
-  return { WebSerialConnection, TransportError, crc16, frame, snapshotRequest, parseSnapshot, signedPosition, pending, absoluteRequest, fastPositionRequest, outputRequest, configRequest };
+  return { WebSerialConnection, TransportError, crc16, frame, snapshotRequest, parseSnapshot, statusRequest, parseStatus, signedPosition, pending, absoluteRequest, fastPositionRequest, outputRequest, configRequest };
 });

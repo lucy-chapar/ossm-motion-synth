@@ -27,7 +27,7 @@ function fakeMotor({ stopConfirmed = true } = {}) {
     async poll_home() { calls.push("poll_home"); hw.homing = hw.owned = false; hw.homed = true; return this.status(); },
     async arm() { calls.push("arm"); hw.armed = true; return this.status(); },
     async start() { calls.push("start"); hw.running = hw.owned = true; hw.stop_confirmed = false; return this.status(); },
-    async command(position) { calls.push(["command", position]); return this.status(); },
+    async command(position) { calls.push(["command", typeof position === "function" ? position() : position]); return this.status(); },
     async stop() { calls.push("stop"); hw.running = hw.armed = hw.homing = false; hw.stop_confirmed = stopConfirmed; hw.owned = !stopConfirmed; return this.status(); },
     async close() { calls.push("close"); hw.connected = false; return this.status(); } };
 }
@@ -241,9 +241,92 @@ test("USB disconnect releases old transport and reconnect never starts motion", 
 test("reply recovery pauses time instead of faulting or generating catch-up targets", async () => {
  const motor=fakeMotor();motor.hw.homed=true;const env=setup({factory:()=>motor});
  await env.connect();await env.action('arm');await env.action('run');
- const command=motor.command.bind(motor);motor.command=async target=>{env.advance(.35);motor.hw.communication_recoveries=1;return command(target);};
+ const command=motor.command.bind(motor);motor.command=async target=>{const result=await command(target);env.advance(.35);motor.hw.communication_recoveries=1;return {...result,communication_recoveries:1};};
  env.advance(.1);await env.runtime.tick();env.advance(.02);await env.runtime.tick();
  assert.equal(env.runtime.state().fault,null);assert.equal(env.runtime.state().running,true);await env.runtime.close();
+});
+
+test("hardware targets are sampled after guard latency and paced from cycle deadlines", async () => {
+  const motor = fakeMotor(); motor.hw.homed = true;
+  const env = setup({factory: () => motor}), sent = [];
+  motor.command = async resolve => {
+    env.advance(.024); // Short status group, including adapter latency.
+    const position = resolve();
+    sent.push({time: env.time(), position, phase: env.runtime.state().signal.phase});
+    env.advance(.021); // Dedicated encoder reply.
+    return motor.status();
+  };
+  await env.connect(); await env.action("play");
+  for (let i = 0; i < 20; i++) {
+    env.advance(i ? .005 : .05);
+    await env.action("heartbeat"); await env.runtime.tick();
+  }
+  assert.equal(sent.length, 20);
+  for (let i = 0; i < sent.length; i++) {
+    assert.ok(Math.abs(sent[i].time - (.074 + i * .05)) < 1e-9);
+    assert.ok(Math.abs(sent[i].phase - ((sent[i].time * .25) % 1)) < 1e-9,
+      "waveform phase includes the guard read before generating this target");
+  }
+  env.advance(.004); await env.runtime.tick();
+  assert.equal(sent.length, 20, "no early target while the next deadline is pending");
+  await env.runtime.close();
+});
+
+test("a delayed guard cannot generate a catch-up target past the motion deadline", async () => {
+  const motor = fakeMotor(); motor.hw.homed = true;
+  const env = setup({factory: () => motor}); let generated = 0;
+  motor.command = async resolve => { env.advance(.26); resolve(); generated++; return motor.status(); };
+  await env.connect(); await env.action("play");
+  env.advance(.05); await env.runtime.tick();
+  assert.equal(generated, 0);
+  assert.match(env.runtime.state().fault, /scheduling deadline/);
+  assert.equal(env.runtime.state().running, false);
+  assert.ok(motor.calls.includes("stop"));
+  await env.runtime.close();
+});
+
+test("read recovery cannot bypass the pre-target motion deadline", async () => {
+  const motor = fakeMotor(); motor.hw.homed = true;
+  const env = setup({factory: () => motor}); let generated = 0;
+  motor.command = async resolve => {
+    env.advance(.35); motor.hw.communication_recoveries = 1;
+    resolve(); generated++; return motor.status();
+  };
+  await env.connect(); await env.action("play");
+  env.advance(.05); await env.runtime.tick();
+  assert.equal(generated, 0);
+  assert.match(env.runtime.state().fault, /scheduling deadline/);
+  await env.runtime.close();
+});
+
+test("heartbeat is checked again after the guard read and before a target", async () => {
+  const motor = fakeMotor(); motor.hw.homed = true;
+  const env = setup({factory: () => motor}); let generated = 0;
+  motor.command = async resolve => { env.advance(.1); resolve(); generated++; return motor.status(); };
+  await env.connect(); await env.action("play");
+  for (let i = 0; i < 14; i++) {
+    env.advance(.1); await env.runtime.tick();
+    if (env.runtime.state().fault) break;
+  }
+  assert.match(env.runtime.state().fault, /heartbeat/);
+  assert.equal(env.runtime.state().running, false);
+  await env.runtime.close();
+});
+
+test("Stop during a guard read fences the target resolver", async () => {
+  const motor = fakeMotor(); motor.hw.homed = true;
+  const env = setup({factory: () => motor}); let finishGuard, generated = 0;
+  motor.command = async resolve => {
+    await new Promise(done => { finishGuard = done; });
+    resolve(); generated++; return motor.status();
+  };
+  await env.connect(); await env.action("play");
+  env.advance(.05); const ticking = env.runtime.tick(); await new Promise(setImmediate);
+  const stopped = env.runtime.stop(); finishGuard(); await ticking; await stopped;
+  assert.equal(generated, 0);
+  assert.equal(env.runtime.state().running, false);
+  assert.equal(env.runtime.state().fault, null);
+  await env.runtime.close();
 });
 
 

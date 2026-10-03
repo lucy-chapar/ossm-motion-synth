@@ -211,8 +211,16 @@ retains 3822 counts/s and 8192 counts/s². It bounds position, speed and acceler
 produce different requested and planned traces, and drive interpolation is
 not modeled. Physical performance is not established by the simulation.
 
-Hardware target/feedback cycles run at most 10 Hz, independent of browser
-animation. Browser runs continue until Stop, a disconnect or a monitored fault. The browser allows 200 ms per 19200-baud transaction; a fast UI or oscillator does not imply high motor bandwidth.
+Browser target cycles use 50 ms wall-clock deadlines (20 Hz), independent of
+animation. Each cycle reads one short group of status registers before generating
+the current position target; the four groups cover every register checked by the
+earlier full snapshots. A guard group older than 250 ms prevents the next target.
+Connect, Home, arming and Stop still use complete snapshots. The planner advances
+the waveform and modulation in steps of at most 2 ms internally and sends only
+the final current target. Delays never create a queue of missed positions.
+The optional Python bridge retains its 10 Hz hardware cycle. Browser runs continue
+until Stop, a disconnect or a monitored fault. The browser allows 200 ms per
+19200-baud transaction; a fast UI or oscillator does not imply high motor bandwidth.
 Browser tracking error beyond one command interval of travel plus 1024 counts,
 capped at ten percent of the working span, for three fresh samples, drive faults, configuration
 changes, persistent communication failures and missed scheduling deadlines latch a fault.

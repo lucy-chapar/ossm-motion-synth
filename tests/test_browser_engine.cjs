@@ -241,3 +241,78 @@ test("tracking remains bounded through abrupt waveform and rate changes",()=>{
   assert.ok(Math.abs(s.velocity-previous)<=12*.02+1e-8);previous=s.velocity;
  }
 });
+
+test("feasible fast sine strokes preserve amplitude through irregular serial intervals", () => {
+  const spanMm = 179.7;
+  const intervals = [.0215, .020, .025, .019, .0748, .020, .022, .020, .0641, .0215];
+  for (const [rate_hz, stroke] of [[1.5, .7], [2.5, .3]]) {
+    const engine = new Engine({rate_hz, stroke});
+    engine.reset({position: .5, vmax: 1080 / spanMm, amax: 6000 / spanMm});
+    let elapsed = 0, index = 0, previousVelocity = 0;
+    let requestedLow = 1, requestedHigh = 0, commandLow = 1, commandHigh = 0;
+    let squaredError = 0, sampleCount = 0;
+    while (elapsed < 16) {
+      const dt = intervals[index++ % intervals.length];
+      elapsed += dt;
+      const signal = engine.step(dt, {running: true, tracking: true});
+      assert.ok(signal.command >= .1 && signal.command <= .9);
+      assert.ok(Math.abs(signal.velocity) <= engine.trajectory.vmax + 1e-9);
+      assert.ok(Math.abs(signal.velocity - previousVelocity) <= engine.trajectory.amax * dt + 1e-8);
+      const stopping = signal.command + signal.velocity * Math.abs(signal.velocity) / (2 * engine.trajectory.amax);
+      assert.ok(stopping >= .1 - 1e-9 && stopping <= .9 + 1e-9);
+      previousVelocity = signal.velocity;
+      if (elapsed < 3) continue; // Startup begins at rest, then settles into the waveform.
+      requestedLow = Math.min(requestedLow, signal.requested);
+      requestedHigh = Math.max(requestedHigh, signal.requested);
+      commandLow = Math.min(commandLow, signal.command);
+      commandHigh = Math.max(commandHigh, signal.command);
+      squaredError += (signal.command - signal.requested) ** 2;
+      sampleCount++;
+    }
+    const requestedSpan = requestedHigh - requestedLow, commandSpan = commandHigh - commandLow;
+    const rms = Math.sqrt(squaredError / sampleCount);
+    assert.ok(Math.abs(commandSpan - requestedSpan) < requestedSpan * .01,
+      `${rate_hz} Hz amplitude error ${(commandSpan - requestedSpan) * spanMm} mm`);
+    assert.ok(rms < .0025, `${rate_hz} Hz tracking RMS ${rms * spanMm} mm`);
+  }
+});
+
+test("hardware waveform and modulation follow the same time path across long and fine updates", () => {
+  const params = {rate_hz: 1.5, stroke: .7, lfo_rate_hz: .3, attack_s: .4, release_s: .6,
+    env_to_stroke: true, patches: [{source: "lfo", target: "rate", depth: .2},
+      {source: "lfo", target: "center", depth: .15}]};
+  const coarse = new Engine(params), fine = new Engine(params);
+  for (const engine of [coarse, fine]) engine.reset({position: .5, vmax: 6, amax: 33});
+  const intervals = [.020, .075, .0215, .0641, .019];
+  for (let index = 0; index < 100; index++) {
+    const dt = intervals[index % intervals.length], gate = index < 50;
+    const signal = coarse.step(dt, {gate, running: true, tracking: true});
+    const count = Math.ceil(dt / .001);
+    let reference;
+    for (let step = 0; step < count; step++) reference = fine.step(dt / count, {gate, running: true, tracking: true});
+    near(signal.phase, reference.phase, "modulated carrier phase", .00001);
+    near(signal.lfo, reference.lfo, "LFO", .00001);
+    near(signal.envelope, reference.envelope, "envelope", .00001);
+    near(signal.requested, reference.requested, "modulated request", .0001);
+    near(signal.command, reference.command, "modulated command", .003);
+  }
+});
+
+test("long hardware tracking updates retain stopping bounds through discontinuities", () => {
+  const engine = new Engine();
+  engine.reset({position: .5, vmax: 2, amax: 12});
+  const intervals = [.020, .075, .0215, .0641, .019];
+  let previousVelocity = 0;
+  for (let index = 0; index < 1500; index++) {
+    if (index % 100 === 0) engine.configure({shape: ["sine", "square", "saw", "triangle"][(index / 100) % 4],
+      rate_hz: index % 200 ? 4 : .02, stroke: 1, center: index % 200 ? .8 : .2});
+    const dt = intervals[index % intervals.length];
+    const signal = engine.step(dt, {running: true, tracking: true});
+    assert.ok(signal.command >= .1 && signal.command <= .9);
+    assert.ok(Math.abs(signal.velocity) <= 2 + 1e-9);
+    assert.ok(Math.abs(signal.velocity - previousVelocity) <= 12 * dt + 1e-8);
+    const stopping = signal.command + signal.velocity * Math.abs(signal.velocity) / 24;
+    assert.ok(stopping >= .1 - 1e-9 && stopping <= .9 + 1e-9);
+    previousVelocity = signal.velocity;
+  }
+});

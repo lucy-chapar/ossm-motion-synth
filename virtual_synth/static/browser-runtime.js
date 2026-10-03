@@ -9,6 +9,9 @@
   if (typeof module === "object" && module.exports) module.exports = exported;
   else root.MotionBrowserRuntime = exported.createRuntime();
 })(globalThis, (engineAPI) => {
+  // At 19200 baud a short guard read plus a target fits this cycle without
+  // alternating fast bursts and long full-status stalls.
+  const HARDWARE_PERIOD = .05;
   const copy = (value) => structuredClone(value);
   const spanOf = (hw) => {
     const bounds = hw.raw_bounds;
@@ -40,6 +43,7 @@
     let mode = "simulation", armed = false, running = false, gate = false, fault = null;
     let unconfirmedStop = false, stoppingCount = 0, revision = 0, epoch = 0, busy = false, closed = false;
     let lastTick = clock(), began = lastTick, lastIO = lastTick, lastHeartbeat = lastTick;
+    let nextTargetCycle = lastTick + HARDWARE_PERIOD;
     let signal = engine.step(0, { gate: false, running: false }), history = [];
     let chain = Promise.resolve();
     let timer = null;
@@ -113,22 +117,46 @@
       if ((armed || activeHome) && now - lastHeartbeat > 1.5) await fail("Control tab heartbeat expired. Output stopped; rearm explicitly.");
       else if ((running && dt > 0.25) || (activeHome && dt > 1)) await fail("Motion scheduling deadline missed. No catch-up targets were sent.");
       signal = engine.step(paused ? 0 : Math.min(dt, 0.25), { gate, running, tracking: mode === "hardware" });
-      if (transport && now - lastIO >= (running ? 0.015 : homing().active ? 0.1 : 0.5)) {
+      if (transport && (running ? now + 1e-9 >= nextTargetCycle : now - lastIO >= (homing().active ? 0.1 : 0.5))) {
         lastIO = now;
         const ioEpoch = epoch, recoveriesBefore = transport.status().communication_recoveries || 0;
         try {
           if (homing().active) {
             lastHardware = await transport.poll_home();
             if (!lastHardware.homing && lastHardware.fault) await fail(`Sensorless homing: ${lastHardware.fault}`);
-          } else if (running) lastHardware = await transport.command(signal.command);
+          } else if (running) {
+            // A guard read can take tens of milliseconds. Sample the trajectory
+            // after that read, immediately before submitting the current target.
+            lastHardware = await transport.command(() => {
+              if (ioEpoch !== epoch || !running) throw new Error("Output stopped before target generation.");
+              const sampledAt = clock(), elapsed = sampledAt - lastTick;
+              if (sampledAt - lastHeartbeat > 1.5) throw new Error("Control tab heartbeat expired before target generation.");
+              if (!Number.isFinite(elapsed) || elapsed < 0 || elapsed > .25) {
+                throw new Error("Motion scheduling deadline missed. No catch-up targets were sent.");
+              }
+              if ((transport.status().communication_recoveries || 0) > recoveriesBefore) {
+                lastTick = sampledAt;
+                return signal.command;
+              }
+              signal = engine.step(elapsed, { gate, running: true, tracking: true });
+              lastTick = sampledAt;
+              return signal.command;
+            });
+            // Keep wall-clock cycle deadlines; never wait a whole period AFTER
+            // I/O or queue missed targets when a transaction runs long.
+            nextTargetCycle = Math.max(nextTargetCycle + HARDWARE_PERIOD, clock());
+          }
           else if (transport.status().connected && !fault) lastHardware = await transport.snapshot();
           // A bounded recovery pauses the planner. Do not advance through the
           // missed interval or send catch-up targets afterward.
-          if ((lastHardware?.communication_recoveries || 0) > recoveriesBefore) lastTick = lastIO = clock();
+          if ((lastHardware?.communication_recoveries || 0) > recoveriesBefore) {
+            lastTick = lastIO = clock();
+            nextTargetCycle = lastTick + HARDWARE_PERIOD;
+          }
         } catch (error) { if (ioEpoch === epoch) await fail(`RS485: ${error.message || error}`); }
       }
       const hw = hardware();
-      history.push({ t: Math.round((now - began) * 1e4) / 1e4, requested: signal.requested, command: signal.command,
+      history.push({ t: Math.round((lastTick - began) * 1e4) / 1e4, requested: signal.requested, command: signal.command,
         actual: mode === "hardware" && hw && !fault ? hw.position_normalized ?? null : null, envelope: signal.envelope });
       if (history.length > 500) history.shift();
     }
@@ -223,6 +251,7 @@
           } catch (error) { await motionError("Cannot resume", error); }
         }
         paused = false; armed = running = true; lastTick = lastIO = lastHeartbeat = clock();
+        nextTargetCycle = lastTick + HARDWARE_PERIOD;
       } else if (name === "run") {
         if (!armed || running || fault) throw new Error("Arm a stopped, healthy synth before running.");
         if (transport) {
@@ -232,6 +261,7 @@
           } catch (error) { await motionError("Cannot start", error); }
         }
         running = true; lastTick = lastIO = lastHeartbeat = clock();
+        nextTargetCycle = lastTick + HARDWARE_PERIOD;
       } else if (name === "gate") {
         if (typeof payload.value !== "boolean") throw new Error("Gate must be true or false.");
         if (payload.value && (!armed || !running || fault)) throw new Error("Start the armed synth before opening the envelope gate.");
@@ -331,9 +361,18 @@
     }
     serial?.addEventListener?.("disconnect", onDisconnect);
     serial?.addEventListener?.("connect", onConnect);
-    if (options.autoStart !== false) timer = setInterval(tick, 10);
+    async function automaticTick() {
+      try { await tick(); }
+      finally {
+        if (!closed) {
+          const seconds = mode === "hardware" && running && !busy ? Math.max(.001, nextTargetCycle - clock()) : .01;
+          timer = setTimeout(automaticTick, seconds * 1000);
+        }
+      }
+    }
+    if (options.autoStart !== false) timer = setTimeout(automaticTick, 10);
     return { request, choosePort, autoConnect, tick, state, stop, supported,
-      async close() { closed = true; clearInterval(timer); await stop(); if (transport) await transport.close(); serial?.removeEventListener?.("disconnect", onDisconnect); serial?.removeEventListener?.("connect", onConnect); } };
+      async close() { closed = true; clearTimeout(timer); await stop(); if (transport) await transport.close(); serial?.removeEventListener?.("disconnect", onDisconnect); serial?.removeEventListener?.("connect", onConnect); } };
   }
   return { createRuntime };
 });

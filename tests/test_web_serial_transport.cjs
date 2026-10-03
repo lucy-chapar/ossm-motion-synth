@@ -34,16 +34,19 @@ class FakeConnection {
   remaining(value) { this.values[12] = value & 65535; this.values[13] = value >>> 16 & 65535; }
   async open() { this.openCount++; this.opened = true; }
   async close() { this.closeCount++; this.opened = false; }
-  async exchange(request, timeout) {
+  async exchange(request, timeout, beforeWrite = null) {
     assert.equal(this.opened, true, "exchange requires an open fake connection");
     assert.ok(timeout > 0 && timeout <= .5);
     const tx = Uint8Array.from(request);
     assert.equal(crc16(tx.slice(0, -2)), tx.at(-2) | tx.at(-1) << 8);
     assert.equal(tx[0], 1);
+    beforeWrite?.();
     this.transmissions.push(tx);
     this.maxActive = Math.max(this.maxActive, ++this.active);
     try {
       if (tx[1] === 3) {
+        const start = tx[2] << 8 | tx[3], count = tx[4] << 8 | tx[5];
+        assert.ok([[0, 26], [0, 7], [7, 7], [14, 7], [21, 5]].some(([s, n]) => s === start && n === count));
         this.readCount++;
         if (this.nativeActive) {
           this.nativeReads++;
@@ -54,17 +57,22 @@ class FakeConnection {
           if (this.onNative) await this.onNative(this);
         }
         if (this.onRead) {
-          const replacement = await this.onRead(this);
+          const replacement = await this.onRead(this, tx);
           if (replacement !== undefined) return replacement;
         }
-        return frame([1, 3, 52, ...this.values.flatMap(value => [value >>> 8, value & 255])]);
+        return frame([1, 3, count * 2, ...this.values.slice(start, start + count).flatMap(value => [value >>> 8, value & 255])]);
       }
       if (tx[1] === 0x7b) {
         const target = (tx[2] << 24) | (tx[3] << 16) | (tx[4] << 8) | tx[5];
         this.target = target; this.destinations.push(target); this.commands.push("absolute");
         const actual = this.values[22] | this.values[23] << 16;
         this.position(target); this.remaining(0);
-        return frame([1, 0x7b, actual >>> 8 & 255, actual & 255, actual >>> 24 & 255, actual >>> 16 & 255]);
+        let reply = frame([1, 0x7b, actual >>> 8 & 255, actual & 255, actual >>> 24 & 255, actual >>> 16 & 255]);
+        if (this.onCommand) {
+          const replacement = await this.onCommand(this, "absolute", tx, this.values[1]);
+          if (replacement !== undefined) reply = replacement;
+        }
+        return reply;
       }
       const register = tx[2] << 8 | tx[3];
       let reply, operation;
@@ -1476,17 +1484,159 @@ test("stop allows delayed mechanical settling without resending motion", async (
 });
 
 
-test("fast stream uses encoder replies and retains periodic full status checks", async () => {
- const {transport,motor,clock}=await running({fastPositions:true});
- const before=motor.readCount;
- await transport.command(.51); await clock.wait(.04); await transport.command(.52);
- assert.equal(motor.readCount,before);
- assert.ok(motor.transmissions.some(tx=>tx[1]===0x7b));
- await clock.wait(.2); await transport.command(.53);
- assert.equal(motor.readCount,before+1);
- motor.values[14]=1; await clock.wait(.21);
- await assert.rejects(transport.command(.54));
- assert.equal(transport.status().running,false); await transport.close();
+test("fast stream interleaves every guard group and uses encoder replies", async () => {
+  const {transport, motor, clock} = await running({fastPositions:true});
+  const before = motor.transmissions.length;
+  for (let i = 0; i < 8; i++) {
+    if (i) await clock.wait(.05);
+    const result = await transport.command(.5 + .001 * i);
+    assert.equal(result.position_raw, i ? motor.destinations[i - 1] : 20000);
+    assert.ok(result.status_check_age_s <= .2 + 1e-9);
+  }
+  const streamed = motor.transmissions.slice(before);
+  assert.deepEqual(streamed.filter(tx => tx[1] === 3).map(tx => [tx[3], tx[5]]),
+    [[0,7], [7,7], [14,7], [21,5], [0,7], [7,7], [14,7], [21,5]]);
+  assert.deepEqual(streamed.map(tx => tx[1]), Array.from({length:8}, () => [3, 0x7b]).flat());
+  await transport.stop();
+  assert.ok(motor.transmissions.slice(before + streamed.length).filter(tx => tx[1] === 3).every(tx => tx[3] === 0 && tx[5] === 26));
+  await transport.close();
+});
+
+test("fast reply tracking compares the current trajectory point when motion advances beyond ten percent per cycle", async () => {
+  const {transport, motor, clock} = await running({fastPositions:true});
+  // A 140 mm working span, with 23.1 mm of smooth travel per 50 ms. This
+  // stays below the configured speed ceiling but exceeds the 14 mm tracking
+  // tolerance relative to a point from the preceding command interval.
+  transport._low = 20000 - 57344; transport._high = 20000 + 57344;
+  for (const normalized of [.665, .83, .995]) {
+    await clock.wait(.05);
+    const position = Math.round(transport._low + (transport._high - transport._low) * normalized);
+    // Fresh feedback represents a servo following the current waveform as
+    // time advances, rather than an instantaneous response to the new write.
+    motor.onRead = m => { m.position(position); };
+    const result = await transport.command(normalized);
+    assert.equal(result.position_raw, position); assert.equal(result.fault, null);
+    assert.equal(result.running, true);
+  }
+  motor.onRead = null; assert.equal(motor.destinations.length, 3);
+  await transport.stop(); await transport.close();
+});
+
+test("one-cycle-old fast encoder feedback still faults at the unchanged current tracking tolerance", async () => {
+  const {transport, motor, clock} = await running({fastPositions:true});
+  transport._low = 20000 - 57344; transport._high = 20000 + 57344;
+  // The default fake reports the preceding target. At this cadence that is
+  // persistently 23.1 mm behind the current trajectory, beyond the same 14 mm
+  // threshold used above. A previous-target comparison would miss all three.
+  await clock.wait(.05); await transport.command(.665);
+  await clock.wait(.05); await transport.command(.83);
+  await clock.wait(.05);
+  await assert.rejects(transport.command(.995), /Tracking error exceeded/);
+  assert.equal(motor.destinations.length, 3); assert.equal(transport.status().stop_confirmed, true);
+  await transport.close();
+});
+
+test("each streamed guard detects configuration, output and alarm changes before resolving a target", async () => {
+  for (const [group, register, value] of [[0,4,1], [0,1,0], [1,8,1], [1,10,1], [2,14,1], [2,20,1], [3,21,2], [3,24,1], [3,25,1]]) {
+    const {transport, motor, clock} = await running({fastPositions:true});
+    for (let i = 0; i < group; i++) { await transport.command(.5); await clock.wait(.05); }
+    const original = motor.values[register], before = motor.destinations.length;
+    motor.values[register] = value; let resolved = false;
+    await assert.rejects(transport.command(() => { resolved = true; return .51; }), /Require|configuration changed/);
+    assert.equal(resolved, false); assert.equal(motor.destinations.length, before);
+    assert.equal(transport.status().running, false);
+    motor.values[register] = original; motor.values[1] = 0;
+    await transport.stop(); await transport.close();
+  }
+});
+
+test("a stalled streamed cycle refuses stale guard data before evaluating or writing a target", async () => {
+  const {transport, motor, clock} = await running({fastPositions:true});
+  await transport.command(.5); await clock.wait(.251); let resolved = false;
+  await assert.rejects(transport.command(() => { resolved = true; return .51; }), /status checks are stale/);
+  assert.equal(resolved, false); assert.equal(motor.destinations.length, 1);
+  assert.equal(transport.status().stop_confirmed, true); await transport.close();
+});
+
+test("a live streamed target is resolved after guard latency and immediately before its write", async () => {
+  const {transport, motor, clock} = await running({fastPositions:true});
+  const began = clock.now(); let resolvedAt = null;
+  motor.onRead = async () => { motor.onRead = null; await clock.wait(.035); };
+  await transport.command(() => { resolvedAt = clock.now(); return .51; });
+  assert.equal(resolvedAt, began + .035); assert.equal(motor.destinations.length, 1);
+  await transport.stop(); await transport.close();
+});
+
+test("Stop cancels a blocked streamed guard read and queued target resolvers", async () => {
+  const {transport, motor} = await running({fastPositions:true});
+  const entered = deferred(), release = deferred(); let resolved = 0;
+  motor.onRead = async () => { motor.onRead = null; entered.resolve(); await release.promise; };
+  const active = assert.rejects(transport.command(() => { resolved++; return .51; }), /cancel/i);
+  await entered.promise;
+  const queued = assert.rejects(transport.command(() => { resolved++; return .52; }), /cancel/i);
+  const stopping = transport.stop(); release.resolve();
+  await Promise.all([active, queued, stopping]);
+  assert.equal(resolved, 0); assert.deepEqual(motor.destinations, []);
+  assert.equal(transport.status().fault, null); assert.equal(transport.status().stop_confirmed, true);
+  await transport.close();
+});
+
+test("streamed guard read recovery checks a complete snapshot before sending a current target", async () => {
+  const {transport, motor} = await running({fastPositions:true});
+  const before = motor.transmissions.length;
+  motor.onRead = () => { motor.onRead = null; throw droppedReply(); };
+  const result = await transport.command(.51);
+  assert.equal(result.communication_recoveries, 1); assert.equal(result.running, true);
+  assert.deepEqual(motor.transmissions.slice(before).map(tx => [tx[1], tx[1] === 3 ? tx[5] : null]), [[3,7], [3,26], [0x7b,null]]);
+  assert.equal(motor.destinations.length, 1); await transport.stop(); await transport.close();
+});
+
+test("streamed recovery refuses changes discovered by its full read-only snapshot", async () => {
+  const {transport, motor} = await running({fastPositions:true}); let resolved = false;
+  motor.onRead = m => { motor.onRead = null; m.values[14] = 1; throw droppedReply(); };
+  await assert.rejects(transport.command(() => { resolved = true; return .51; }), /Require/);
+  assert.equal(resolved, false); assert.deepEqual(motor.destinations, []);
+  motor.values[14] = 0; await transport.stop(); await transport.close();
+});
+
+test("repeated streamed guard recovery faults after three target cycles", async () => {
+  const {transport, motor, clock} = await running({fastPositions:true});
+  motor.onRead = (_, tx) => { if (tx[5] !== 26) throw droppedReply(); };
+  await transport.command(.5); await clock.wait(.05); await transport.command(.5); await clock.wait(.05);
+  await assert.rejects(transport.command(.5), /Communication remained unstable/);
+  assert.equal(motor.destinations.length, 3); assert.equal(transport.status().communication_recoveries, 3);
+  assert.equal(transport.status().stop_confirmed, true); await transport.close();
+});
+
+test("a slow or asynchronous streamed target resolver cannot send an unchecked target", async () => {
+  for (const asynchronous of [false, true]) {
+    const {transport, motor, clock} = await running({fastPositions:true});
+    await assert.rejects(transport.command(asynchronous ? async () => .51 : () => { clock.elapsed += .251; return .51; }),
+      asynchronous ? /Position must be finite/ : /status checks are stale/);
+    assert.deepEqual(motor.destinations, []); assert.equal(transport.status().stop_confirmed, true);
+    await transport.close();
+  }
+});
+
+test("serial waiting cannot let guard data expire before the native target write", async () => {
+  const {transport, motor, clock} = await running({fastPositions:true});
+  const exchange = motor.exchange.bind(motor);
+  motor.exchange = async (request, timeout, beforeWrite) => {
+    if (request[1] === 0x7b) await clock.wait(.251);
+    return exchange(request, timeout, beforeWrite);
+  };
+  await assert.rejects(transport.command(.51), /status checks are stale/);
+  assert.deepEqual(motor.destinations, []);
+  assert.equal(transport.status().stop_confirmed, true); await transport.close();
+});
+
+test("lost streamed target replies recover without retransmitting and fault after three cycles", async () => {
+  const {transport, motor, clock} = await running({fastPositions:true});
+  motor.onCommand = (_, operation) => { if (operation === "absolute") throw droppedReply(); };
+  await transport.command(.5); await clock.wait(.05); await transport.command(.5); await clock.wait(.05);
+  await assert.rejects(transport.command(.5), /Communication remained unstable/);
+  assert.equal(motor.destinations.length, 3); assert.equal(transport.status().communication_recoveries, 3);
+  assert.equal(transport.status().stop_confirmed, true); await transport.close();
 });
 
 test("stop accepts sub-tenth-millimetre disabled settling but rejects continuing drift",async()=>{

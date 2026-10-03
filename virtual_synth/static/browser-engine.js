@@ -178,8 +178,12 @@
       const feed = Math.abs(target - from) <= this.vmax * dt * 1.5 ? (target - from) / dt : 0;
       const count = Math.ceil(dt / .002), h = dt / count;
       for (let i = 0; i < count; i++) {
-        const reference = from + (target - from) * (i + 1) / count;
-        let wanted = clamp(feed + 6 * (reference - this.position), -this.vmax, this.vmax);
+        // Compare reference and planner position at the same midpoint. An
+        // end-of-step reference against the start position adds a false error
+        // proportional to velocity and makes a feasible waveform overshoot.
+        const reference = from + (target - from) * (i + .5) / count;
+        const predicted = this.position + this.velocity * h / 2;
+        let wanted = clamp(feed + 6 * (reference - predicted), -this.vmax, this.vmax);
         // Brake before a rail boundary, with one integration-step margin.
         const upper = Math.max(0, Math.sqrt(2 * this.amax * Math.max(0, this.high - this.position)) - this.amax * h);
         const lower = Math.max(0, Math.sqrt(2 * this.amax * Math.max(0, this.position - this.low)) - this.amax * h);
@@ -189,7 +193,8 @@
         const stopping = position + next * Math.abs(next) / (2 * this.amax);
         if (position < this.low || position > this.high || stopping < this.low || stopping > this.high) {
           // The exact bounded point planner handles a discontinuity near a limit.
-          this.update(clamp(reference, this.low, this.high), h);
+          const endpoint = from + (target - from) * (i + 1) / count;
+          this.update(clamp(endpoint, this.low, this.high), h);
         } else { this.position = position; this.velocity = next; }
       }
       this.trackingTarget = target;
@@ -276,6 +281,20 @@
       if (typeof gate !== "boolean" || typeof running !== "boolean" || typeof tracking !== "boolean") {
         throw new TypeError("gate and running must be booleans");
       }
+      if (running && tracking && dt > .002) {
+        // Serial/status reads make browser updates uneven. Advance the entire
+        // waveform and its modulation at the planner's resolution, rather than
+        // interpolating one long chord across a curved waveform. This sends
+        // only the final current command; it creates no serial catch-up queue.
+        const count = Math.ceil(dt / .002), h = dt / count;
+        let signal;
+        for (let i = 0; i < count; i++) signal = this._step(h, gate, running, tracking);
+        return signal;
+      }
+      return this._step(dt, gate, running, tracking);
+    }
+
+    _step(dt, gate, running, tracking) {
       const previous_rate = this._effective()[0];
       this.envelope = clamp(this.envelope + (gate ? dt / this.params.attack_s : -dt / this.params.release_s));
       this.lfo_phase = wrapped(this.lfo_phase + dt * this.params.lfo_rate_hz);

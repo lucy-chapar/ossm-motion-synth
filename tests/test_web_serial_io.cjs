@@ -74,6 +74,61 @@ test("snapshot parser decodes both signed words and rejects CRC, length and exce
   assert.throws(() => parseSnapshot(frame([2, 0x83, 2])), /slave/);
 });
 
+test("streaming guard reads validate fixed ranges and assemble short replies", async () => {
+  const port = new FakePort((tx, port) => {
+    const start = tx[3], count = tx[5];
+    const reply = frame([1, 3, count * 2, ...Array.from({length: count}, (_, i) => [0, start + i]).flat()]);
+    port.emit(reply.slice(0, 4)); port.emit(reply.slice(4));
+  });
+  const connection = new WebSerialConnection(port); await connection.open();
+  const registers = [];
+  for (const [start, count] of [[0, 7], [7, 7], [14, 7], [21, 5]]) {
+    const reply = await connection.exchange(io.statusRequest(start, count));
+    assert.equal(reply.length, 5 + 2 * count);
+    registers.push(...io.parseStatus(reply, count));
+    assert.throws(() => io.parseStatus(reply, count === 7 ? 5 : 7), /length|count/);
+  }
+  assert.deepEqual(registers, Array.from({length: 26}, (_, i) => i));
+  for (const range of [[0, 8], [1, 7], [21, 7], [0, 0], [-1, 7], ["0", 7]]) {
+    assert.throws(() => io.statusRequest(...range), /fixed/);
+    if (range.every(v => Number.isInteger(v) && v >= 0 && v <= 255)) {
+      await assert.rejects(connection.exchange(frame([1, 3, 0, range[0], 0, range[1]])), /protocol|byte|fixed/);
+    }
+  }
+  assert.equal(port.writes.length, 4);
+  await connection.close();
+});
+
+test("partial status count and CRC errors are rejected without retransmission", async () => {
+  for (const corrupt of ["count", "crc"]) {
+    const port = new FakePort((tx, port) => {
+      const reply = frame([1, 3, corrupt === "count" ? 10 : 14, ...Array(14).fill(0)]);
+      if (corrupt === "crc") reply[4] = 1;
+      port.emit(reply);
+    });
+    const connection = new WebSerialConnection(port); await connection.open();
+    await assert.rejects(connection.exchange(io.statusRequest(0, 7)), /byte count|CRC/);
+    assert.equal(port.writes.length, 1);
+    await connection.close();
+  }
+});
+
+test("Stop intent is checked after the quiet gap before submitting a native write", async () => {
+  const port = new FakePort(), connection = new WebSerialConnection(port);
+  await connection.open(); let stopped = false, checked = 0;
+  const pending = connection.exchange(io.fastPositionRequest(123), .2, () => {
+    checked++;
+    if (stopped) throw new TransportError("Operation cancelled by Stop.");
+  });
+  stopped = true;
+  await assert.rejects(pending, /cancelled/);
+  assert.equal(checked, 1);
+  assert.equal(port.writes.length, 0);
+  await connection.exchange(outputRequest("inhibit"));
+  assert.equal(port.writes.length, 1, "cancelled intent leaves independent inhibit available");
+  await connection.close();
+});
+
 test("fragmented response chunks assemble without repeating a request", async () => {
   const response = snapshot();
   const port = new FakePort(async (_, port) => {
