@@ -164,3 +164,25 @@ baud opening profiles, bounded read-only
 discovery, closing/cancellation failures, calibration invalidation, and selected
 cadence across Play/Pause/Resume/Stop. Python tests are retained from the earlier
 run, not rerun for these JavaScript changes.
+
+## Watched slow sine after restart
+
+With the user watching the carriage, fresh direct Home measured 181.57 nominal
+mm of travel and parked at center with output inhibited. One ten-second sine
+at 0.25 Hz / 30% stroke then ran using the 2000 RPM/s ramped profile at 19200
+baud. The user confirmed: "Moves smoothly."
+
+The run accepted 199 targets. After excluding startup, the planned span was
+42.610 nominal mm and encoder span 42.557 mm; encoder lag relative to the
+preceding target was 0.499 mm RMS and 0.918 mm at the 95th percentile. Target
+intervals were 49.93 ms median, 53.55 ms at the 95th percentile, and 57.27 ms
+maximum. Complete guard-plus-target cycles were 39.77 ms median and 51.89 ms
+maximum, leaving no evidence for increasing cadence at this baud.
+
+There were no transaction errors or communication recoveries. Final Stop was
+confirmed with output, pending demand, PWM, actual speed and alarm all zero.
+The serial connection was closed and released. This watched result confirms
+smooth visible movement for this slow pattern; faster patterns, a live browser
+event loop, and 115200 operation remain unverified. No baud commissioning
+sequence was transmitted. Browser source was unchanged for this test, so the
+206-test pass above is retained rather than rerun.
