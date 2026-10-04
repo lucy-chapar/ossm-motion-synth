@@ -401,62 +401,85 @@ test("reconnecting read-only discards previous Home calibration and stopped feed
   assertReadOnlyProbes(new Map([[19200,motor]])); await transport.close();
 });
 
-test("motion profiles retain streaming defaults and expose the bounded ramped acceleration", () => {
-  const streaming = make().transport.status(), ramped = make({motionProfile:"ramped"}).transport.status();
-  assert.equal(streaming.motion_profile, "streaming"); assert.equal(ramped.motion_profile, "ramped");
-  assert.equal(streaming.max_acceleration_raw_s2, 6000 * 32768 / 40);
-  assert.equal(ramped.max_acceleration_raw_s2, 1200 * 32768 / 40);
-  assert.equal(ramped.max_velocity_raw_s, streaming.max_velocity_raw_s);
-  assert.equal(ramped.max_velocity_raw_s, 32768 * 1800 / 60 * .9);
+const MOTION_PROFILE_CASES = [["streaming",60098,6000], ["ramped",2000,1200], ["servo_ramped",20000,6000]];
+
+test("motion profiles retain streaming defaults and independent host acceleration budgets", () => {
+  const streaming = make().transport.status();
+  assert.equal(streaming.motion_profile, "streaming");
+  for (const [motionProfile, , accelerationMmS2] of MOTION_PROFILE_CASES) {
+    const result = make({motionProfile}).transport.status();
+    assert.equal(result.motion_profile, motionProfile);
+    assert.equal(result.max_acceleration_raw_s2, accelerationMmS2 * 32768 / 40);
+    assert.equal(result.max_velocity_raw_s, streaming.max_velocity_raw_s);
+    assert.equal(result.max_velocity_raw_s, 32768 * 1800 / 60 * .9);
+  }
   for (const motionProfile of ["", "fast", "constructor", "toString", null, 2000, {}]) {
     const motor = new FakeConnection();
-    assert.throws(() => make({motor, motionProfile}), /Motion profile must be streaming or ramped/);
+    assert.throws(() => make({motor, motionProfile}), /Motion profile must be streaming, ramped, or servo_ramped/);
     assert.equal(motor.openCount, 0); assert.deepEqual(motor.transmissions, []);
   }
 });
 
 test("each motion profile requires its exact drive acceleration before arming", async () => {
-  for (const [motionProfile, acceleration, expected] of [["streaming",2000,60098], ["ramped",60098,2000]]) {
-    const motor = new FakeConnection(); motor.values[3] = acceleration;
-    const {transport} = make({motor, motionProfile});
-    await transport.connect(); await assert.rejects(transport.arm(), new RegExp(`speed/acceleration1800/${expected}`));
-    assert.deepEqual(motor.commands, []); assert.deepEqual(motor.settings, []); await transport.close();
+  for (const [motionProfile, expected] of MOTION_PROFILE_CASES) {
+    for (const [, acceleration] of MOTION_PROFILE_CASES) {
+      if (acceleration === expected) continue;
+      const motor = new FakeConnection(); motor.values[3] = acceleration;
+      const {transport} = make({motor, motionProfile});
+      await transport.connect(); await assert.rejects(transport.arm(), new RegExp(`speed/acceleration1800/${expected}`));
+      assert.deepEqual(motor.commands, []); assert.deepEqual(motor.settings, []); await transport.close();
+    }
   }
-  const motor = new FakeConnection(); motor.values[3] = 2000;
-  const {transport} = await running({motor, motionProfile:"ramped", fastPositions:true});
-  assert.equal(transport.status().motion_profile, "ramped"); assert.equal(transport.status().acceleration_rpm_s, 2000);
-  motor.values[3] = 60098;
-  await assert.rejects(transport.command(.51), /speed\/acceleration1800\/2000/);
-  assert.deepEqual(motor.destinations, []);
-  motor.values[3] = 2000; await transport.stop(); await transport.close();
+  for (const [motionProfile, setting, accelerationMmS2] of MOTION_PROFILE_CASES) {
+    const motor = new FakeConnection(); motor.values[3] = setting;
+    const {transport} = await running({motor, motionProfile, fastPositions:true});
+    const result = transport.status();
+    assert.equal(result.motion_profile, motionProfile);
+    assert.equal(result.acceleration_setting_raw, setting);
+    assert.equal(result.acceleration_rpm_s, setting >= 60000 ? null : setting);
+    assert.equal(result.acceleration_mode, setting >= 60000 ? "position_feedforward" : "ramp");
+    assert.equal(result.max_acceleration_raw_s2, accelerationMmS2 * 32768 / 40);
+    motor.values[3] = setting === 60098 ? 20000 : 60098;
+    await assert.rejects(transport.command(.51), new RegExp(`speed/acceleration1800/${setting}`));
+    assert.deepEqual(motor.destinations, []);
+    motor.values[3] = setting; await transport.stop();
+    assert.equal(transport.status().stop_confirmed, true); assert.equal(motor.values[1], 0);
+    await transport.close();
+  }
 });
 
-test("successful Home restores the selected ramped profile before arming", async () => {
-  for (const nativeHome of [false, true]) {
+test("successful Home restores each selected profile before arming", async () => {
+  for (const [motionProfile, setting, accelerationMmS2] of MOTION_PROFILE_CASES) {
+   for (const nativeHome of [false, true]) {
     const simulatedMotor = new FakeConnection({native:true}); simulatedMotor.contacts = [-140563,23277];
-    const context = make({motor:simulatedMotor, motionProfile:"ramped", nativeHome});
+    const context = make({motor:simulatedMotor, motionProfile, nativeHome});
     const {transport, motor} = context;
     await transport.connect(); await transport.begin_home(); const result = await advance(context);
     assert.equal(result.homed, true); assert.equal(result.stop_confirmed, true);
-    assert.equal(result.motion_profile, "ramped"); assert.ok(Math.abs(result.max_acceleration_raw_s2 - 983040) < 1e-8);
-    assert.deepEqual(motor.values.slice(0, 4), [1,0,1800,2000]);
-    assert.deepEqual(motor.settings.filter(([register]) => register === 3).at(-1), [3,2000]);
-    assert.ok(!motor.settings.some(([register,value]) => register === 3 && value === 60098));
+    assert.equal(result.motion_profile, motionProfile);
+    assert.equal(result.max_acceleration_raw_s2, accelerationMmS2 * 32768 / 40);
+    assert.deepEqual(motor.values.slice(0, 4), [1,0,1800,setting]);
+    assert.deepEqual(motor.settings.filter(([register]) => register === 3).at(-1), [3,setting]);
+    const otherSettings = MOTION_PROFILE_CASES.filter(([name]) => name !== motionProfile).map(([, value]) => value);
+    assert.ok(!motor.settings.some(([register,value]) => register === 3 && otherSettings.includes(value)));
     await transport.arm(); await transport.start(); await transport.command(.51); await transport.stop(); await transport.close();
+   }
   }
 });
 
-test("cancelled Home restores the selected ramped profile while inhibited", async () => {
-  for (const nativeHome of [false, true]) {
+test("cancelled Home restores each selected profile while inhibited", async () => {
+  for (const [motionProfile, setting] of MOTION_PROFILE_CASES) {
+   for (const nativeHome of [false, true]) {
     const simulatedMotor = new FakeConnection({native:true}); simulatedMotor.contacts = [-140563,23277];
-    const context = make({motor:simulatedMotor, motionProfile:"ramped", nativeHome});
+    const context = make({motor:simulatedMotor, motionProfile, nativeHome});
     const {transport, motor} = context;
     await transport.connect(); await transport.begin_home(); await advance(context, "first_contact");
     const result = await transport.stop();
-    assert.equal(result.stop_confirmed, true); assert.equal(result.homed, false); assert.equal(result.motion_profile, "ramped");
-    assert.deepEqual(motor.values.slice(0, 4), [1,0,1800,2000]);
-    assert.deepEqual(motor.settings.filter(([register]) => register === 3).at(-1), [3,2000]);
+    assert.equal(result.stop_confirmed, true); assert.equal(result.homed, false); assert.equal(result.motion_profile, motionProfile);
+    assert.deepEqual(motor.values.slice(0, 4), [1,0,1800,setting]);
+    assert.deepEqual(motor.settings.filter(([register]) => register === 3).at(-1), [3,setting]);
     await transport.close();
+   }
   }
 });
 
@@ -1991,11 +2014,14 @@ test("each streamed guard detects configuration, output and alarm changes before
 });
 
 test("a stalled streamed cycle refuses stale guard data before evaluating or writing a target", async () => {
-  const {transport, motor, clock} = await running({fastPositions:true});
+ for (const [motionProfile, setting] of MOTION_PROFILE_CASES) {
+  const simulatedMotor = new FakeConnection(); simulatedMotor.values[3] = setting;
+  const {transport, motor, clock} = await running({motor:simulatedMotor, motionProfile, fastPositions:true});
   await transport.command(.5); await clock.wait(.251); let resolved = false;
   await assert.rejects(transport.command(() => { resolved = true; return .51; }), /status checks are stale/);
   assert.equal(resolved, false); assert.equal(motor.destinations.length, 1);
   assert.equal(transport.status().stop_confirmed, true); await transport.close();
+ }
 });
 
 test("a live streamed target is resolved after guard latency and immediately before its write", async () => {
@@ -2008,7 +2034,9 @@ test("a live streamed target is resolved after guard latency and immediately bef
 });
 
 test("Stop cancels a blocked streamed guard read and queued target resolvers", async () => {
-  const {transport, motor} = await running({fastPositions:true});
+ for (const [motionProfile, setting] of MOTION_PROFILE_CASES) {
+  const simulatedMotor = new FakeConnection(); simulatedMotor.values[3] = setting;
+  const {transport, motor} = await running({motor:simulatedMotor, motionProfile, fastPositions:true});
   const entered = deferred(), release = deferred(); let resolved = 0;
   motor.onRead = async () => { motor.onRead = null; entered.resolve(); await release.promise; };
   const active = assert.rejects(transport.command(() => { resolved++; return .51; }), /cancel/i);
@@ -2019,6 +2047,7 @@ test("Stop cancels a blocked streamed guard read and queued target resolvers", a
   assert.equal(resolved, 0); assert.deepEqual(motor.destinations, []);
   assert.equal(transport.status().fault, null); assert.equal(transport.status().stop_confirmed, true);
   await transport.close();
+ }
 });
 
 test("streamed guard read recovery checks a complete snapshot before sending a current target", async () => {
@@ -2059,7 +2088,9 @@ test("a slow or asynchronous streamed target resolver cannot send an unchecked t
 });
 
 test("serial waiting cannot let guard data expire before the native target write", async () => {
-  const {transport, motor, clock} = await running({fastPositions:true});
+ for (const [motionProfile, setting] of MOTION_PROFILE_CASES) {
+  const simulatedMotor = new FakeConnection(); simulatedMotor.values[3] = setting;
+  const {transport, motor, clock} = await running({motor:simulatedMotor, motionProfile, fastPositions:true});
   const exchange = motor.exchange.bind(motor);
   motor.exchange = async (request, timeout, beforeWrite) => {
     if (request[1] === 0x7b) await clock.wait(.251);
@@ -2068,6 +2099,7 @@ test("serial waiting cannot let guard data expire before the native target write
   await assert.rejects(transport.command(.51), /status checks are stale/);
   assert.deepEqual(motor.destinations, []);
   assert.equal(transport.status().stop_confirmed, true); await transport.close();
+ }
 });
 
 test("lost streamed target replies recover without retransmitting and fault after three cycles", async () => {
@@ -2106,6 +2138,109 @@ test("confirmed stop rechecks an isolated speed-only contradiction without motio
  const other=await running();await other.transport.stop();other.motor.values[16]=65280;
  await assert.rejects(other.transport.snapshot(),/actual speed -256/);
  assert.equal(other.transport.status().stop_confirmed,false);other.motor.values[16]=0;await other.transport.close();
+});
+
+test("repeated Stop rebuilds fresh stationary proof after cancelling an already-stopped snapshot", async () => {
+  for (const [motionProfile, setting] of MOTION_PROFILE_CASES) {
+    const simulatedMotor = new FakeConnection(); simulatedMotor.values[3] = setting;
+    const {transport, motor, clock} = await running({motor:simulatedMotor, motionProfile});
+    await transport.stop();
+    const reference = transport._stop_position, before = motor.transmissions.length;
+    const commands = motor.commands.length, began = clock.now(), entered = deferred(), release = deferred();
+    let reads = 0;
+    motor.onRead = async () => {
+      reads++;
+      if (reads === 1) { entered.resolve(); await release.promise; }
+      else assert.equal(transport.status().stop_confirmed, false, "cached confirmation cannot substitute for fresh proof");
+    };
+    const cancelled = assert.rejects(transport.snapshot(), /cancel/i);
+    await entered.promise;
+    const stopping = transport.stop(); release.resolve();
+    const [, status] = await Promise.all([cancelled, stopping]);
+    assert.equal(status.stop_confirmed, true); assert.equal(status.owned, false); assert.equal(status.fault, null);
+    assert.ok(reads >= 4, "exclude the cancelled reply and collect at least three new replies");
+    assert.ok(clock.now() - began >= .6); assert.ok(clock.now() - began <= 3);
+    assert.equal(transport._stop_position, reference, "re-verification must retain the original drift reference");
+    assert.equal(motor.commands.length, commands); assert.equal(motor.maxActive, 1);
+    for (const tx of motor.transmissions.slice(before)) assert.deepEqual(Array.from(tx.slice(0, 6)), [1,3,0,0,0,26]);
+    motor.onRead = null; await transport.close();
+  }
+});
+
+test("repeated Stop cannot resurrect confirmation from contradictory late or fresh feedback", async () => {
+  for (const failure of ["speed", "output", "pwm", "pending", "drift", "configuration"]) {
+    const {transport, motor, clock} = await running(); await transport.stop();
+    const reference = transport._stop_position, saved = motor.values.slice(), writes = motor.commands.length;
+    const entered = deferred(), release = deferred(), began = clock.now(); let reads = 0;
+    motor.onRead = async m => {
+      if (++reads === 1) { entered.resolve(); await release.promise; }
+      if (failure === "speed") m.values[16] = 2;
+      if (failure === "output") m.values[1] = 1;
+      if (failure === "pwm") m.values[19] = 1;
+      if (failure === "pending") m.remaining(3);
+      if (failure === "drift") m.position(reference + 821);
+      if (failure === "configuration") m.values[4] = 1;
+    };
+    const cancelled = assert.rejects(transport.snapshot(), /cancel/i);
+    await entered.promise;
+    const stopping = assert.rejects(transport.stop(), /Stop\/inhibit unconfirmed/); release.resolve();
+    await Promise.all([cancelled, stopping]);
+    const status = transport.status();
+    assert.equal(status.stop_confirmed, false, failure); assert.equal(status.owned, false);
+    assert.ok(status.fault, failure); assert.ok(reads >= 2, "a cancelled response cannot complete verification");
+    assert.ok(clock.now() - began <= 3.01); assert.equal(motor.commands.length, writes);
+    assert.equal(transport._stop_position, reference); assert.deepEqual(motor.destinations, []);
+    motor.onRead = null; motor.values = saved; await transport.close();
+  }
+});
+
+test("Stop cancelling a never-owned read-only snapshot sends no controls or positive proof", async () => {
+  const {transport, motor} = make({allowed:false}); await transport.connect();
+  const entered = deferred(), release = deferred(), before = motor.readCount;
+  motor.onRead = async () => { motor.onRead = null; entered.resolve(); await release.promise; };
+  const cancelled = assert.rejects(transport.snapshot(), /cancel/i);
+  await entered.promise;
+  const stopping = transport.stop(); release.resolve();
+  const [, status] = await Promise.all([cancelled, stopping]);
+  assert.equal(status.stop_confirmed, false); assert.equal(status.owned, false); assert.equal(status.fault, null);
+  assert.equal(transport._stop_position, null); assert.equal(motor.readCount - before, 1);
+  assert.deepEqual(motor.commands, []); assert.deepEqual(motor.settings, []); assert.deepEqual(motor.destinations, []);
+  await transport.close();
+});
+
+test("repeated Stop re-verifies reconnect recovery before Home without a fictitious zero-width window", async () => {
+  const {transport, motor, clock} = make(); await transport.connect(); await transport.recover_stop();
+  assert.equal(transport.status().origin_raw, null); assert.equal(transport.status().stop_confirmed, true);
+  const reference = transport._stop_position, writes = motor.commands.length, began = clock.now();
+  const entered = deferred(), release = deferred(); let reads = 0;
+  motor.onRead = async () => { if (++reads === 1) { entered.resolve(); await release.promise; } };
+  const cancelled = assert.rejects(transport.snapshot(), /cancel/i);
+  await entered.promise;
+  const stopping = transport.stop(); release.resolve();
+  const [, status] = await Promise.all([cancelled, stopping]);
+  assert.equal(status.stop_confirmed, true); assert.equal(status.owned, false); assert.equal(status.origin_raw, null);
+  assert.equal(status.fault, null); assert.ok(reads >= 4); assert.ok(clock.now() - began >= .6);
+  assert.equal(transport._stop_position, reference); assert.equal(motor.commands.length, writes);
+  motor.onRead = null; await transport.close();
+});
+
+test("read-only Stop re-verification never advances the original fixed drift reference", async () => {
+  const {transport, motor} = await running(); await transport.stop();
+  const reference = transport._stop_position, writes = motor.commands.length;
+  for (const drift of [700, 1400]) {
+    const entered = deferred(), release = deferred(); let reads = 0;
+    motor.onRead = async m => {
+      if (++reads === 1) { entered.resolve(); await release.promise; }
+      m.position(reference + drift);
+    };
+    const cancelled = assert.rejects(transport.snapshot(), /cancel/i);
+    await entered.promise;
+    const stopping = drift === 700 ? transport.stop() : assert.rejects(transport.stop(), /position drift 1400 counts/);
+    release.resolve(); await Promise.all([cancelled, stopping]);
+    assert.equal(transport.status().stop_confirmed, drift === 700);
+    assert.equal(transport._stop_position, reference); assert.equal(motor.commands.length, writes);
+  }
+  motor.onRead = null; motor.position(reference); await transport.close();
 });
 
  test("inhibited preflight waits for transient speed but rejects persistent speed", async () => {

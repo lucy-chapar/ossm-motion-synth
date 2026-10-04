@@ -1,8 +1,10 @@
 # Browser motion smoothing — 2026-10-02
 
 The later [motion planner audit](MOTION_PLANNER_AUDIT.md) supersedes the ramped
-browser default below. These entries retain the actual earlier attempts and
-their validation limits.
+and bypass-streaming defaults described in the historical trials below. The
+local browser now uses a 20000 RPM/s servo ramp with the 6000 mm/s² host budget;
+the watched comparison is recorded in that audit. These entries retain the
+actual earlier attempts and their validation limits.
 
 Local development against `0ad919ebf362c7a617ffeb46c92cbaffa42aa5dd`.
 This revision is local and has not been deployed. Connected tests are recorded

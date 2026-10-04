@@ -132,12 +132,15 @@ and restores the previous output/stall setting. The waveform planner uses
 this measured working span, keeping its existing physical velocity and
 acceleration limits when converting normalized positions to encoder counts.
 After parking, browser Home restores a 1800 RPM ceiling and the selected
-profile. The local browser selects `streaming`: 60098 (98% position feedforward,
-no internal acceleration ramp), with host ceilings of nominal 1080 mm/s and
-6000 mm/s². The optional `ramped` profile retains the earlier 2000 RPM/s drive
-ramp and 1200 mm/s² host ceiling for comparison. Faster requested fixed waves
-are retimed to fit their selected budget. These local changes still need fast
-physical validation and have not been deployed.
+profile. The provisional local browser default is `servo_ramped`: a 20000 RPM/s drive ramp
+(nominal 13333 mm/s²), with host ceilings of nominal 1080 mm/s and 6000 mm/s².
+This retains drive headroom while shaping the gaps between discrete targets.
+The `streaming` comparison profile uses 60098 (98% position feedforward, no
+internal ramp); its watched 1 Hz test was visibly pulsing. The older `ramped`
+profile retains 2000 RPM/s and a 1200 mm/s² host ceiling. Faster requested fixed
+waves are retimed to fit their selected budget. The servo-ramped 1 Hz trial
+reduced sampled speed bursts, but fast physical smoothness is still being evaluated.
+These local changes have not been deployed.
 Centering uses the slower
 35 RPM / 75 RPM/s calibration profile. The Python bridge retains its earlier
 profile. Modulated patterns can still be limited by the physical budget.

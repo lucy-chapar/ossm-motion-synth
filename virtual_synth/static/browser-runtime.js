@@ -23,7 +23,7 @@
     const clock = options.clock || (() => performance.now() / 1000);
     const serial = options.serial === undefined ? globalThis.navigator?.serial : options.serial;
     const transportFactory = options.transportFactory || ((port) => new globalThis.MotionWebSerialTransport.MotorTransport(port, {
-      allowMotion: true, fastPositions: true, motionProfile: "streaming", baudRate: "auto",
+      allowMotion: true, fastPositions: true, motionProfile: "servo_ramped", baudRate: "auto",
     }));
     const engine = new engineAPI.Engine();
     const ports = new Map();

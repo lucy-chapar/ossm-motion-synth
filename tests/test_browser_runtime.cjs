@@ -32,7 +32,7 @@ function fakeMotor({ stopConfirmed = true } = {}) {
     async close() { calls.push("close"); hw.connected = false; return this.status(); } };
 }
 
-test("production browser factory uses one host trajectory budget without the slow drive ramp", async () => {
+test("production browser factory retains the full host budget with the faster servo ramp", async () => {
   const {MotorTransport} = require("../virtual_synth/static/web-serial-transport.js");
   const previous = globalThis.MotionWebSerialTransport;
   const motor = fakeMotor(); motor.hw.homed = true; motor.hw.raw_bounds = [1000, 146000];
@@ -53,7 +53,7 @@ test("production browser factory uses one host trajectory budget without the slo
   const action = (name, fields = {}) => runtime.request("/api/action", {action: name, ...fields});
   try {
     await action("connect", {port: await runtime.choosePort()});
-    assert.equal(configured.motion_profile, "streaming");
+    assert.equal(configured.motion_profile, "servo_ramped");
     assert.equal(configured.max_acceleration_raw_s2 / 819.2, 6000);
     assert.equal(configured.max_velocity_raw_s / 819.2, 1080);
     await action("configure", {params: {rate_hz: 1.5, stroke: .7}});

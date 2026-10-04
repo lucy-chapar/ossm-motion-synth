@@ -89,9 +89,16 @@ named comparison, not an assumed identification.
 
 ## Revised trajectory ownership
 
-The browser now selects the existing `streaming` profile. The host owns velocity
-and acceleration shaping; register 3 is 60098 to bypass the drive's internal
-acceleration ramp with 98% position feedforward. This value is an encoded mode,
+The first audited revision selected the existing `streaming` profile. The host
+owned velocity and acceleration shaping; register 3 was 60098 to bypass the
+drive's internal acceleration ramp with 98% position feedforward. The later
+watched retest below rejected that profile for smooth curves. The local browser
+now selects `servo_ramped`, retaining host limits of 1080 mm/s and 6000 mm/s²
+with a 20000 RPM/s drive ramp. That native limit has headroom above the host
+budget and shapes motion between discrete targets; its fast smoothness remains
+under physical evaluation.
+
+The streaming value 60098 is an encoded mode,
 not 60098 RPM/s. The [vendor manual, physical page 11](https://www.robotanno.com/web/userfiles/download/ACCESSORIES/IntegratedServoMotor/YZ-AIMManual_v2_55.pdf)
 describes its meaning. Profile budgets are now written in explicit mm/s².
 Telemetry reports this encoded setting as `acceleration_setting_raw`, names the
@@ -205,7 +212,7 @@ The square's reference is an endpoint target; error during finite transit is
 expected. Its acceptance is arrival at both endpoints within the half-cycle,
 without violating velocity, acceleration, stroke or stopping limits.
 
-The final local revision passes all 239 browser tests, including production
+The initial capacity revision passed all 239 browser tests, including production
 runtime/profile wiring, planned-phase Pause/Resume, stop and telemetry guards,
 finite curve transitions, and tiny-stroke numeric regressions. The web export
 was rebuilt and every exported asset matched its source-manifest SHA-256.
@@ -233,7 +240,55 @@ the streaming drive setting 60098 and host acceleration 6000 mm/s².
 | 1.5 Hz | 119 | 19.83/s | 98.63 mm | 469.05 mm/s | 55.77 ms |
 
 All three runs completed without a fault and confirmed output inhibited with zero
-pending demand, speed, PWM and alarm. Encoder travel is based on sparse rotating
-status reads and may miss extrema; planned peak speed is not measured motor
-speed. The physical smoothness observation is still pending. No higher
+pending demand, speed, PWM and alarm. FC7b returns encoder feedback with each
+target reply; sampled travel can still miss extrema between those replies.
+Planned peak speed is not measured motor speed. The physical smoothness
+observation is still pending. No higher
 acceleration budget or persistent baud change has been applied in this comparison.
+
+### Watched retest rejects ramp bypass for smooth curves
+
+After the motor restarted in native control mode, fresh Home measured 181.666
+nominal mm. Two six-second centered 70% streaming sines again retained travel:
+99.18 mm at 0.5 Hz and 98.44 mm at 1 Hz, with 20 targets/s. Both runs confirmed
+inhibition with zero speed, PWM, pending demand and alarm before another run.
+
+At 1 Hz, the host planned a peak of 310.78 mm/s. Existing register-16 reads
+sampled speeds as high as 594.53 mm/s; clean encoder differences between target
+replies averaged at most 323.32 mm/s. The user described the carriage as moving
+like a jackhammer. Following the overall sine and maintaining low position
+error therefore did not establish smooth motion between updates. The 1.5 Hz
+retest was cancelled, and the bypass profile is not accepted as a smooth default.
+
+The next controlled comparison is `servo_ramped`: register 3 at 20000 RPM/s,
+or nominal 13333 mm/s², with the host still at 6000 mm/s². This retains substantial
+drive headroom instead of restoring the old 2000 RPM/s / 1200 mm/s² pair. Its
+inter-target behavior is experimental; the firmware does not document how it
+replans a position move already in progress. Existing following-error, Stop and
+freshness checks remain unchanged. Higher baud remains a separate comparison.
+
+The controlled servo-ramp trial verified 20000 RPM/s after Home, measured
+181.611 nominal mm, and ran the same centered 70% stroke at the same 19200 baud.
+Its 0.5 Hz run sampled 99.15 mm travel; its 1 Hz run sampled 98.34 mm. At 1 Hz,
+the highest sampled register-16 speed fell from 594.53 to 398.07 nominal mm/s,
+while the planned peak remained 310.51 mm/s and target delivery stayed at
+19.83/s. Both runs completed without faults and confirmed inhibited stationary
+output. The watched smoothness observation is pending; lower sampled speed
+bursts alone do not establish smooth motion.
+
+The retest also exposed a confirmation race when Stop cancelled an idle status
+read after a prior successful Stop had released ownership. That cancelled read
+cleared the confirmation flag, and repeated Stop returned without rebuilding
+the proof. Repeated Stop now obtains fresh read-only stationary feedback against
+the original stopping position. It uses the same bounded three-sample proof and
+minimum settling time as normal Stop; never-owned read-only connections are not
+promoted to confirmed. Regression checks include contradictory feedback and
+gradual drift, rather than ignoring cancellation or relaxing stopped-speed checks.
+
+The current local servo-ramp revision passes 244/244 browser tests. Its web
+export was rebuilt and all packaged assets match the source-manifest SHA-256.
+A separate stationary reconnect then exercised the production Stop recovery
+and repeated Stop: both confirmed inhibition, with zero speed, PWM, pending
+demand and alarm, no fault, and the same encoder position throughout. The serial
+port was released after this check. These results do not replace the pending
+watched assessment of the servo-ramp trial or establish parity with stock speed.

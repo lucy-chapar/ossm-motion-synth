@@ -32,6 +32,10 @@
   const MOTION_PROFILES = Object.freeze({
     streaming: Object.freeze({ driveAccelerationSetting: 60098, maxAccelerationMmS2: 6000 }),
     ramped: Object.freeze({ driveAccelerationSetting: 2000, maxAccelerationMmS2: 1200 }),
+    // Experimental inter-target ramp with headroom above the host budget.
+    // 20000 RPM/s at 40 mm/rev is 13333 mm/s², substantially above the host
+    // budget. Whether repeated position updates move smoothly needs live QA.
+    servo_ramped: Object.freeze({ driveAccelerationSetting: 20000, maxAccelerationMmS2: 6000 }),
   });
   const RUN_SPEED_RPM = 1800;
   const RUN_MAX_VELOCITY = 32768 * RUN_SPEED_RPM / 60 * .9;
@@ -56,7 +60,7 @@
     constructor(port, { allowMotion = false, connectionFactory = null, clock: now = clock,
                         wait: sleep = wait, nativeHome = false, fastPositions = false, motionProfile = "streaming", baudRate = 19200, portLabel = "Selected USB serial adapter" } = {}) {
       if (!port) throw new TypeError("An explicitly selected SerialPort is required");
-      if (typeof motionProfile !== "string" || !Object.hasOwn(MOTION_PROFILES, motionProfile)) throw new TypeError("Motion profile must be streaming or ramped");
+      if (typeof motionProfile !== "string" || !Object.hasOwn(MOTION_PROFILES, motionProfile)) throw new TypeError("Motion profile must be streaming, ramped, or servo_ramped");
       if (baudRate !== "auto" && (!Number.isInteger(baudRate) || !BAUD_RATES.includes(baudRate))) throw new TypeError("Baud rate must be 19200, 38400, 115200, or auto");
       this._requested_baud = baudRate; this._baud = baudRate === "auto" ? null : baudRate;
       this._motion_profile = motionProfile;
@@ -749,14 +753,55 @@
       if (errors.length) this._fault ||= errors.join("; "); else this._owned = false;
       this._home_stage(this._fault ? "fault" : "cancelled", this._home_progress);
     }
+    async _verify_stop(reference = null) {
+      const positions = [], started = this._clock(), deadline = started + 3;
+      for (let attempt = 0; attempt < 40 && this._clock() < deadline; attempt++) {
+        let v;
+        try { v = await this._read(Math.min(IO_TIMEOUT, deadline - this._clock())); }
+        catch (error) {
+          if (!error.recoverableResponse) throw error;
+          positions.length = 0; this._communication_recoveries++;
+          continue; // Read-only recovery stays within the stop deadline.
+        }
+        let position;
+        if (reference !== null && this._origin === null) {
+          this._configuration(v, false, this._baseline); position = io.signedPosition(v);
+        } else position = this._check_active(v, reference === null ? v[1] === 1 : false);
+        if (reference !== null && Math.abs(position - reference) > STOP_SETTLE_TOLERANCE) {
+          throw new TransportError(`Stopped feedback changed: position drift ${Math.abs(position - reference)} counts (limit ${STOP_SETTLE_TOLERANCE})`);
+        }
+        if (this._inhibited_feedback(v)) {
+          positions.push(position);
+          if (positions.length > 3) positions.shift();
+          if (positions.length === 3 && spread(positions) <= STOP_CONFIRM_TOLERANCE && this._clock() - started >= .6) return positions.at(-1);
+        } else positions.length = 0;
+        await this._wait(Math.min(.1, Math.max(0, deadline - this._clock())));
+      }
+      throw new TransportError(`Motor did not settle within 3 seconds after stop/inhibit: output ${this._values?.[1]}, pending ${this._values ? io.pending(this._values) : "unknown"}, speed ${this._values ? this._signed_speed(this._values) : "unknown"}, PWM ${this._values?.[19]}, encoder spread ${positions.length ? spread(positions) : "no stationary samples"} counts (${positions.length}/3 samples; limit ${STOP_CONFIRM_TOLERANCE} counts)`);
+    }
     async _stop_impl() {
       const prior = this._inCleanup; this._inCleanup = true;
       try {
         if (this._homing) { await this._stop_home(); return; }
         this._armed = this._running = false;
-        if (!this._owned || this._cleanup_attempted) return;
+        if (!this._owned) {
+          // Stop can cancel an idle snapshot after an earlier confirmed Stop
+          // released ownership. Rebuild its proof with fresh reads, without
+          // taking control of a read-only connection or moving its reference.
+          if (!this._stop_confirmed && this._stop_position !== null) {
+            try {
+              await this._verify_stop(this._stop_position);
+              this._cleanup_errors = []; this._stop_confirmed = true;
+            } catch (error) {
+              this._cleanup_errors = ["readback: " + (error.message || error)];
+              this._fault ||= this._cleanup_errors[0];
+            }
+          }
+          return;
+        }
+        if (this._cleanup_attempted) return;
         this._cleanup_attempted = true; this._stop_confirmed = false;
-        const errors = [], positions = [];
+        const errors = []; let position = null;
         for (const operation of ["clear", "inhibit"]) {
           try { await this._write(operation, IO_TIMEOUT); }
           catch (error) {
@@ -765,27 +810,10 @@
           }
         }
         try {
-          const started = this._clock(), deadline = started + 3;
-          for (let attempt = 0; attempt < 40 && this._clock() < deadline; attempt++) {
-            let v;
-            try { v = await this._read(Math.min(IO_TIMEOUT, deadline - this._clock())); }
-            catch (error) {
-              if (!error.recoverableResponse) throw error;
-              positions.length = 0; this._communication_recoveries++;
-              continue; // Read-only recovery stays within the stop deadline.
-            }
-            const position = this._check_active(v, v[1] === 1);
-            if (this._inhibited_feedback(v)) {
-              positions.push(position);
-              if (positions.length > 3) positions.shift();
-              if (positions.length === 3 && spread(positions) <= STOP_CONFIRM_TOLERANCE && this._clock() - started >= .6) break;
-            } else positions.length = 0;
-            await this._wait(Math.min(.1, Math.max(0, deadline - this._clock())));
-          }
-          if (positions.length !== 3 || spread(positions) > STOP_CONFIRM_TOLERANCE) throw new TransportError(`Motor did not settle within 3 seconds after stop/inhibit: output ${this._values?.[1]}, pending ${this._values ? io.pending(this._values) : "unknown"}, speed ${this._values ? this._signed_speed(this._values) : "unknown"}, PWM ${this._values?.[19]}, encoder spread ${positions.length ? spread(positions) : "no stationary samples"} counts (${positions.length}/3 samples; limit ${STOP_CONFIRM_TOLERANCE} counts)`);
+          position = await this._verify_stop();
         } catch (error) { errors.push("readback: " + (error.message || error)); }
         this._cleanup_errors = errors; this._enabled_at = null; this._stop_confirmed = !errors.length;
-        this._stop_position = this._stop_confirmed ? positions.at(-1) : null;
+        this._stop_position = this._stop_confirmed ? position : null;
         if (errors.length) this._fault ||= errors.join("; "); else this._owned = false;
       } finally { this._inCleanup = prior; }
     }
