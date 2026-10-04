@@ -5,9 +5,9 @@ It did not establish useful speed or smoothness under demanding curves. That
 test required only about 33.5 mm/s and 52.6 mm/s². The user's subsequent report
 of slow movement and jitter on curves is the reason for this audit.
 
-This revision is local. Its new behavior has offline verification; fast physical
-motion, the browser event loop with a connected motor, and 115200 operation
-still need matched physical tests.
+This revision is local. Its new behavior has offline verification and the
+watched 1 Hz servo-ramp acceptance recorded below. More demanding rates,
+other curves and loads, and 115200 operation still need matched physical tests.
 
 ## Where performance was lost
 
@@ -95,8 +95,8 @@ drive's internal acceleration ramp with 98% position feedforward. The later
 watched retest below rejected that profile for smooth curves. The local browser
 now selects `servo_ramped`, retaining host limits of 1080 mm/s and 6000 mm/s²
 with a 20000 RPM/s drive ramp. That native limit has headroom above the host
-budget and shapes motion between discrete targets; its fast smoothness remains
-under physical evaluation.
+budget and shapes motion between discrete targets. The watched centered 70%
+1 Hz sine was accepted below; broader motion remains under physical evaluation.
 
 The streaming value 60098 is an encoded mode,
 not 60098 RPM/s. The [vendor manual, physical page 11](https://www.robotanno.com/web/userfiles/download/ACCESSORIES/IntegratedServoMotor/YZ-AIMManual_v2_55.pdf)
@@ -242,8 +242,9 @@ the streaming drive setting 60098 and host acceleration 6000 mm/s².
 All three runs completed without a fault and confirmed output inhibited with zero
 pending demand, speed, PWM and alarm. FC7b returns encoder feedback with each
 target reply; sampled travel can still miss extrema between those replies.
-Planned peak speed is not measured motor speed. The physical smoothness
-observation is still pending. No higher
+Planned peak speed is not measured motor speed. This initial batch had no
+recorded smoothness verdict; the watched streaming retest below supplied the
+visual assessment. No higher
 acceleration budget or persistent baud change has been applied in this comparison.
 
 ### Watched retest rejects ramp bypass for smooth curves
@@ -260,7 +261,7 @@ like a jackhammer. Following the overall sine and maintaining low position
 error therefore did not establish smooth motion between updates. The 1.5 Hz
 retest was cancelled, and the bypass profile is not accepted as a smooth default.
 
-The next controlled comparison is `servo_ramped`: register 3 at 20000 RPM/s,
+The subsequent controlled comparison used `servo_ramped`: register 3 at 20000 RPM/s,
 or nominal 13333 mm/s², with the host still at 6000 mm/s². This retains substantial
 drive headroom instead of restoring the old 2000 RPM/s / 1200 mm/s² pair. Its
 inter-target behavior is experimental; the firmware does not document how it
@@ -273,11 +274,50 @@ Its 0.5 Hz run sampled 99.15 mm travel; its 1 Hz run sampled 98.34 mm. At 1 Hz,
 the highest sampled register-16 speed fell from 594.53 to 398.07 nominal mm/s,
 while the planned peak remained 310.51 mm/s and target delivery stayed at
 19.83/s. Both runs completed without faults and confirmed inhibited stationary
-output. The watched smoothness observation is pending; lower sampled speed
-bursts alone do not establish smooth motion.
+output. No user smoothness verdict was captured for these two earlier runs;
+lower sampled speed bursts alone do not establish smooth motion. The following
+1 Hz retest records the user's acceptance.
 
-The retest also exposed a confirmation race when Stop cancelled an idle status
-read after a prior successful Stop had released ownership. That cancelled read
+### Watched servo-ramp 1 Hz retest accepted
+
+Fresh Home measured 181.623535 nominal mm. The production browser path then
+ran one six-second centered 70% sine at 1 Hz, using `servo_ramped` with register
+3 at 20000 RPM/s, the unchanged 6000 mm/s² host budget, and 19200 baud.
+
+| Sent targets | Target rate | Sampled encoder travel | Planned peak speed | Highest sampled register-16 speed | Largest target interval | Maximum guard age |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 119 | 19.833/s | 98.846436 mm | 312.989 mm/s | 361.466667 mm/s | 75.8275 ms | 199.468084 ms |
+
+The user watched this run and reported **"it was fine."** The run completed
+without a fault and confirmed stationary inhibition with zero output, pending
+demand, speed, PWM and alarm. The serial port was released afterward. This is
+user acceptance of this 1 Hz sine at the tested stroke and load; other rates,
+shapes and loads, and parity with stock firmware remain unverified. Sampled
+register-16 speed is distinct from instantaneous peak speed.
+
+Retained evidence: [watched 1 Hz servo-ramp run](/private/tmp/ossm-speed-servo_ramped-2026-10-03-watched-live-2026-10-04T01-55-14-863Z-evidence.json).
+
+### Watched servo-ramp 1.5 Hz trial completed; visual assessment pending
+
+Fresh Home measured 181.635742 nominal mm. A separate six-second centered 70%
+sine used the same `servo_ramped` setting of 20000 RPM/s, 6000 mm/s² host budget,
+and 19200 baud. The requested and planned rate both remained 1.5 Hz. Requested
+travel was 99.249354 mm; sent command travel was 99.283447 mm.
+
+| Sent targets | Target rate | Sampled encoder travel | Planned peak speed | Highest sampled register-16 speed | Largest target interval | Maximum guard age |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 120 | 20/s | 97.294922 mm | 469.653887 mm/s | 516.6 mm/s | 54.795292 ms | 189.171834 ms |
+
+The 30 register-16 speed samples ranged from -516.6 to 451.133333 nominal mm/s.
+The run completed without a fault and confirmed stationary inhibition with zero
+output, pending demand, speed, PWM and alarm. The serial port was released.
+The user's visual assessment is pending. Encoder travel and sampled speeds
+alone do not establish smooth motion or acceptance at this rate.
+
+Retained evidence: [watched 1.5 Hz servo-ramp trial](/private/tmp/ossm-speed-servo_ramped-2026-10-03-watched-live-2026-10-04T01-59-10-748Z-evidence.json).
+
+The earlier streaming retest also exposed a confirmation race when Stop cancelled
+an idle status read after a prior successful Stop had released ownership. That cancelled read
 cleared the confirmation flag, and repeated Stop returned without rebuilding
 the proof. Repeated Stop now obtains fresh read-only stationary feedback against
 the original stopping position. It uses the same bounded three-sample proof and
@@ -290,5 +330,6 @@ export was rebuilt and all packaged assets match the source-manifest SHA-256.
 A separate stationary reconnect then exercised the production Stop recovery
 and repeated Stop: both confirmed inhibition, with zero speed, PWM, pending
 demand and alarm, no fault, and the same encoder position throughout. The serial
-port was released after this check. These results do not replace the pending
-watched assessment of the servo-ramp trial or establish parity with stock speed.
+port was released after this check. These stationary checks establish Stop
+behavior. The separate watched 1 Hz acceptance above remains limited to that
+pattern and does not establish parity with stock speed.
