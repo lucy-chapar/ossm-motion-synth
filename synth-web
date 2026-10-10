@@ -1,0 +1,8 @@
+#!/bin/sh
+# SPDX-License-Identifier: MPL-2.0
+set -eu
+cd "$(dirname "$0")"
+if [ -x .venv/bin/python ]; then
+    exec .venv/bin/python scripts/serve_web.py "$@"
+fi
+exec python3 scripts/serve_web.py "$@"

@@ -32,6 +32,26 @@ Physical stop/power isolation remains independent. The browser edition has
 been tested with a connected OSSM; see the [guide](docs/GUIDE.md) for the
 measured rail check and drive compatibility details.
 
+## Run the browser edition locally
+
+From this repository directory, with Python 3.11 or later:
+
+```sh
+./synth-web --open
+```
+
+This rebuilds the current browser assets and serves the direct Web Serial edition
+at **http://127.0.0.1:8769/**, then opens Google Chrome. No Python packages are
+required. Keep the terminal open while using the app; **Ctrl-C** stops the server.
+Run the same command again after a reboot. If the port is occupied, stop the
+existing server or use `./synth-web --port 8770 --open`.
+
+Use the same URL and browser profile to retain adapter permission. A previously
+permitted adapter may reconnect automatically; **Home → Play** are explicit
+actions after each connection. If needed, click **Connect** and select the
+USB–RS485 adapter. The launcher serves the app and never opens an adapter or
+starts motion itself.
+
 ## Optional Python bridge
 
 Requires Python 3.11 or later.
@@ -109,9 +129,9 @@ and load it in a same-origin iframe with `allow="serial 'self'; autoplay 'self'"
 The iframe keeps the instrument styles separate from the surrounding site.
 Any parent `Permissions-Policy` must allow `serial=(self)`.
 
-Web Serial access is granted through the browser's chooser after a user click;
-previously allowed adapters are listed without opening them. The app never
-auto-connects or auto-runs. See the
+Web Serial access is granted through the browser's chooser after a user click.
+The app can reconnect one previously permitted adapter matching the saved USB
+identity, but never automatically homes or starts motion. See the
 [Web Serial API documentation](https://developer.chrome.com/docs/capabilities/serial).
 
 ## License
