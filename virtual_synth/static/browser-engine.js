@@ -214,6 +214,14 @@
         if (generation !== this._generation) this._captureWait = 0;
         this._generation = generation;
       }
+      if (!this._following && !this._capture && reference.startupPlan) {
+        const plan = reference.startupPlan, start = plan.sample(0), end = plan.sample(plan.duration);
+        if (["position", "velocity", "acceleration"].some(key => Math.abs(start[key] - current[key]) > 1e-10)
+            || !this._fits(plan, this.low, this.high) || !this._brakeFits(end, this.low, this.high)) {
+          throw new Error("Initial waveform capture does not match the retained state or stopping corridor");
+        }
+        this._capture = {plan: plan.snapshot(), elapsed: 0};
+      }
       if (!this._following && !this._capture) {
         // Capture a future moving state. A reference sample is not a rest
         // endpoint: its nonzero velocity and acceleration pass into Ruckig.
@@ -403,12 +411,16 @@
       Object.defineProperties(this, {
         _referencePlanner: {value: null, writable: true},
         _referencePlans: {value: null, writable: true},
+        _startupReference: {value: null, writable: true},
+        _startupPending: {value: true, writable: true},
+        _commandTravelUpper: {value: 0, writable: true},
       });
     }
 
     configure(full_or_changes) {
       const params = validateParams(full_or_changes, this.params);
       this.trajectory.configure_bounds(params.lower, params.upper);
+      this._cancelStartup();
       this.params = params;
       return detached(params);
     }
@@ -428,7 +440,44 @@
       this.phase = this.lfo_phase = this.envelope = 0;
       this.reference_phase = 0;
       this._planned_rate = null;
+      this._cancelStartup(); this._startupPending = true;
+      this._commandTravelUpper = 0;
       this._referencePlans?.forward.dispose(); this._referencePlans?.backward?.dispose(); this._referencePlans = null;
+    }
+
+    _cancelStartup() {
+      this._startupReference?.plan.dispose(); this._startupReference = null;
+    }
+
+    commandedTravelUpper() { return this._commandTravelUpper; }
+
+    _initialSineCapture(geometry, rate) {
+      const trajectory = this.trajectory, current = trajectory.pva(), amplitude = geometry.amplitude.value;
+      if (!(amplitude > 0) || Math.abs(current.velocity) > 1e-10 || Math.abs(current.acceleration) > 1e-10) return null;
+      const omega = 2 * Math.PI * rate;
+      // The first physical reversal has zero velocity and the sine's nonzero
+      // inward acceleration. Matching that full PVA avoids chasing a reference
+      // that starts at maximum speed while the carriage is stationary.
+      const direction = current.position <= geometry.midpoint.value ? 1 : -1;
+      const target = {position: geometry.midpoint.value + direction * amplitude,
+        velocity: 0, acceleration: -direction * amplitude * omega * omega};
+      const limits = {vmax: Math.min(trajectory.vmax, amplitude * omega),
+        amax: Math.min(trajectory.amax, amplitude * omega * omega),
+        jmax: Math.min(trajectory.jmax, amplitude * omega * omega * omega)};
+      // Microscopic geometry retains the existing capture path and its
+      // numerical handling rather than introducing near-zero Ruckig limits.
+      if (Object.values(limits).some(value => value < 1e-12)) return null;
+      try {
+        const planner = this._referencePlanner ||= new (ruckigAPI().Planner)({cycleTime: .002});
+        const plan = planner.calculate(current, target, limits);
+        if (!Number.isFinite(plan.duration) || !(plan.duration > 0)
+            || plan.minPosition < Math.min(current.position, target.position) - 1e-10
+            || plan.maxPosition > Math.max(current.position, target.position) + 1e-10
+            || !trajectory._fits(plan, trajectory.low, trajectory.high)
+            || !trajectory._brakeFits(target, trajectory.low, trajectory.high)) return null;
+        return {plan: plan.snapshot(), elapsed: 0, rate, midpoint: geometry.midpoint.value, amplitude,
+          phase: wrapped((direction > 0 ? .25 : .75) - rate * plan.duration)};
+      } catch (_) { return null; /* The existing bounded capture handles this case. */ }
     }
 
     _futureGeometry(offset, gate) {
@@ -470,7 +519,12 @@
       const limits = {vmax: trajectory.vmax * REFERENCE_RESERVE,
         amax: trajectory.amax * REFERENCE_RESERVE, jmax: trajectory.jmax * REFERENCE_RESERVE};
       const geometry = this._futureGeometry(0, gate), amplitude = geometry.amplitude.value;
-      const dynamic = p.env_to_stroke && geometry.direct === null || p.patches.some(patch => patch.depth !== 0);
+      // A held envelope stays constant after reaching its attack/release end.
+      // Follow that fixed reference exactly instead of continually recapturing
+      // it on the modulation grid. Nonzero LFO patches remain time-varying.
+      const envelopeEvolving = gate ? this.envelope < 1 : this.envelope > 0;
+      const dynamic = p.env_to_stroke && geometry.direct === null && envelopeEvolving
+        || p.patches.some(patch => patch.depth !== 0 && (patch.source === "lfo" || envelopeEvolving));
       let rate = geometry.rate.value, maximumSineRate = null, plans = null;
       if (geometry.direct === null && p.shape === "sine") {
         rate = this._sineRate(geometry, limits).value;
@@ -493,10 +547,37 @@
         }
         plans = this._referencePlans; rate = plans.rate;
       }
+      // A Gate change can begin modulation without changing the parameters.
+      // An initial fixed-geometry segment must stop defining the reference as
+      // soon as that geometry evolves; follow() recaptures from retained PVA.
+      if (this._startupReference && (dynamic || geometry.direct !== null || p.shape !== "sine"
+          || this._startupReference.rate !== rate || this._startupReference.midpoint !== geometry.midpoint.value
+          || this._startupReference.amplitude !== amplitude)) this._cancelStartup();
+      let startupPlan = null, phaseOffset = 0;
+      if (this._startupPending && dt > 0) {
+        this._startupPending = false;
+        if (!dynamic && geometry.direct === null && p.shape === "sine") {
+          this._startupReference = this._initialSineCapture(geometry, rate);
+          if (this._startupReference) {
+            startupPlan = this._startupReference.plan;
+            phaseOffset = this._startupReference.phase - this.reference_phase;
+            this.reference_phase = this._startupReference.phase;
+            this._planned_rate = rate;
+          }
+        }
+      }
       if (geometry.direct === null) this.reference_phase = wrapped(this.reference_phase + .5 * ((this._planned_rate ?? rate) + rate) * dt);
       this._planned_rate = geometry.direct === null ? rate : null;
+      if (this._startupReference) {
+        this._startupReference.elapsed += dt;
+        if (!startupPlan && this._startupReference.elapsed >= this._startupReference.plan.duration - 1e-10) this._cancelStartup();
+      }
+      const startup = this._startupReference;
       const phase = this.reference_phase;
       const sample = offset => {
+        if (startup && startup.elapsed + offset < startup.plan.duration) {
+          return startup.plan.sample(Math.max(0, startup.elapsed + offset));
+        }
         const future = dynamic ? this._futureGeometry(offset, gate) : geometry;
         const midpoint = future.midpoint, a = future.amplitude;
         if (future.direct !== null) {
@@ -542,8 +623,11 @@
           acceleration: midpoint.second - a.second + 2 * (a.second * progress + 2 * a.first * speed + a.value * acceleration)};
       };
       const envelopeConnected = p.env_to_stroke || p.patches.some(patch => patch.source === "envelope" && patch.depth !== 0);
-      const generation = JSON.stringify([p, envelopeConnected ? gate : null]);
-      return {sample, rate, maximumSineRate, generation, exact: !dynamic};
+      // Entering exact following needs a fresh capture from retained PVA. An
+      // earlier modulation capture can predict a slightly different phase.
+      const generation = JSON.stringify([p, envelopeConnected ? gate : null, dynamic]);
+      return {sample, rate, maximumSineRate, generation, exact: !dynamic,
+        startupPlan, phaseOffset, startup: Boolean(startup && startup.elapsed < startup.plan.duration)};
     }
 
     _source(patch, bipolar = true) {
@@ -596,14 +680,30 @@
       const midpoint = low + center * (high - low);
       let amplitude = stroke * Math.min(midpoint - low, high - midpoint);
       if (tracking && midpoint - amplitude === midpoint + amplitude) amplitude = 0;
-      const carrier = waveform(this.params.shape, this.phase);
-      const wave = direct_position === null ? carrier : direct_position;
-      const requested = clamp(midpoint + amplitude * wave, low, high);
+      let carrier = waveform(this.params.shape, this.phase);
+      let wave = direct_position === null ? carrier : direct_position;
+      let requested = clamp(midpoint + amplitude * wave, low, high);
       if (tracking && running) {
+        const previousVelocity = Math.abs(this.trajectory.velocity), previousAcceleration = Math.abs(this.trajectory.acceleration);
         const reference = this._continuousReference(dt, gate);
+        if (reference.phaseOffset) {
+          this.phase = wrapped(this.phase + reference.phaseOffset);
+          carrier = waveform(this.params.shape, this.phase);
+          wave = direct_position === null ? carrier : direct_position;
+          requested = clamp(midpoint + amplitude * wave, low, high);
+        }
         const strokeLow = midpoint - amplitude, strokeHigh = midpoint + amplitude;
         const command = this.trajectory.follow(reference, dt,
           reference.exact && strokeLow < strokeHigh ? [strokeLow, strokeHigh] : null, reference.generation, reference.exact);
+        // Bound total motion, including excursions that return to the same
+        // endpoint. Integrating |v| from retained PVA with either acceleration
+        // or jerk bounds proves an upper distance for each planner substep.
+        // This counter advances with planning; only a verified wire target
+        // resets the runtime's observation anchor, never scope/state polling.
+        const accelerationDistance = this.trajectory.amax * dt * dt / 2;
+        const jerkDistance = previousAcceleration * dt * dt / 2 + this.trajectory.jmax * dt * dt * dt / 6;
+        this._commandTravelUpper += Math.min(this.trajectory.vmax * dt,
+          previousVelocity * dt + Math.min(accelerationDistance, jerkDistance));
         const planned = reference.sample(0);
         return {
           requested, command, velocity: this.trajectory.velocity, acceleration: this.trajectory.acceleration,
@@ -612,6 +712,7 @@
           effective_rate_hz: rate, effective_stroke: stroke, effective_center: center, carrier,
           position_patched: direct_position !== null, envelope_bypassed: Boolean(env_bypassed),
           reference_phase: this.reference_phase, planned_reference: planned.position,
+          startup_transition: reference.startup,
           planned_reference_velocity: planned.velocity, planned_reference_acceleration: planned.acceleration,
           planned_rate_hz: direct_position === null ? reference.rate : null,
           rate_limited: direct_position === null && reference.rate < rate - 1e-10,
@@ -623,6 +724,7 @@
       }
       if (!tracking) this.reference_phase = this.phase;
       this._planned_rate = null;
+      if (!running) this._cancelStartup();
       let command;
       if (running) command = this.trajectory.update(requested, dt);
       else {
@@ -640,6 +742,7 @@
         acceleration: this.trajectory.acceleration,
         reference_phase: this.reference_phase,
         planned_reference: requested,
+        startup_transition: false,
         planned_rate_hz: null,
         rate_limited: false,
         requested_span_normalized: 2 * amplitude * (direct_position === null ? 1

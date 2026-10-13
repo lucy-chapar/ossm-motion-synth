@@ -22,6 +22,9 @@
   const CONFIG = [0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 20, 21, 24, 25];
   const STREAM_STATUS_GROUPS = [[0, 7], [7, 7], [14, 7], [21, 5]];
   const STREAM_STATUS_MAX_AGE = .25, STREAM_STATUS_REFRESH_AGE = .1, STREAM_STATUS_HEADROOM = .1;
+  const TRACE_CAPACITY = 4096;
+  const TRACE_FIELDS = ["cycle_started_s", "guards_ready_s", "submitted_s", "replied_s", "target_raw", "previous_target_raw", "encoder_raw", "tracking_error_raw", "guard_age_s", "tracking_failures", "sampled_s", "planned_velocity_raw_s", "planned_acceleration_raw_s2", "guard_encoder_raw", "native_write_submitted_s", "writer_promise_settled_s", "first_response_chunk_s", "last_response_chunk_s", "exchange_validated_s"];
+  const TRACE_IO_OFFSET = 14, IO_TIMING_SIZE = 5;
   const HOME_IO_TIMEOUT = .5;
   const HOME_SEEK_SECONDS = 30, HOME_TOTAL_SECONDS = 360, COUNTS_PER_MM = 32768 / 40;
   const HOME_SEARCH_COUNTS = 409600, HOME_MIN_SPAN = 16384, HOME_INSET = 1638;
@@ -36,6 +39,9 @@
     // The host retains 6000 mm/s²; the higher native setting reduces the
     // following lag observed at 20000 during dense continuous updates.
     servo_ramped: Object.freeze({ driveAccelerationSetting: 50000, maxAccelerationMmS2: 6000 }),
+    // Documented native acceleration bypass, with zero position feedforward.
+    // The host retains continuous P/V/A and its acceleration/jerk budgets.
+    servo_direct: Object.freeze({ driveAccelerationSetting: 60000, maxAccelerationMmS2: 6000, positionGainSetting: 3000 }),
   });
   const RUN_SPEED_RPM = 1800;
   const RUN_MAX_VELOCITY = 32768 * RUN_SPEED_RPM / 60 * .9;
@@ -61,12 +67,15 @@
     constructor(port, { allowMotion = false, connectionFactory = null, clock: now = clock,
                         wait: sleep = wait, nativeHome = false, fastPositions = false, motionProfile = "streaming", baudRate = 19200, portLabel = "Selected USB serial adapter" } = {}) {
       if (!port) throw new TypeError("An explicitly selected SerialPort is required");
-      if (typeof motionProfile !== "string" || !Object.hasOwn(MOTION_PROFILES, motionProfile)) throw new TypeError("Motion profile must be streaming, ramped, or servo_ramped");
+      if (typeof motionProfile !== "string" || !Object.hasOwn(MOTION_PROFILES, motionProfile)) throw new TypeError("Motion profile must be streaming, ramped, servo_ramped, or servo_direct");
       if (baudRate !== "auto" && (!Number.isInteger(baudRate) || !BAUD_RATES.includes(baudRate))) throw new TypeError("Baud rate must be 19200, 38400, 115200, or auto");
       this._requested_baud = baudRate; this._baud = baudRate === "auto" ? null : baudRate;
       this._motion_profile = motionProfile;
       this._run_accel_setting = MOTION_PROFILES[motionProfile].driveAccelerationSetting;
       this._run_max_acceleration = COUNTS_PER_MM * MOTION_PROFILES[motionProfile].maxAccelerationMmS2;
+      this._run_position_gain = MOTION_PROFILES[motionProfile].positionGainSetting ?? null;
+      this._home_gain_write_uncertain = false;
+      this._fault_code = null; this._continuity_home_retained = false;
       this.port = portLabel; this._port = port; this.allow_motion = allowMotion === true;
       this._nativeHome = nativeHome === true;
       this._fastPositions = fastPositions === true; this._snapshot_at = -Infinity;
@@ -74,10 +83,19 @@
       this._status_group_due = STREAM_STATUS_GROUPS.map(() => -Infinity);
       this._command_reply_count = this._command_reply_head = this._command_reply_size = this._command_reply_rate = 0;
       this._command_reply_times = new Float64Array(1024);
+      // Numeric ring: no trace copying or per-target object allocation on the
+      // motion path. Export is an explicit, stopped-only diagnostic operation.
+      this._command_trace = new Float64Array(TRACE_CAPACITY * TRACE_FIELDS.length);
+      this._target_exchange_timing = new Float64Array(IO_TIMING_SIZE).fill(NaN);
+      this._trace_head = this._trace_size = 0; this._trace_started = null;
+      this._trace_recoveries_at_start = 0;
+      this._planned_sample_at = this._planned_velocity = this._planned_acceleration = NaN;
       this._factory = connectionFactory; this._clock = now; this._wait = sleep;
       for (const field of ["connection", "values", "baseline", "origin", "hold_position", "low", "high", "enabled_at", "target", "stop_position", "fault", "observed_at", "home_origin", "home_started", "home_phase_started", "home_reference", "home_expected", "home_initial", "home_park", "home_motion_timeout", "home_move_phase", "home_move_from", "home_move_target", "home_contact_phase", "home_contact_position", "home_hold_position", "proposed_endpoints", "proposed_bounds", "measured_endpoints", "measured_travel"]) this["_" + field] = null;
       for (const field of ["owned", "cleanup_attempted", "armed", "running", "stop_confirmed", "homing", "homed", "home_activity"]) this["_" + field] = false;
       this._communication_recoveries = 0; this._recovery_streak = 0;
+      this._last_communication_error = this._last_communication_operation = null;
+      this._last_communication_function = this._last_communication_register = this._last_communication_elapsed_s = null;
       this._tracking_failures = 0; this._home_phase = "idle"; this._home_progress = 0; this._home_direction = "normal";
       this._cleanup_errors = []; this._home_samples = []; this._home_actions = []; this._home_candidates = {}; this._home_contacts = {};
       this._queue = Promise.resolve(); this._epoch = 0; this._activeEpoch = 0; this._inCleanup = false;
@@ -104,7 +122,7 @@
       return {
         port: this.port, baud: this._baud, slave: 1, connected: this._connection !== null, owned: this._owned,
         motion_allowed: this.allow_motion, motion_profile: this._motion_profile, armed: this._armed, running: this._running,
-        stop_confirmed: this._stop_confirmed, fault: this._fault, homing: this._homing, homed: this._homed,
+        stop_confirmed: this._stop_confirmed, fault: this._fault, fault_code: this._fault_code, homing: this._homing, homed: this._homed,
         home_phase: this._home_phase, home_progress: this._home_progress, home_direction: this._home_direction,
         home_origin_raw: this._home_origin, measured_endpoints_raw: this._measured_endpoints?.slice() ?? null,
         measured_travel_raw: this._measured_travel, nominal_counts_per_mm: COUNTS_PER_MM,
@@ -114,6 +132,7 @@
         output_enabled: v && ((v[0] === 1 && [0, 1].includes(output)) || (v[0] === 0 && [0, 2, 3, 6, 7, 10, 11, 14, 15].includes(output))) ? Boolean(output & 1) : null,
         alarm: v?.[14] ?? null, mode: v?.[0] ?? null, speed_rpm: v?.[2] ?? null,
         acceleration_setting_raw: v?.[3] ?? null,
+        position_gain_raw: v?.[7] ?? null,
         acceleration_rpm_s: v && v[3] < 60000 ? v[3] : null,
         acceleration_mode: !v ? null : v[3] < 60000 ? "ramp"
           : v[3] <= 60098 ? "position_feedforward" : "unknown",
@@ -123,8 +142,11 @@
         origin_raw: this._origin, raw_bounds: this._origin !== null ? [this._low, this._high] : null,
         position_normalized: position !== null && this._origin !== null ? (position - this._low) / (this._high - this._low) : null,
         communication_recoveries: this._communication_recoveries,
+        last_communication_error: this._last_communication_error,
         command_reply_count: this._command_reply_count,
         command_reply_rate_hz: this._command_reply_rate,
+        command_trace_count: this._trace_size,
+        command_trace_started_s: this._trace_started,
         status_check_age_s: this._values ? Math.max(0, this._clock() - Math.min(...this._status_group_at)) : null,
         target_raw: this._target, observed_at: this._observed_at,
         run_seconds: this._running && this._enabled_at !== null ? Math.max(0, this._clock() - this._enabled_at) : 0,
@@ -132,24 +154,96 @@
       };
     }
     _require_connection() { if (!this._connection) throw new TransportError("Connect an explicitly selected serial device first"); }
+    motionDiagnostics() {
+      if (this._running || this._armed || this._homing || this._owned) throw new TransportError("Stop output before saving motion diagnostics");
+      const rows = [];
+      for (let i = 0; i < this._trace_size; i++) {
+        const offset = ((this._trace_head + i) % TRACE_CAPACITY) * TRACE_FIELDS.length;
+        const row = Array.from(this._command_trace.subarray(offset, offset + TRACE_FIELDS.length));
+        for (let index = TRACE_IO_OFFSET; index < TRACE_FIELDS.length; index++) if (!Number.isFinite(row[index])) row[index] = null;
+        rows.push(row);
+      }
+      return { schema_version: 1, fields: TRACE_FIELDS.slice(), rows, trace_started_s: this._trace_started,
+        capacity: TRACE_CAPACITY, baud: this._baud, motion_profile: this._motion_profile,
+        commands_total: this._command_reply_count, trace_rows_dropped: Math.max(0, this._command_reply_count - this._trace_size),
+        nominal_counts_per_mm: COUNTS_PER_MM, raw_bounds: this._origin === null ? null : [this._low, this._high],
+        drive_acceleration_setting: this._run_accel_setting,
+        position_gain_raw: this._values?.[7] ?? null, speed_gain_raw: this._values?.[5] ?? null,
+        speed_integral_raw: this._values?.[6] ?? null,
+        guard_max_age_s: STREAM_STATUS_MAX_AGE, stop_confirmed: this._stop_confirmed, fault: this._fault, fault_code: this._fault_code,
+        communication_recoveries: this._communication_recoveries - this._trace_recoveries_at_start,
+        lifetime_communication_recoveries: this._communication_recoveries,
+        last_communication_error: this._last_communication_error, last_communication_operation: this._last_communication_operation,
+        last_communication_function: this._last_communication_function, last_communication_register: this._last_communication_register,
+        last_communication_elapsed_s: this._last_communication_elapsed_s };
+    }
+    recordPlannerSample(at, velocity, acceleration) {
+      this._planned_sample_at = at;
+      const span = this._high - this._low;
+      this._planned_velocity = velocity * span; this._planned_acceleration = acceleration * span;
+    }
+    _record_command_trace(started, guardsReady, submitted, replied, target, previous, actual, failures, guardPosition) {
+      if (this._trace_size === TRACE_CAPACITY) { this._trace_head = (this._trace_head + 1) % TRACE_CAPACITY; this._trace_size--; }
+      const offset = ((this._trace_head + this._trace_size++) % TRACE_CAPACITY) * TRACE_FIELDS.length;
+      const trace = this._command_trace, began = this._trace_started;
+      trace[offset] = started - began; trace[offset + 1] = guardsReady - began;
+      trace[offset + 2] = submitted - began; trace[offset + 3] = replied - began;
+      trace[offset + 4] = target; trace[offset + 5] = previous; trace[offset + 6] = actual;
+      trace[offset + 7] = actual - previous;
+      trace[offset + 8] = Math.max(0, submitted - Math.min(...this._status_group_at));
+      trace[offset + 9] = failures;
+      trace[offset + 10] = this._planned_sample_at - began;
+      trace[offset + 11] = this._planned_velocity; trace[offset + 12] = this._planned_acceleration;
+      trace[offset + 13] = guardPosition;
+      for (let i = 0; i < IO_TIMING_SIZE; i++) trace[offset + TRACE_IO_OFFSET + i] = this._target_exchange_timing[i] / 1000 - began;
+    }
     _require_clear_fault() { this._require_connection(); if (this._fault) throw new TransportError("Fault is latched; disconnect and inspect before reconnecting: " + this._fault); }
     _budget() {
       return IO_TIMEOUT;
     }
     async _exchange(tx, budget, beforeSubmit = null) {
       this._checkCancelled();
-      const rx = await this._connection.exchange(tx, budget, () => {
+      const began = this._clock();
+      const timing = this._connection.exchangeTiming;
+      const timingBefore = timing instanceof Float64Array && timing.length === 7 ? timing[0] : NaN;
+      if (tx[1] === 0x7b) this._target_exchange_timing.fill(NaN);
+      let rx;
+      try { rx = await this._connection.exchange(tx, budget, () => {
         this._checkCancelled();
         if (this._fastPositions && tx[1] === 0x7b) this._require_fresh_stream_guards();
         const replacement = beforeSubmit?.();
         this._checkCancelled();
         if (this._fastPositions && tx[1] === 0x7b) this._require_fresh_stream_guards();
         return replacement;
-      });
+      }); }
+      catch (error) {
+        if (error.recoverableResponse) {
+          const register = (tx[2] << 8) | tx[3];
+          // Keep the entire diagnostic tuple attached to this exact failed
+          // exchange, including a failed recovery or independent cleanup.
+          // Outer recovery handlers must not overwrite only part of it.
+          this._last_communication_error = String(error.message || error);
+          this._last_communication_operation = tx[1] === 3
+            ? ((tx[4] << 8) | tx[5]) === 26 ? "full_status" : "partial_status"
+            : tx[1] === 0x7b || tx[1] === 16 && register === 22 ? "target"
+            : tx[1] === 16 && register === 12 ? "clear"
+            : tx[1] === 6 && register === 1 ? tx[5] ? "enable" : "inhibit"
+            : "configuration";
+          this._last_communication_function = tx[1];
+          this._last_communication_register = tx[1] === 3 ? register : null;
+          this._last_communication_elapsed_s = this._clock() - began;
+        }
+        throw error;
+      }
       if (!(rx instanceof Uint8Array) || rx.length < 5 || io.crc16(rx.slice(0, -2)) !== (rx.at(-2) | rx.at(-1) << 8)) throw new TransportError("Response CRC or length mismatch");
       if (rx[0] !== 1 || (rx[1] !== tx[1] && rx[1] !== (tx[1] | 128))) throw new TransportError("Response slave/function mismatch");
       if (rx[1] === (tx[1] | 128)) throw new TransportError("Drive returned Modbus exception " + rx[2]);
       if (rx.length !== (tx[1] === 3 ? 5 + 2 * ((tx[4] << 8) | tx[5]) : 8)) throw new TransportError("Response length mismatch");
+      if (tx[1] === 0x7b && timing === this._connection.exchangeTiming && timing instanceof Float64Array && timing.length === 7 &&
+          Number.isFinite(timing[0]) && (!Number.isFinite(timingBefore) || timing[0] > timingBefore) && timing[1] === 0x7b &&
+          Number.isFinite(timing[6])) {
+        for (let i = 0; i < IO_TIMING_SIZE; i++) this._target_exchange_timing[i] = Number.isFinite(timing[i + 2]) ? timing[i + 2] : NaN;
+      }
       return rx;
     }
     async _read(budget = null, speedRecheck = 0, baudProbe = false) {
@@ -201,6 +295,13 @@
     async _read_stream_guards() {
       this._checkCancelled();
       this._require_fresh_stream_guards();
+      if (this._baud === 115200) {
+        // At this baud a complete snapshot costs less bus occupancy than four
+        // partial reads and refreshes every guard from the same reply. Keep
+        // genuine receipt timestamps and the unchanged 250 ms write fence.
+        if (this._clock() - Math.min(...this._status_group_at) + 1e-9 < STREAM_STATUS_REFRESH_AGE) return this._values;
+        return this._read();
+      }
       const dueAt = group => Math.min(this._status_group_due[group], this._status_group_at[group] + STREAM_STATUS_REFRESH_AGE);
       for (let reads = 0; reads < STREAM_STATUS_GROUPS.length; reads++) {
         let group = this._status_group_next;
@@ -259,6 +360,7 @@
     }
     _configuration(v, enabled, baseline = null) {
       if (v[0] !== 1 || v[1] !== Number(enabled) || v[2] !== RUN_SPEED_RPM || v[3] !== this._run_accel_setting || v[10] !== 0 || v[14] !== 0 || v[20] !== 0 || v[21] !== 1 || v[25] !== 0) throw new TransportError("Require mode1, scalar output " + Number(enabled) + `, speed/acceleration${RUN_SPEED_RPM}/${this._run_accel_setting}, gear0, alarm0, save0, address1, special0`);
+      if (this._run_position_gain !== null && v[7] !== this._run_position_gain) throw new TransportError(`Require position gain ${this._run_position_gain}; drive reports ${v[7]}`);
       if (baseline && CONFIG.some(i => v[i] !== baseline[i])) throw new TransportError("Motor configuration changed after arming");
     }
     _check_active(v, enabled, hold = false) {
@@ -270,13 +372,19 @@
     }
     async _fault_and_cleanup(error) {
       const cancelled = error instanceof CancelledOperation;
-      if (!cancelled) this._fault ||= `${error.name || "Error"}: ${error.message || error}`;
+      if (!cancelled && !this._fault) {
+        this._fault = `${error.name || "Error"}: ${error.message || error}`;
+        this._fault_code = typeof error.code === "string" ? error.code : null;
+        // Only an unsent software gap during an already measured run may keep
+        // its calibration. Cleanup faults never replace the original cause.
+        this._continuity_home_retained = this._fault_code === "MOTION_CONTINUITY_GAP" && this._homed;
+      }
       if (!cancelled || this._homing) this._homed = false;
       this._armed = this._running = false;
       if (this._owned && !this._cleanup_attempted) await this._stop_impl();
       if (this._fault) this._homed = false;
       if (cancelled && !this._fault) throw error;
-      throw new TransportError(this._fault);
+      throw Object.assign(new TransportError(this._fault), { code: this._fault_code });
     }
     async connect() {
       if (this._connection) throw new TransportError("Transport is already connected");
@@ -285,6 +393,7 @@
       // stopped feedback, or configuration assumptions.
       for (const field of ["values", "baseline", "origin", "hold_position", "low", "high", "enabled_at", "target", "stop_position", "observed_at", "home_origin", "measured_endpoints", "measured_travel", "proposed_endpoints", "proposed_bounds"]) this["_" + field] = null;
       this._homed = this._stop_confirmed = false;
+      this._fault_code = null; this._continuity_home_retained = false;
       this._home_phase = "idle"; this._home_progress = 0;
       this._snapshot_at = -Infinity; this._status_group_at.fill(-Infinity); this._status_group_next = 0;
       this._status_group_due.fill(-Infinity);
@@ -322,8 +431,12 @@
     }
     async reset_fault() {
       this._require_connection();
+      const continuityGap = this._fault_code === "MOTION_CONTINUITY_GAP";
+      const retainedHome = this._continuity_home_retained && this._baseline && this._measured_endpoints
+        && this._origin !== null && Number.isInteger(this._low) && Number.isInteger(this._high) && this._low < this._high;
       if (this._armed || this._running || this._homing || !this._stop_confirmed ||
-          !/Response timeout|Communication remained unstable|Motor did not settle within 3 seconds after stop\/inhibit/.test(this._fault || "")) {
+          (continuityGap ? !retainedHome || this._owned || this._cleanup_errors.length
+            : !/Response timeout|Communication remained unstable|Motor did not settle within 3 seconds after stop\/inhibit/.test(this._fault || ""))) {
         throw new TransportError("Reconnect or Home is required for this fault");
       }
       const positions = [];
@@ -331,10 +444,15 @@
         if (i) await this._wait(.1);
         const v = await this._read(.5); this._configuration(v, false, this._baseline);
         if (!this._inhibited_feedback(v)) throw new TransportError("Fault reset requires stationary inhibited feedback");
-        positions.push(io.signedPosition(v));
+        const position = io.signedPosition(v);
+        if (continuityGap && (position < this._low || position > this._high)) {
+          throw new TransportError("Fault reset requires the encoder inside the original measured rail bounds");
+        }
+        positions.push(position);
       }
       if (spread(positions) > STOP_CONFIRM_TOLERANCE) throw new TransportError("Encoder moved during fault reset");
       this._fault = null; this._recovery_streak = 0; this._tracking_failures = 0;
+      this._fault_code = null; this._continuity_home_retained = false;
       this._cleanup_attempted = false; this._cleanup_errors = [];
       this._homed = Boolean(this._measured_endpoints && this._origin !== null);
       return this.status();
@@ -415,6 +533,10 @@
         this._owned = true; await this._write("clear"); await this._stable_hold(false);
         this._enabled_at = this._clock(); await this._write("enable"); await this._stable_hold(true); this._running = true;
         this._command_reply_count = this._command_reply_head = this._command_reply_size = this._command_reply_rate = 0;
+        this._trace_head = this._trace_size = 0; this._trace_started = this._clock();
+        this._trace_recoveries_at_start = this._communication_recoveries;
+        this._last_communication_error = this._last_communication_operation = null;
+        this._last_communication_function = this._last_communication_register = this._last_communication_elapsed_s = null;
       } catch (error) { await this._fault_and_cleanup(error); }
       return this.status();
     }
@@ -435,10 +557,12 @@
       this._require_clear_fault();
       if (!this.allow_motion || !this._armed || !this._running) throw new TransportError("ARM and START are required before sending a target");
       try {
+        const cycleStarted = this._clock();
         const resolveTarget = typeof normalized === "function" ? normalized : null;
         if (!resolveTarget && (typeof normalized !== "number" || !Number.isFinite(normalized) || normalized < 0 || normalized > 1)) throw new TransportError("Position must be finite and normalized0..1");
         const recoveriesBefore = this._communication_recoveries;
         const position = this._check_active(this._fastPositions ? await this._read_stream_guards() : await this._read(), true);
+        const guardsReady = this._clock();
         // Encoder feedback arrives with each dedicated target reply. Allow 100 ms
         // of travel, capped at ten percent of the calibrated working range.
         const trackingLimit = Math.min((this._high - this._low) * .1, 1024 + RUN_MAX_VELOCITY * .1);
@@ -446,13 +570,15 @@
         if (this._tracking_failures >= 3) throw new TransportError("Tracking error exceeded the motion budget for three fresh samples");
         this._checkCancelled();
         if (this._fastPositions) this._require_fresh_stream_guards();
-        let target = null;
+        let target = null, submitted = null;
         const currentTarget = () => {
+          this._planned_sample_at = this._planned_velocity = this._planned_acceleration = NaN;
           if (resolveTarget) normalized = resolveTarget();
           this._checkCancelled();
           if (typeof normalized !== "number" || !Number.isFinite(normalized) || normalized < 0 || normalized > 1) throw new TransportError("Position must be finite and normalized0..1");
           if (this._fastPositions) this._require_fresh_stream_guards();
           target = this._nonzero_target(this._low + (this._high - this._low) * normalized, this._low, this._high);
+          submitted = this._clock();
           return target;
         };
         try {
@@ -469,6 +595,7 @@
             // reach the newly submitted point. Live replies followed the
             // preceding accepted target; use that point for the same lag bound.
             this._tracking_failures = Math.abs(actual - this._target) > trackingLimit ? this._tracking_failures + 1 : 0;
+            this._record_command_trace(cycleStarted, guardsReady, submitted, this._observed_at, target, this._target, actual, this._tracking_failures, position);
             if (this._tracking_failures >= 3) throw new TransportError("Tracking error exceeded the motion budget for three fresh samples");
           } else await this._absolute(currentTarget(), this._budget());
         }
@@ -494,12 +621,33 @@
     _home_queue(actions, following, progress) {
       this._home_actions = actions.slice(); this._home_following = following; this._home_stage(actions[0][0], progress);
     }
+    async _home_gain_state() {
+      const position = io.signedPosition(this._values), v = await this._read(HOME_IO_TIMEOUT);
+      if (!this._inhibited_feedback(v) || v[10] !== 0 || v[14] !== 0 || v[20] !== 0 || v[21] !== 1 || v[25] !== 0 ||
+          CONFIG.some(i => i !== 7 && v[i] !== this._home_expected[i]) || Math.abs(io.signedPosition(v) - position) > 4) {
+        throw new TransportError("Position gain setup requires fresh, stationary, inhibited position-mode feedback and unchanged configuration");
+      }
+      return v;
+    }
+    async _confirm_home_gain() {
+      const v = await this._home_gain_state();
+      if (v[7] !== this._run_position_gain) throw new TransportError(`Position gain readback ${v[7]} does not match fixed ${this._run_position_gain}; no retry`);
+      this._home_expected[7] = v[7];
+    }
     async _write_home_setting(register, value) {
-      const permitted = { 0: [0, 1], 2: [RUN_SPEED_RPM, HOME_SPEED_RPM, HOME_RECHECK_SPEED_RPM, 80], 3: [15, this._run_accel_setting, HOME_ACCEL_RPM_S, HOME_RECHECK_ACCEL_RPM_S], 9: [0, 1], 10: [0], 24: [89, this._home_reference[24]], 25: [0, 1] };
+      const permitted = { 0: [0, 1], 2: [RUN_SPEED_RPM, HOME_SPEED_RPM, HOME_RECHECK_SPEED_RPM, 80], 3: [15, this._run_accel_setting, HOME_ACCEL_RPM_S, HOME_RECHECK_ACCEL_RPM_S], 7: this._run_position_gain === null ? [] : [this._run_position_gain], 9: [0, 1], 10: [0], 24: [89, this._home_reference[24]], 25: [0, 1] };
       if (!permitted[register]?.includes(value)) throw new TransportError("Setting is outside the fixed native homing profile");
+      if (register === 7) {
+        if (this._home_gain_write_uncertain) throw new TransportError("Position gain write was unconfirmed; no retry");
+        await this._home_gain_state();
+        // A cancelled exchange or lost acknowledgement might have applied the
+        // setting. Cleanup may establish it by readback, but never resend it.
+        this._home_gain_write_uncertain = true;
+      }
       const tx = io.configRequest(register, value), rx = await this._exchange(tx, HOME_IO_TIMEOUT);
       if (!equalPrefix(rx, tx, 6)) throw new TransportError("Homing setting acknowledgement mismatch; no retry");
       this._home_expected[register] = value;
+      if (register === 7) { await this._confirm_home_gain(); this._home_gain_write_uncertain = false; }
     }
     _native_reset(v) {
       return v[0] === 0 && [10, 11, 14, 15].includes(v[1]) && v[10] === 32768 && v[25] === 1;
@@ -552,13 +700,14 @@
       return v;
     }
     _prepare_home() {
+      const gain = this._run_position_gain === null ? [] : [["setting_home_position_gain", 7, this._run_position_gain]];
       if (!this._nativeHome) {
-        this._home_queue([["setting_home_gear", 10, 0], ["clearing", "clear", 0],
+        this._home_queue([["setting_home_gear", 10, 0], ["clearing", "clear", 0], ...gain,
           ["setting_probe_speed", 2, HOME_SPEED_RPM], ["setting_probe_acceleration", 3, HOME_ACCEL_RPM_S],
           ["setting_home_output", 24, 89], ["setting_home_direction", 9, 0]], "verify_preparation", .1);
         return;
       }
-      this._home_queue([["setting_home_gear", 10, 0], ["clearing", "clear", 0], ["setting_home_speed", 2, 80],
+      this._home_queue([["setting_home_gear", 10, 0], ["clearing", "clear", 0], ...gain, ["setting_home_speed", 2, 80],
         ["setting_home_acceleration", 3, 15], ["setting_home_output", 24, 89],
         ["setting_home_direction", 9, Number(this._home_direction === "reverse")]], "verify_preparation", .1);
     }
@@ -637,6 +786,7 @@
         const v = await this._read(IO_TIMEOUT);
         this._validate_home_start(v);
         this._home_reference = v.slice(); this._home_expected = v.slice(); this._home_initial = io.signedPosition(v);
+        this._home_gain_write_uncertain = false;
         this._home_park = null; this._home_direction = reverse ? "reverse" : "normal"; this._home_origin = null;
         this._home_activity = false; this._home_actions = []; this._home_candidates = {}; this._home_contacts = {};
         this._home_motion_timeout = this._home_move_phase = null; this._proposed_endpoints = this._proposed_bounds = null;
@@ -740,7 +890,10 @@
         } else if (phase === "verify_stop") {
           const v = await this._home_read(false);
           if (Math.abs(io.signedPosition(v) - this._home_park) > PARK_STOP_TOLERANCE) throw new TransportError(`Encoder drifted after centering by ${Math.abs(io.signedPosition(v) - this._home_park)} counts (limit ${PARK_STOP_TOLERANCE})`);
-          if (this._home_stationary(v, STOP_PENDING_TOLERANCE, true)) this._home_queue([["restoring_run_speed", 2, RUN_SPEED_RPM], ["restoring_run_acceleration", 3, this._run_accel_setting], ["restoring_output", 24, this._home_reference[24]]], "verify_complete", .95);
+          if (this._home_stationary(v, STOP_PENDING_TOLERANCE, true)) {
+            const gain = this._run_position_gain === null ? [] : [["restoring_run_position_gain", 7, this._run_position_gain]];
+            this._home_queue([["restoring_run_speed", 2, RUN_SPEED_RPM], ["restoring_run_acceleration", 3, this._run_accel_setting], ["restoring_output", 24, this._home_reference[24]], ...gain], "verify_complete", .95);
+          }
         } else if (phase === "verify_complete") {
           const v = await this._home_read(false), position = io.signedPosition(v);
           if (Math.abs(position - this._home_park) > PARK_STOP_TOLERANCE || !this._inhibited_feedback(v)) throw new TransportError("Final homing stop was not confirmed");
@@ -783,6 +936,10 @@
           await this._write_home_setting(10, 0);
           await this._write("clear", IO_TIMEOUT);
           for (const [register, value] of [[2, RUN_SPEED_RPM], [3, this._run_accel_setting], [24, this._home_reference[24]]]) await this._write_home_setting(register, value);
+          if (this._run_position_gain !== null) {
+            if (this._home_gain_write_uncertain) await this._confirm_home_gain();
+            else await this._write_home_setting(7, this._run_position_gain);
+          }
           positions = [];
           for (let i = 0; i < 3; i++) {
             if (i) await this._wait(.1); v = await this._home_read(false);

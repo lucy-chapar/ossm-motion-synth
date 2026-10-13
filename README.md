@@ -50,11 +50,13 @@ The October 13 browser hardware planner carries
 position, velocity and acceleration between commands, uses finite jerk-limited
 transitions and preserves nonzero derivatives through intermediate moving
 points. It retains the 1080 mm/s / 6000 mm/s² host ceilings and 100000 mm/s³ host
-jerk limit. References reserve 95% of those host budgets. The current
-`servo_ramped` drive profile uses 1800 RPM and 50000 RPM/s. The
+jerk limit. References reserve 95% of those host budgets. The browser's
+`servo_direct` profile uses 1800 RPM and register 3 = 60000: native
+acceleration bypass with zero position feedforward. Home restores position
+gain 3000 while inhibited and verifies the setting. The
 [motion planner audit](docs/MOTION_PLANNER_AUDIT.md) records the C2 design and
-earlier 20000 RPM/s trials; the latest results are in the
-[serial throughput audit](docs/SERIAL_THROUGHPUT_AUDIT.md).
+earlier 20000 RPM/s trials; the later ramp/gain comparisons are in the
+[tuning record](docs/TUNING-2026-10-13.md).
 
 The browser serial path sends the next fresh target after the previous
 transaction completes, with one exchange outstanding and no queue of missed
@@ -63,12 +65,18 @@ tested drive, separate persistent commissioning and a power cycle established
 115200 baud; normal Connect still reads status without changing drive settings.
 A stationary, inhibited 100-command link test reached **177.746 completed
 replies/s**, which measures communication rather than pattern frequency or
-physical smoothness. It does not establish 500 Hz delivery. The final three
-six-second guarded trials using the exact production browser modules completed
-102–107.833 target replies/s with confirmed Stop after each, through an
-exclusive Node serial harness. The final Chrome Home → Play → Stop check
-also passed at 115200; its saw trial displayed 80–85 command updates/s and
-confirmed Stop. The browser shows measured command cadence in Motor connection.
+physical smoothness. It does not establish 500 Hz delivery. Earlier ramped
+results are retained in the [serial audit](docs/SERIAL_THROUGHPUT_AUDIT.md).
+The browser shows measured command cadence in Motor connection.
+
+A dedicated worker owns the planner, watchdog and serial reader/writer.
+The page sends controls and polls feedback; it sends no per-target messages.
+Delayed samples are rejected before transmission when unsent path travel
+exhausts the existing following corridor, including reversals. Fresh targets
+are sampled again across planning work before the final write. At 115200 baud,
+one full guard snapshot every 100 ms replaces four separate status exchanges;
+the 250 ms receipt-age fence remains unchanged. Stopped-only motion diagnostics
+retain bounded encoder/timing evidence and the settings used for the run.
 
 The bundled Ruckig WASM asset loads locally before Home or Play becomes available;
 all later planning is synchronous and offline. A recovered communication error
@@ -140,7 +148,7 @@ against the Python engine for the shared preview behavior. All browser assets,
 including the prebuilt local Ruckig WASM core, are bundled and run without a CDN.
 Normal use and export need no frontend build. The pinned source, portable build
 recipe and numerical checks are documented in [vendor/ruckig](vendor/ruckig/README.md).
-The current revision passes 292 browser tests and 132 Python tests, including 13 core checks;
+The current revision passes 376 browser tests and 134 Python tests, including 13 core checks;
 these software checks do not establish physical smoothness or firmware parity.
 
 The optional Python bridge binds to loopback and accepts only same-origin

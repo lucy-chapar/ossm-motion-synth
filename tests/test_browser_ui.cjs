@@ -26,9 +26,9 @@ class Element {
   getBoundingClientRect() { return { width: 500, height: 200, left: 0, top: 0 }; }
 }
 
-async function display(state) {
+async function display(state, { closeProtection = () => false } = {}) {
   const nodes = new Map(Array.from(html.matchAll(/\bid="([^"]+)"/g), ([, id]) => [id, new Element()]));
-  const intervals = [], requests = [];
+  const intervals = [], requests = [], windowEvents = new Map();
   const document = {
     hidden: false, activeElement: null,
     getElementById(id) { assert.ok(nodes.has(id), `Missing UI element: ${id}`); return nodes.get(id); },
@@ -38,6 +38,8 @@ async function display(state) {
   };
   const runtime = {
     supported: true, state: () => state, autoConnect: async () => false,
+    get mustStopBeforeClose() { return closeProtection(); },
+    async stop() { requests.push("/api/action:stop"); return state; },
     async request(route) {
       requests.push(route);
       if (route === "/api/session") return { token: "test-session" };
@@ -46,7 +48,7 @@ async function display(state) {
     },
   };
   const context = vm.createContext({
-    document, window: { addEventListener() {}, devicePixelRatio: 1 },
+    document, window: { addEventListener(name, listener) { windowEvents.set(name, listener); }, devicePixelRatio: 1 },
     MotionBrowserRuntime: runtime, performance: { now: () => 100 },
     ResizeObserver: class { observe() {} }, requestAnimationFrame() {},
     setTimeout: () => 0, clearTimeout() {},
@@ -56,7 +58,9 @@ async function display(state) {
   await new Promise(setImmediate);
   assert.equal(nodes.get("notice").textContent, "", "UI startup must succeed");
   assert.ok(requests.length >= 2);
-  return { node: id => nodes.get(id), async refresh() { await intervals[0](); } };
+  return { node: id => nodes.get(id), requests,
+    windowEvent(name, event) { assert.ok(windowEvents.has(name)); return windowEvents.get(name)(event); },
+    async refresh() { await intervals[0](); } };
 }
 
 function state({ mode = "hardware", signal = {}, params = {}, hardware = {} } = {}) {
@@ -135,6 +139,63 @@ function verifiedStoppedState() {
   Object.assign(sample,{running:false, armed:false, stopping:false, unconfirmed_stop:false});
   return sample;
 }
+
+test("USB disconnection hides live status while keeping cleanup, reconnect and retained fault history",async()=>{
+  const sample=verifiedStoppedState();
+  sample.hardware.device="USB adapter";sample.hardware.command_trace_count=10;
+  sample.history=[{t:0,actual:.4,command:.4},{t:.02,actual:.5,command:.5}];
+  const history=JSON.stringify(sample.history),ui=await display(sample);
+  assert.match(ui.node("hardware-status").textContent,/^Connected:/);
+  assert.equal(ui.node("hardware-metrics").hidden,false);
+  assert.equal(ui.node("run-button").disabled,false);
+  assert.equal(ui.node("show-motion-diagnostics").disabled,false);
+  ui.node("motion-diagnostics-json").textContent="old run";ui.node("motion-diagnostics-json").hidden=false;
+  sample.hardware.connected=false;sample.fault="USB serial adapter disconnected. Reconnect to continue.";
+  await ui.refresh();
+  assert.match(ui.node("hardware-status").textContent,/^No USB connection\./);
+  assert.match(ui.node("transport-message").textContent,/No USB connection.*Home/);
+  assert.equal(ui.node("disconnect-button").disabled,false,"the remaining session can still be cleaned up");
+  for(const id of ["connect-button","port-select","refresh-ports"]) assert.equal(ui.node(id).disabled,false,id);
+  assert.equal(ui.node("hardware-metrics").hidden,true);
+  for(const id of ["show-motion-diagnostics","save-motion-diagnostics"]) {
+    assert.equal(ui.node(id).hidden,true,id);assert.equal(ui.node(id).disabled,true,id);
+  }
+  assert.equal(ui.node("motion-diagnostics-json").hidden,true);assert.equal(ui.node("motion-diagnostics-json").textContent,"");
+  assert.equal(ui.node("home-button").disabled,true);assert.equal(ui.node("run-button").disabled,true);
+  assert.equal(ui.node("stop-confirmed").textContent,"No feedback");
+  assert.equal(sample.hardware.stop_confirmed,true,"rendering does not rewrite the retained historical Stop evidence");
+  assert.equal(ui.node("fault-notice").hidden,false);assert.match(ui.node("fault-text").textContent,/USB serial adapter disconnected/);
+  assert.equal(ui.node("scope-empty").hidden,true);assert.equal(ui.node("actual-legend").hidden,false);
+  assert.equal(JSON.stringify(sample.history),history,"disconnect display preserves the recorded scope");
+  sample.fault=null;await ui.refresh();
+  assert.equal(ui.node("run-button").disabled,true,"stale Home validity cannot authorize Play on a lost link");
+  sample.hardware.connected=true;sample.homing.valid=false;await ui.refresh();
+  assert.equal(ui.node("home-button").disabled,false);assert.equal(ui.node("run-button").disabled,true,"new connection still requires Home");
+  sample.homing.valid=true;await ui.refresh();
+  assert.equal(ui.node("run-button").disabled,false);assert.equal(ui.node("stop-confirmed").textContent,"Confirmed");
+});
+
+test("beforeunload uses pending-owner protection even when the last displayed state is stopped",async()=>{
+  const sample=verifiedStoppedState();let protectedOwner=false;
+  const ui=await display(sample,{closeProtection:()=>protectedOwner});
+  const before=ui.requests.length;
+  function closing() {
+    return {prevented:false,returnValue:undefined,preventDefault(){this.prevented=true;}};
+  }
+  const idle=closing();ui.windowEvent("beforeunload",idle);
+  assert.equal(idle.prevented,false);assert.equal(idle.returnValue,undefined);
+  // A Play/Home request can be pending while the UI still displays this Stop.
+  protectedOwner=true;
+  const pending=closing();ui.windowEvent("beforeunload",pending);
+  assert.equal(pending.prevented,true);assert.equal(pending.returnValue,"");
+  assert.equal(ui.node("stop-confirmed").textContent,"Confirmed");
+  assert.equal(ui.requests.length,before,"a close prompt does not claim or request Stop");
+  protectedOwner=false;
+  const stopped=closing();ui.windowEvent("beforeunload",stopped);
+  assert.equal(stopped.prevented,false);assert.equal(stopped.returnValue,undefined);
+  ui.windowEvent("pagehide",{});await Promise.resolve();
+  assert.equal(ui.requests.at(-1),"/api/action:stop","actual pagehide keeps best-effort Stop");
+});
 
 test("verified Stop remains Confirmed after a latched following fault while motion stays locked", async () => {
   const sample = verifiedStoppedState();

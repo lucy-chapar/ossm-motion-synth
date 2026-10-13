@@ -1,0 +1,389 @@
+{
+  "date": "2026-10-13",
+  "stage": "Local development; final physical validation and deployment pending",
+  "software_checks": {
+    "browser": {
+      "passed": 376,
+      "failed": 0
+    },
+    "python": {
+      "passed": 134,
+      "failed": 0
+    }
+  },
+  "reviewed_browser_profile": {
+    "name": "servo_direct",
+    "drive_speed_rpm": 1800,
+    "drive_register_3": 60000,
+    "position_feedforward_percent": 0,
+    "position_gain_raw": 3000,
+    "max_velocity_mm_s": 1080,
+    "max_acceleration_mm_s2": 6000,
+    "max_jerk_mm_s3": 100000,
+    "saved_to_eeprom": false
+  },
+  "trials": [
+    {
+      "capture": "ossm-tuning-direct0-sine-1p5-70",
+      "execution_context": "window",
+      "parameters": {
+        "rate_hz": 1.4985372650797282,
+        "stroke": 0.7,
+        "center": 0.5,
+        "shape": "sine",
+        "attack_s": 0.8,
+        "release_s": 1.2,
+        "env_to_stroke": false,
+        "lfo_rate_hz": 0.07,
+        "lower": 0.1,
+        "upper": 0.9,
+        "patches": []
+      },
+      "drive_acceleration_setting": 60000,
+      "position_gain_raw": 3000,
+      "speed_gain_raw": 3000,
+      "speed_integral_raw": 10,
+      "retained_rows": 1909,
+      "commands_total": null,
+      "trace_rows_dropped": null,
+      "trace_start_of_retained_targets_s": 0.005400000035763242,
+      "trace_end_of_retained_targets_s": 11.316200000047687,
+      "trace_end_of_reply_s": 11.32070000004768,
+      "retained_window_targets_per_second": 168.68833327421478,
+      "target_gap_ms": {
+        "min": 4.399999976158142,
+        "median": 4.799999952311396,
+        "p95": 16.199999988074865,
+        "p99": 26.699999988082368,
+        "max": 31.300000011924567
+      },
+      "target_reply_ms": {
+        "min": 4.299999952309008,
+        "median": 4.600000023842199,
+        "p95": 5.8999999761510935,
+        "p99": 7.399999976158256,
+        "max": 16.000000000005343
+      },
+      "following_error_mm": {
+        "min": 0.013427734375,
+        "median": 5.65673828125,
+        "p95": 9.166259765625,
+        "p99": 11.86767578125,
+        "max": 13.892822265625
+      },
+      "generation_to_submission_ms": {
+        "min": 0,
+        "median": 0,
+        "p95": 0.10000002384913387,
+        "p99": 0.20000004768405688,
+        "max": 0.5000000000023874
+      },
+      "planned_peak_velocity_mm_s": 463.1980576695728,
+      "span_mm": {
+        "command": 98.388671875,
+        "reported_encoder": 97.515869140625
+      },
+      "lag_fit_to_reply_receipt": {
+        "delay_ms": 28.5,
+        "rms_mm": 1.1867852762268418,
+        "max_error_mm": 8.083774342613008,
+        "samples": 1573
+      },
+      "fault": null,
+      "stop_confirmed": true
+    },
+    {
+      "capture": "ossm-tuning-direct40-sine-1p5-70",
+      "execution_context": "window",
+      "parameters": {
+        "rate_hz": 1.4985372650797282,
+        "stroke": 0.7,
+        "center": 0.5,
+        "shape": "sine",
+        "attack_s": 0.8,
+        "release_s": 1.2,
+        "env_to_stroke": false,
+        "lfo_rate_hz": 0.07,
+        "lower": 0.1,
+        "upper": 0.9,
+        "patches": []
+      },
+      "drive_acceleration_setting": 60040,
+      "position_gain_raw": 3000,
+      "speed_gain_raw": 3000,
+      "speed_integral_raw": 10,
+      "retained_rows": 4096,
+      "commands_total": null,
+      "trace_rows_dropped": null,
+      "trace_start_of_retained_targets_s": 0.7693999999761729,
+      "trace_end_of_retained_targets_s": 25.299099999964255,
+      "trace_end_of_reply_s": 25.305399999976174,
+      "retained_window_targets_per_second": 166.94048439247075,
+      "target_gap_ms": {
+        "min": 4.299999952309008,
+        "median": 4.800000011925931,
+        "p95": 19.000000000005457,
+        "p99": 26.499999999998636,
+        "max": 31.900000035761877
+      },
+      "target_reply_ms": {
+        "min": 4.299999952309008,
+        "median": 4.699999988076797,
+        "p95": 5.800000011930706,
+        "p99": 7.300000011923657,
+        "max": 27.699999988072932
+      },
+      "following_error_mm": {
+        "min": 0.00244140625,
+        "median": 5.703125,
+        "p95": 9.0478515625,
+        "p99": 11.717529296875,
+        "max": 13.73291015625
+      },
+      "generation_to_submission_ms": {
+        "min": 0,
+        "median": 0,
+        "p95": 0.10000002384913387,
+        "p99": 0.29999995231833054,
+        "max": 0.5000000000165983
+      },
+      "planned_peak_velocity_mm_s": 463.1981616238075,
+      "span_mm": {
+        "command": 98.388671875,
+        "reported_encoder": 97.72705078125
+      },
+      "lag_fit_to_reply_receipt": {
+        "delay_ms": 28.5,
+        "rms_mm": 1.1300148678502588,
+        "max_error_mm": 6.157218912341804,
+        "samples": 3891
+      },
+      "fault": null,
+      "stop_confirmed": true
+    },
+    {
+      "capture": "ossm-final-worker-sine-1p5-70",
+      "execution_context": "dedicated_worker",
+      "parameters": {
+        "rate_hz": 1.4985372650797282,
+        "stroke": 0.7,
+        "center": 0.5,
+        "shape": "sine",
+        "attack_s": 0.8,
+        "release_s": 1.2,
+        "env_to_stroke": false,
+        "lfo_rate_hz": 0.07,
+        "lower": 0.1,
+        "upper": 0.9,
+        "patches": []
+      },
+      "drive_acceleration_setting": 60000,
+      "position_gain_raw": 3000,
+      "speed_gain_raw": 3000,
+      "speed_integral_raw": 10,
+      "retained_rows": 2179,
+      "commands_total": 2179,
+      "trace_rows_dropped": 0,
+      "trace_start_of_retained_targets_s": 0.009800000011921384,
+      "trace_end_of_retained_targets_s": 12.733800000011918,
+      "trace_end_of_reply_s": 12.798399999976162,
+      "retained_window_targets_per_second": 171.17258723671804,
+      "target_gap_ms": {
+        "min": 4.200000047688945,
+        "median": 4.80000001191172,
+        "p95": 8.799999952316284,
+        "p99": 27.299999952319354,
+        "max": 33.00000000000125
+      },
+      "target_reply_ms": {
+        "min": 4.200000047688945,
+        "median": 4.699999988076797,
+        "p95": 5.100000023844586,
+        "p99": 6.000000000000227,
+        "max": 64.59999996424415
+      },
+      "following_error_mm": {
+        "min": 0.00732421875,
+        "median": 5.6201171875,
+        "p95": 9.083251953125,
+        "p99": 12.04345703125,
+        "max": 13.994140625
+      },
+      "generation_to_submission_ms": {
+        "min": 0,
+        "median": 0,
+        "p95": 0.10000002384913387,
+        "p99": 0.1999999880837322,
+        "max": 0.499999999995282
+      },
+      "planned_peak_velocity_mm_s": 463.1974830873521,
+      "span_mm": {
+        "command": 98.388671875,
+        "reported_encoder": 97.666015625
+      },
+      "lag_fit_to_reply_receipt": {
+        "delay_ms": 28.5,
+        "rms_mm": 1.1432870822433143,
+        "max_error_mm": 5.702033628707324,
+        "samples": 1841
+      },
+      "fault": "RS485: Error: Motion continuity lost: unsent travel exceeded the tracking corridor. No catch-up target was sent.",
+      "stop_confirmed": true
+    },
+    {
+      "capture": "ossm-worker-direct-gain6000-sine-1-30",
+      "execution_context": "dedicated_worker",
+      "parameters": {
+        "rate_hz": 0.998911714399486,
+        "stroke": 0.3,
+        "center": 0.5,
+        "shape": "sine",
+        "attack_s": 0.8,
+        "release_s": 1.2,
+        "env_to_stroke": false,
+        "lfo_rate_hz": 0.07,
+        "lower": 0.1,
+        "upper": 0.9,
+        "patches": []
+      },
+      "drive_acceleration_setting": 60000,
+      "position_gain_raw": 6000,
+      "speed_gain_raw": 3000,
+      "speed_integral_raw": 10,
+      "retained_rows": 2240,
+      "commands_total": 2240,
+      "trace_rows_dropped": 0,
+      "trace_start_of_retained_targets_s": 0.00839999997614882,
+      "trace_end_of_retained_targets_s": 13.407699999988083,
+      "trace_end_of_reply_s": 13.412199999988076,
+      "retained_window_targets_per_second": 167.09828125334948,
+      "target_gap_ms": {
+        "min": 4.300000011909333,
+        "median": 4.80000001191172,
+        "p95": 19.10000002384038,
+        "p99": 27.399999976154277,
+        "max": 73.79999995231401
+      },
+      "target_reply_ms": {
+        "min": 4.299999952309008,
+        "median": 4.699999988076797,
+        "p95": 5.199999988079185,
+        "p99": 7.200000047689059,
+        "max": 61.80000001192809
+      },
+      "following_error_mm": {
+        "min": 0,
+        "median": 0.665283203125,
+        "p95": 1.322021484375,
+        "p99": 2.579345703125,
+        "max": 6.278076171875
+      },
+      "generation_to_submission_ms": {
+        "min": 0,
+        "median": 0,
+        "p95": 0.10000002384913387,
+        "p99": 0.1999999880837322,
+        "max": 0.6999999880719088
+      },
+      "planned_peak_velocity_mm_s": 132.52498009110548,
+      "span_mm": {
+        "command": 42.230224609375,
+        "reported_encoder": 42.252197265625
+      },
+      "lag_fit_to_reply_receipt": {
+        "delay_ms": 19,
+        "rms_mm": 0.586998361657552,
+        "max_error_mm": 14.884504712810113,
+        "samples": 1903
+      },
+      "fault": null,
+      "stop_confirmed": true
+    },
+    {
+      "capture": "ossm-worker-direct-gain6000-sine-1p5-70",
+      "execution_context": "dedicated_worker",
+      "parameters": {
+        "rate_hz": 1.4985372650797282,
+        "stroke": 0.7,
+        "center": 0.5,
+        "shape": "sine",
+        "attack_s": 0.8,
+        "release_s": 1.2,
+        "env_to_stroke": false,
+        "lfo_rate_hz": 0.07,
+        "lower": 0.1,
+        "upper": 0.9,
+        "patches": []
+      },
+      "drive_acceleration_setting": 60000,
+      "position_gain_raw": 6000,
+      "speed_gain_raw": 3000,
+      "speed_integral_raw": 10,
+      "retained_rows": 1468,
+      "commands_total": 1468,
+      "trace_rows_dropped": 0,
+      "trace_start_of_retained_targets_s": 0.004099999964239487,
+      "trace_end_of_retained_targets_s": 8.562999999999988,
+      "trace_end_of_reply_s": 8.59039999997617,
+      "retained_window_targets_per_second": 171.40053044128015,
+      "target_gap_ms": {
+        "min": 4.299999952309008,
+        "median": 4.799999952297185,
+        "p95": 9.000000000014552,
+        "p99": 27.3999999761827,
+        "max": 28.900000035775975
+      },
+      "target_reply_ms": {
+        "min": 4.199999988088621,
+        "median": 4.60000002385641,
+        "p95": 5.100000023844586,
+        "p99": 6.000000000028649,
+        "max": 27.3999999761827
+      },
+      "following_error_mm": {
+        "min": 0.003662109375,
+        "median": 2.359619140625,
+        "p95": 7.4462890625,
+        "p99": 10.224609375,
+        "max": 11.75537109375
+      },
+      "generation_to_submission_ms": {
+        "min": 0,
+        "median": 0,
+        "p95": 0.10000002384913387,
+        "p99": 0.19999998806952135,
+        "max": 0.7000000476864443
+      },
+      "planned_peak_velocity_mm_s": 463.8893310877669,
+      "span_mm": {
+        "command": 98.536376953125,
+        "reported_encoder": 98.49853515625
+      },
+      "lag_fit_to_reply_receipt": {
+        "delay_ms": 19,
+        "rms_mm": 1.7372386226090013,
+        "max_error_mm": 7.625296456463548,
+        "samples": 1128
+      },
+      "fault": "RS485: Error: Motion continuity lost: unsent travel exceeded the tracking corridor. No catch-up target was sent.",
+      "stop_confirmed": true
+    }
+  ],
+  "measurement_limits": [
+    "Nominal distances assume 819.2 counts/mm.",
+    "Reply-receipt lag includes unknown motor/USB/read-task sampling latency.",
+    "Following error compares fresh replies with the preceding accepted target.",
+    "Rates are retained-window command rates, not pattern frequency.",
+    "Timer-lateness and final typed Clear fault recovery await physical validation.",
+    "New trials were not watched for human smoothness acceptance."
+  ],
+  "interruption": {
+    "usb_adapter_disappeared_from_macos_and_chrome": true,
+    "prior_stop_confirmed": true,
+    "last_known_native_setting": 60000,
+    "last_known_position_gain_raw": 6000,
+    "gain_is_volatile": true,
+    "restoration_to_reviewed_3000_not_yet_physically_verified": true,
+    "required_next_step": "Reconnect USB; reviewed Home verifies and restores gain 3000 before motion."
+  }
+}

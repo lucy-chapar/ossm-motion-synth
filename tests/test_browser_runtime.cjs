@@ -4,12 +4,12 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const { createRuntime } = require("../virtual_synth/static/browser-runtime.js");
 
-function setup({ supported = true, factory, storage } = {}) {
+function setup({ supported = true, factory, storage, diagnosticScheduler } = {}) {
   let now = 0, choices = 0, opens = 0;
   const port = { getInfo: () => ({ usbVendorId: 1027, usbProductId: 24577 }) };
   const listeners = {};
   const serial = supported ? { addEventListener: (name,fn)=>{listeners[name]=fn;}, removeEventListener: ()=>{}, getPorts: async () => [port], requestPort: () => { choices++; return Promise.resolve(port); } } : null;
-  const runtime = createRuntime({ serial, storage, clock: () => now, autoStart: false,
+  const runtime = createRuntime({ serial, storage, clock: () => now, autoStart: false, diagnosticScheduler,
     transportFactory: (selected) => { assert.equal(selected, port); opens++; return factory(); } });
   const action = (name, details = {}) => runtime.request("/api/action", { action: name, ...details });
   return { runtime, action, advance: (dt) => { now += dt; }, time: () => now, port,
@@ -33,7 +33,23 @@ function fakeMotor({ stopConfirmed = true } = {}) {
     async close() { calls.push("close"); hw.connected = false; return this.status(); } };
 }
 
-test("production browser factory retains the full host budget with the faster servo ramp", async () => {
+function diagnosticTimer() {
+  let current = null, cleared = 0, unreferenced = 0;
+  return {
+    scheduler: {
+      setInterval(callback, milliseconds) {
+        assert.equal(milliseconds,20);
+        current = { callback, active:true, unref() { unreferenced++; } }; return current;
+      },
+      clearInterval(timer) { timer.active=false; cleared++; },
+    },
+    fire() { if(current?.active) current.callback(); },
+    captured() { return current?.callback; },
+    counts() { return {cleared,unreferenced,active:Boolean(current?.active)}; },
+  };
+}
+
+test("production browser factory selects direct servo motion while retaining the full host budget", async () => {
   const {MotorTransport} = require("../virtual_synth/static/web-serial-transport.js");
   const previous = globalThis.MotionWebSerialTransport;
   const motor = fakeMotor(); motor.hw.homed = true; motor.hw.raw_bounds = [1000, 146000];
@@ -54,7 +70,7 @@ test("production browser factory retains the full host budget with the faster se
   const action = (name, fields = {}) => runtime.request("/api/action", {action: name, ...fields});
   try {
     await action("connect", {port: await runtime.choosePort()});
-    assert.equal(configured.motion_profile, "servo_ramped");
+    assert.equal(configured.motion_profile, "servo_direct");
     assert.equal(configured.max_acceleration_raw_s2 / 819.2, 6000);
     assert.equal(configured.max_velocity_raw_s / 819.2, 1080);
     assert.equal(configured.max_jerk_raw_s3 / 819.2, 100000);
@@ -123,6 +139,145 @@ test("connect is read-only; home completes before hardware can arm", async () =>
   assert.ok(command[1] - .5 <= .5 * motor.hw.max_acceleration_raw_s2 / 19660 * .1 ** 2);
 });
 
+test("motion diagnostics preserve the recorded run settings after stopped controls change", async () => {
+  const motors = [fakeMotor(), fakeMotor()];
+  for (const motor of motors) {
+    motor.hw.homed = true;
+    motor.motionDiagnostics = () => ({ rows: [] });
+  }
+  const env = setup({ factory: () => motors.shift() });
+  await env.connect(); await env.action("configure", { params: { rate_hz: 1.5, stroke: .7 } });
+  await env.action("play"); env.advance(.01); await env.runtime.tick();
+  await assert.rejects(env.runtime.request("/api/motion-diagnostics"), /Stop output/);
+  await env.action("stop");
+  await env.action("configure", { params: { rate_hz: 2.5, stroke: .3 } });
+  const saved = await env.runtime.request("/api/motion-diagnostics");
+  assert.equal(saved.parameters.rate_hz, 1.5); assert.equal(saved.parameters.stroke, .7);
+  assert.equal(saved.parameters_at_export.rate_hz, 2.5); assert.equal(saved.parameters_at_export.stroke, .3);
+  assert.deepEqual(saved.configuration_changes, []);
+  saved.parameters.rate_hz = .02;
+  assert.equal((await env.runtime.request("/api/motion-diagnostics")).parameters.rate_hz, 1.5,
+    "exported settings are detached from the retained run record");
+  await env.action("disconnect"); await env.connect();
+  assert.equal((await env.runtime.request("/api/motion-diagnostics")).parameters, null,
+    "a different connection cannot inherit another motor's run record");
+  await env.runtime.close();
+});
+
+test("motion diagnostics retain a bounded timeline of accepted active configuration changes", async () => {
+  const motor = fakeMotor(); motor.hw.homed = true;
+  motor.motionDiagnostics = () => ({ rows: [], trace_started_s: motor.hw.command_trace_started_s });
+  const env = setup({ factory: () => motor }), start = motor.start.bind(motor);
+  motor.start = async () => {
+    await start(); motor.hw.command_trace_started_s = env.time() - .007;
+    return motor.status();
+  };
+  env.advance(2); await env.connect(); await env.action("play");
+  env.advance(.002); await env.runtime.tick();
+  await assert.rejects(env.action("configure", { params: { lower: .2 } }), /Stop output/);
+  const sentBefore = motor.calls.filter(Array.isArray).length;
+  for (let i = 0; i < 130; i++) {
+    env.advance(.001);
+    await env.action("configure", { params: { rate_hz: .25 + i * .001 } });
+  }
+  assert.equal(motor.calls.filter(Array.isArray).length, sentBefore, "recording configuration does not generate target commands");
+  await env.action("stop"); await env.action("configure", { params: { stroke: .33 } });
+  const saved = await env.runtime.request("/api/motion-diagnostics");
+  assert.equal(saved.parameters.rate_hz, .25); assert.equal(saved.parameters.stroke, .7);
+  assert.equal(saved.parameters_at_export.stroke, .33);
+  assert.equal(saved.configuration_changes_capacity, 128); assert.equal(saved.configuration_changes.length, 128);
+  assert.equal(saved.configuration_changes_dropped, 2, "only accepted active changes count toward the ring");
+  assert.equal(saved.configuration_changes[0].parameters.rate_hz, .252);
+  assert.equal(saved.configuration_changes.at(-1).parameters.rate_hz, .379);
+  assert.equal(saved.run_started_at_s, saved.motion.trace_started_s, "configuration and target traces share their exact clock origin");
+  assert.ok(Math.abs(saved.configuration_changes[0].elapsed_s - .012) < 1e-9);
+  assert.ok(saved.configuration_changes.every((item, i, changes) => i === 0 || item.elapsed_s >= changes[i - 1].elapsed_s));
+  await env.runtime.close();
+});
+
+test("Resume captures a new diagnostic segment from the current paused controls", async () => {
+  const motor = fakeMotor(); motor.hw.homed = true;
+  motor.motionDiagnostics = () => ({ rows: [] });
+  const env = setup({ factory: () => motor });
+  await env.connect(); await env.action("play");
+  env.advance(.01); await env.runtime.tick();
+  await env.action("configure", { params: { rate_hz: .3 } });
+  await env.action("pause"); await env.action("configure", { params: { stroke: .35 } });
+  await env.action("resume"); env.advance(.01); await env.runtime.tick(); await env.action("stop");
+  const saved = await env.runtime.request("/api/motion-diagnostics");
+  assert.equal(saved.parameters.rate_hz, .3); assert.equal(saved.parameters.stroke, .35);
+  assert.deepEqual(saved.configuration_changes, [], "the resumed transport trace cannot inherit changes from its preceding trace");
+  assert.equal(saved.configuration_changes_dropped, 0);
+  await env.runtime.close();
+});
+
+test("independent diagnostic timers remain responsive during late fake serial I/O without advancing motion",async()=>{
+  const motor=fakeMotor();motor.hw.homed=true;motor.motionDiagnostics=()=>({rows:[]});
+  const timer=diagnosticTimer(),env=setup({factory:()=>motor,diagnosticScheduler:timer.scheduler});
+  let finishReply;
+  motor.command=async resolve=>{
+    motor.calls.push(["command",resolve()]);
+    await new Promise(resolve=>{finishReply=resolve;});return motor.status();
+  };
+  await env.connect();await env.action("play");env.advance(.005);
+  const pending=env.runtime.tick();await new Promise(setImmediate);
+  assert.equal(typeof finishReply,"function");
+  const before=env.runtime.state().signal;
+  for(let i=0;i<4;i++){env.advance(.02);timer.fire();}
+  assert.deepEqual(env.runtime.state().signal,before,"the timer must not step or extrapolate the engine");
+  assert.equal(motor.calls.filter(Array.isArray).length,1,"the timer never produces a target");
+  await assert.rejects(env.runtime.request("/api/motion-diagnostics"),/Stop output/);
+  finishReply();await pending;await env.action("stop");
+  const saved=await env.runtime.request("/api/motion-diagnostics"),rows=saved.timer_lateness.rows;
+  assert.equal(saved.timer_lateness.enabled,true);assert.equal(rows.length,4);
+  assert.ok(rows.every(row=>row.interval_s <= .025 + 1e-9 && row.lateness_s <= .005 + 1e-9),
+    "an 80 ms serial await does not resemble an 80 ms owner scheduling stall");
+  assert.ok(rows.slice(1).every(row=>Math.abs(row.interval_s-.02)<1e-9));
+  assert.equal(timer.counts().active,false);assert.equal(timer.counts().unreferenced,1);
+  await env.runtime.close();
+});
+
+test("diagnostic timer stores one actual late callback, bounds its ring, and resets on Run and Resume",async()=>{
+  const motor=fakeMotor();motor.hw.homed=true;motor.motionDiagnostics=()=>({rows:[]});
+  const timer=diagnosticTimer(),env=setup({factory:()=>motor,diagnosticScheduler:timer.scheduler});
+  await env.connect();await env.action("play");
+  env.advance(.1);timer.fire();await env.action("stop");
+  const late=await env.runtime.request("/api/motion-diagnostics");
+  assert.equal(late.timer_lateness.rows.length,1,"a held callback never invents catch-up rows");
+  assert.deepEqual(late.timer_lateness.rows[0],{elapsed_run_s:.1,interval_s:.1,lateness_s:.08});
+  late.timer_lateness.rows[0].interval_s=99;
+  assert.equal((await env.runtime.request("/api/motion-diagnostics")).timer_lateness.rows[0].interval_s,.1,
+    "export rows are detached from the numeric ring");
+  env.advance(.5);timer.fire();
+  assert.equal((await env.runtime.request("/api/motion-diagnostics")).timer_lateness.rows.length,1,"Stop preserves the run without idle rows");
+  await env.action("play");
+  for(let i=0;i<515;i++){env.advance(.02);timer.fire();}
+  await env.action("pause");
+  const bounded=await env.runtime.request("/api/motion-diagnostics");
+  assert.equal(bounded.timer_lateness.capacity,512);assert.equal(bounded.timer_lateness.rows.length,512);
+  assert.equal(bounded.timer_lateness.dropped,3);
+  assert.ok(Math.abs(bounded.timer_lateness.rows[0].elapsed_run_s-.08)<1e-9);
+  assert.ok(bounded.timer_lateness.rows.every(row=>Object.values(row).every(Number.isFinite)));
+  await env.action("resume");env.advance(.02);timer.fire();await env.action("stop");
+  const resumed=await env.runtime.request("/api/motion-diagnostics");
+  assert.equal(resumed.timer_lateness.rows.length,1);assert.equal(resumed.timer_lateness.dropped,0);
+  assert.ok(Math.abs(resumed.timer_lateness.rows[0].elapsed_run_s-.02)<1e-9);
+  await env.action("play");const queued=timer.captured();await env.runtime.close();
+  assert.equal(timer.counts().active,false,"close clears the independent timer");
+  env.advance(.5);queued();
+  assert.deepEqual((await env.runtime.request("/api/motion-diagnostics")).timer_lateness.rows,[],
+    "an already queued callback after close does not add a row");
+});
+
+test("autoStart false disables diagnostic timer work unless an explicit test scheduler is injected",async()=>{
+  const motor=fakeMotor();motor.hw.homed=true;motor.motionDiagnostics=()=>({rows:[]});
+  const env=setup({factory:()=>motor});await env.connect();await env.action("play");
+  env.advance(.1);await env.runtime.tick();await env.action("stop");
+  const saved=await env.runtime.request("/api/motion-diagnostics");
+  assert.equal(saved.timer_lateness.enabled,false);assert.deepEqual(saved.timer_lateness.rows,[]);
+  await env.runtime.close();
+});
+
 test("every baud generates one fresh target per completed hardware tick, including Resume", async () => {
   for (const baud of [undefined, 19200, 38400, 115200]) {
     const motor = fakeMotor(); motor.hw.homed = true; motor.hw.baud = baud;
@@ -146,7 +301,7 @@ test("Pause and Resume retain the retimed hardware phase rather than the faster 
   const env = setup({factory: () => motor});
   await env.connect(); await env.action("configure", {params: {rate_hz: 4, stroke: .7}});
   await env.action("play");
-  env.advance(.17); await env.runtime.tick();
+  for (let i = 0; i < 17; i++) { env.advance(.01); await env.runtime.tick(); }
   const before = env.runtime.state().signal;
   assert.equal(before.rate_limited, true);
   assert.ok(Math.abs(before.reference_phase - before.phase) > .1);
@@ -243,8 +398,8 @@ test("scheduling and heartbeat failures still stop a long-running pattern", asyn
     const motor = fakeMotor(); motor.hw.homed = true;
     const env = setup({ factory: () => motor });
     await env.connect(); await env.action("arm"); await env.action("run");
-    for (let i = 0; i < 78; i++) {
-      env.advance(.25); await env.action("heartbeat"); await env.runtime.tick();
+    for (let i = 0; i < 390; i++) {
+      env.advance(.05); await env.action("heartbeat"); await env.runtime.tick();
     }
     assert.equal(env.runtime.state().running, true);
     const commands = motor.calls.filter(Array.isArray).length;
@@ -342,6 +497,7 @@ test("hardware arming refuses a missing or invalid physical jerk limit", async (
 });
 
 test("hardware samples after guards and starts the next cycle on completion without overlap", async () => {
+  const {Engine} = require("../virtual_synth/static/browser-engine.js");
   const motor = fakeMotor(); motor.hw.homed = true;
   const env = setup({factory: () => motor}), sent = [];
   let active = 0, maximumActive = 0;
@@ -349,17 +505,28 @@ test("hardware samples after guards and starts the next cycle on completion with
     maximumActive = Math.max(maximumActive, ++active);
     env.advance(.024);
     const position = resolve();
-    sent.push({time: env.time(), position, phase: env.runtime.state().signal.phase});
+    sent.push({time: env.time(), position, signal: env.runtime.state().signal});
     env.advance(.021); active--;
     return motor.status();
   };
   await env.connect(); await env.action("play");
   for (let i = 0; i < 20; i++) { await env.action("heartbeat"); await env.runtime.tick(); }
   assert.equal(sent.length, 20); assert.equal(maximumActive, 1);
+  const reference = new Engine(env.runtime.state().params), span = motor.hw.raw_bounds[1] - motor.hw.raw_bounds[0];
+  reference.reset({position:motor.hw.position_normalized, vmax:motor.hw.max_velocity_raw_s/span,
+    amax:motor.hw.max_acceleration_raw_s2/span, jmax:motor.hw.max_jerk_raw_s3/span});
+  const wrap = phase => ((phase % 1) + 1) % 1;
+  const origin = sent[0].signal.phase - sent[0].time * reference.params.rate_hz;
   for (let i = 0; i < sent.length; i++) {
     assert.ok(Math.abs(sent[i].time - (.024 + i * .045)) < 1e-9);
-    assert.ok(Math.abs(sent[i].phase - ((sent[i].time * .25) % 1)) < 1e-9,
-      "phase includes guard latency before generating the target");
+    const expected = reference.step(sent[i].time - (i ? sent[i-1].time : 0), {running:true, tracking:true});
+    for (const key of ["command", "velocity", "acceleration", "planned_reference", "reference_phase"]) {
+      assert.ok(Math.abs(sent[i].signal[key] - expected[key]) < 1e-9,
+        `${key} samples the independently configured real planner after guard latency`);
+    }
+    assert.ok(Math.abs(sent[i].position - expected.command) < 1e-9);
+    assert.ok(Math.abs(sent[i].signal.phase - wrap(origin + sent[i].time * reference.params.rate_hz)) < 1e-9,
+      "phase includes each guard interval from its aligned startup origin");
   }
   env.advance(.004); await env.runtime.tick();
   assert.equal(sent.length, 21, "next fresh target is not held for an arbitrary deadline");
@@ -433,6 +600,7 @@ test("pause verifies stop, freezes phase, and resumes with fresh encoder positio
   assert.equal(env.runtime.state().paused, true);
   assert.equal(env.runtime.state().running, false);
   const phase = env.runtime.state().signal.phase;
+  const referencePhase = env.runtime.state().signal.reference_phase;
   env.advance(2); await env.runtime.tick();
   assert.equal(env.runtime.state().signal.phase, phase);
   motor.hw.position_normalized = .53;
@@ -440,8 +608,17 @@ test("pause verifies stop, freezes phase, and resumes with fresh encoder positio
   assert.equal(env.runtime.state().running, true);
   assert.equal(env.runtime.state().paused, false);
   assert.equal(env.runtime.state().signal.phase, phase);
+  assert.equal(env.runtime.state().signal.reference_phase, referencePhase);
+  assert.equal(env.runtime.state().signal.command, .53, "Resume starts from the fresh stationary encoder");
+  assert.equal(env.runtime.state().signal.velocity, 0);
+  assert.equal(env.runtime.state().signal.acceleration, 0);
   env.advance(.06); await env.runtime.tick();
-  assert.ok(env.runtime.state().signal.command > .52);
+  const resumed = env.runtime.state().signal, span = motor.hw.raw_bounds[1] - motor.hw.raw_bounds[0];
+  assert.ok(Number.isFinite(resumed.command) && resumed.command >= .1 && resumed.command <= .9);
+  assert.ok(Math.abs(resumed.command - .53) <= .5 * motor.hw.max_acceleration_raw_s2 / span * .06 ** 2 + 1e-9,
+    "resumed movement is bounded from the fresh encoder without a direction assumption");
+  assert.notEqual(resumed.command, .53, "the resumed planner produces useful nonzero motion");
+  assert.ok(Math.abs(resumed.phase - ((phase + env.runtime.state().params.rate_hz * .06) % 1)) < 1e-9);
   await env.action("stop");
   await assert.rejects(env.action("resume"), /paused/);
 });
@@ -573,6 +750,64 @@ test("automatic hardware loop exceeds 500 Hz fake completion rate and yields pro
     await new Promise(resolve => setTimeout(resolve,15)); assert.equal(commands,stopAt);
     assert.equal(runtime.state().running,false); assert.equal(runtime.state().fault,null);
   } finally {await runtime.close();}
+});
+
+test("automatic yields measure synchronous planning rather than time awaiting native replies", async () => {
+  const fs = require("node:fs"), vm = require("node:vm"), path = require("node:path");
+  const filename = path.join(__dirname, "../virtual_synth/static/browser-runtime.js");
+  const engineAPI = require("../virtual_synth/static/browser-engine.js");
+  for (const plannerMs of [0, 2]) {
+    let wallMs = 0, commands = 0, extraTasks = 0, runtime;
+    class TimedEngine extends engineAPI.Engine {
+      step(dt, controls) { wallMs += plannerMs; return super.step(dt, { ...controls }); }
+      reset(options) { return super.reset({ ...options }); }
+      configure(params) { return super.configure({ ...params }); }
+    }
+    class Channel {
+      constructor() {
+        this.port1 = { unref() {}, close() {} };
+        this.port2 = { unref() {}, close() {}, postMessage: () => {
+          extraTasks++; setImmediate(() => this.port1.onmessage());
+        } };
+      }
+    }
+    const module = { exports: {} };
+    vm.runInNewContext(fs.readFileSync(filename, "utf8"), {
+      module, require: name => {
+        assert.equal(name, "./browser-engine.js");
+        return { ...engineAPI, Engine: TimedEngine };
+      },
+      performance: { now: () => wallMs }, structuredClone, queueMicrotask,
+      MessageChannel: Channel, clearTimeout,
+      setTimeout(fn, ms) { if (ms === 0) extraTasks++; return setTimeout(fn, ms); },
+    }, { filename });
+    const motor = fakeMotor(); motor.hw.homed = true;
+    const port = {}, serial = { requestPort: async () => port, getPorts: async () => [port] };
+    let resolveStopped;
+    const stopped = new Promise(resolve => { resolveStopped = resolve; });
+    motor.command = async resolveTarget => {
+      resolveTarget();
+      // Native receive completion is an event-loop task. Its elapsed time must
+      // not be charged to the synchronous planner responsiveness budget.
+      await new Promise(setImmediate); wallMs += 5;
+      if (++commands === 31) queueMicrotask(() => runtime.stop().then(resolveStopped));
+      return motor.status();
+    };
+    runtime = module.exports.createRuntime({ serial, clock: () => wallMs / 1000,
+      storage: null, transportFactory: () => motor });
+    let deadline;
+    try {
+      await runtime.request("/api/action", { action: "connect", port: await runtime.choosePort() });
+      await runtime.request("/api/action", { action: "play" });
+      await Promise.race([stopped, new Promise((_, reject) => {
+        deadline = setTimeout(() => reject(new Error("Reply-driven loop did not stop")), 2000);
+      })]);
+      assert.equal(commands, 31);
+      if (plannerMs === 0) assert.equal(extraTasks, 0, "native reply awaits already yield to event-loop tasks");
+      else assert.ok(extraTasks >= 15, "expensive synchronous planning still forces responsive task yields");
+      assert.equal(runtime.state().running, false); assert.equal(runtime.state().fault, null);
+    } finally { clearTimeout(deadline); await runtime.close(); }
+  }
 });
 
 test("fast hardware history stays around 50 Hz over ten seconds instead of every transaction", async () => {

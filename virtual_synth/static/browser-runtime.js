@@ -7,7 +7,10 @@
     ? require("./browser-engine.js") : root.MotionBrowserEngine;
   const exported = factory(engine);
   if (typeof module === "object" && module.exports) module.exports = exported;
-  else root.MotionBrowserRuntime = exported.createRuntime();
+  else {
+    root.MotionBrowserRuntimeAPI = exported;
+    if (!root.MotionWorkerOwner && !root.MotionBrowserRuntime) root.MotionBrowserRuntime = exported.createRuntime();
+  }
 })(globalThis, (engineAPI) => {
   const HISTORY_PERIOD = .02, HISTORY_SECONDS = 10;
   const copy = (value) => structuredClone(value);
@@ -18,12 +21,19 @@
     }
     return bounds[1] - bounds[0];
   };
+  const trackingBudgetOf = hw => {
+    const span = spanOf(hw), velocity = hw.max_velocity_raw_s;
+    if (!Number.isFinite(velocity) || velocity <= 0) throw new Error("Motor tracking budget is unavailable.");
+    // Match the transport's existing following corridor in raw encoder
+    // counts, then normalize once to the engine's measured working range.
+    return Math.min(span * .1, 1024 + velocity * .1) / span;
+  };
 
   function createRuntime(options = {}) {
     const clock = options.clock || (() => performance.now() / 1000);
     const serial = options.serial === undefined ? globalThis.navigator?.serial : options.serial;
     const transportFactory = options.transportFactory || ((port) => new globalThis.MotionWebSerialTransport.MotorTransport(port, {
-      allowMotion: true, fastPositions: true, motionProfile: "servo_ramped", baudRate: "auto",
+      allowMotion: true, fastPositions: true, motionProfile: "servo_direct", baudRate: "auto",
     }));
     const engine = new engineAPI.Engine();
     const motionReady = () => Boolean(engineAPI.motionReady?.());
@@ -44,11 +54,76 @@
     let mode = "simulation", armed = false, running = false, gate = false, fault = null;
     let unconfirmedStop = false, stoppingCount = 0, revision = 0, epoch = 0, busy = false, closed = false;
     let lastTick = clock(), began = lastTick, lastIO = lastTick, lastHeartbeat = lastTick;
-    let lastHistory = lastTick - HISTORY_PERIOD, lastTargetSampled = lastTick;
+    let lastHistory = lastTick - HISTORY_PERIOD, lastTargetSampled = lastTick, lastAcceptedTravel = 0;
     let signal = engine.step(0, { gate: false, running: false }), history = [];
     let chain = Promise.resolve();
     let timer = null;
     let automaticRunning = false, yieldChannel = null, yieldResolve = null, taskYields = 0;
+    let synchronousPlannerMs = 0;
+    const timedStep = (dt, controls) => {
+      const began = performance.now();
+      try { return engine.step(dt, controls); }
+      finally { synchronousPlannerMs += performance.now() - began; }
+    };
+    const CONFIGURATION_HISTORY_CAPACITY = 128;
+    const DIAGNOSTIC_TIMER_PERIOD = .02, DIAGNOSTIC_TIMER_CAPACITY = 512;
+    const diagnosticScheduler = options.diagnosticScheduler || (options.autoStart !== false
+      && typeof globalThis.setInterval === "function" && typeof globalThis.clearInterval === "function"
+      ? { setInterval: globalThis.setInterval.bind(globalThis), clearInterval: globalThis.clearInterval.bind(globalThis) } : null);
+    let diagnosticTransport = null, initialRunParameters = null, diagnosticRunStarted = null;
+    let lastContinuityGap = null;
+    let configurationChanges = [], configurationChangesDropped = 0;
+    // Numeric storage avoids allocating diagnostic rows in the target loop.
+    const diagnosticTimerRows = new Float64Array(DIAGNOSTIC_TIMER_CAPACITY * 3);
+    let diagnosticTimer = null, diagnosticTimerPrevious = null;
+    let diagnosticTimerCount = 0, diagnosticTimerNext = 0, diagnosticTimerDropped = 0;
+    function stopDiagnosticTimer() {
+      if (diagnosticTimer !== null) diagnosticScheduler.clearInterval(diagnosticTimer);
+      diagnosticTimer = null;
+    }
+    function timerDiagnostics(recordedRun) {
+      const rows = [];
+      if (recordedRun) {
+        const first = (diagnosticTimerNext - diagnosticTimerCount + DIAGNOSTIC_TIMER_CAPACITY) % DIAGNOSTIC_TIMER_CAPACITY;
+        for (let i = 0; i < diagnosticTimerCount; i++) {
+          const offset = ((first + i) % DIAGNOSTIC_TIMER_CAPACITY) * 3;
+          rows.push({ elapsed_run_s: diagnosticTimerRows[offset], interval_s: diagnosticTimerRows[offset + 1],
+            lateness_s: diagnosticTimerRows[offset + 2] });
+        }
+      }
+      return { enabled: Boolean(diagnosticScheduler), period_s: DIAGNOSTIC_TIMER_PERIOD,
+        capacity: DIAGNOSTIC_TIMER_CAPACITY, dropped: recordedRun ? diagnosticTimerDropped : 0, rows };
+    }
+    function beginRunDiagnostics() {
+      diagnosticTransport = transport;
+      initialRunParameters = copy(engine.params);
+      const traceStarted = transport.status().command_trace_started_s;
+      diagnosticRunStarted = Number.isFinite(traceStarted) ? traceStarted : clock();
+      configurationChanges = []; configurationChangesDropped = 0;
+      lastContinuityGap = null;
+      stopDiagnosticTimer();
+      diagnosticTimerCount = diagnosticTimerNext = diagnosticTimerDropped = 0;
+      diagnosticTimerPrevious = clock();
+      if (diagnosticScheduler) {
+        // Observe the owner event loop independently of serial awaits or the
+        // motion task chain. Record only callbacks that actually occurred;
+        // a delayed callback never fabricates catch-up samples or targets.
+        diagnosticTimer = diagnosticScheduler.setInterval(() => {
+          if (!running || closed) return;
+          const now = clock(), interval = now - diagnosticTimerPrevious;
+          if (!Number.isFinite(now) || !Number.isFinite(interval) || interval < 0) return;
+          diagnosticTimerPrevious = now;
+          const offset = diagnosticTimerNext * 3;
+          diagnosticTimerRows[offset] = now - diagnosticRunStarted;
+          diagnosticTimerRows[offset + 1] = interval;
+          diagnosticTimerRows[offset + 2] = Math.max(0, interval - DIAGNOSTIC_TIMER_PERIOD);
+          diagnosticTimerNext = (diagnosticTimerNext + 1) % DIAGNOSTIC_TIMER_CAPACITY;
+          if (diagnosticTimerCount < DIAGNOSTIC_TIMER_CAPACITY) diagnosticTimerCount++;
+          else diagnosticTimerDropped++;
+        }, DIAGNOSTIC_TIMER_PERIOD * 1000);
+        diagnosticTimer?.unref?.();
+      }
+    }
     const automaticEnabled = options.autoStart !== false;
     const yieldTask = () => new Promise(resolve => {
       // Periodically yield to timers too: repeatedly reposted channel tasks
@@ -72,7 +147,7 @@
       for (const [id, known] of ports) if (known === port) return id;
       const id = `adapter-${nextPort++}`; ports.set(id, port); return id;
     };
-    const supported = Boolean(serial && typeof serial.requestPort === "function");
+    const supported = Boolean(serial && typeof serial.getPorts === "function");
     const hardware = () => {
       if (transport) lastHardware = transport.status();
       return lastHardware;
@@ -95,6 +170,7 @@
     }
     function fence() {
       epoch++; revision++; paused = false; running = armed = gate = false;
+      stopDiagnosticTimer();
       signal = engine.step(0, { running: false, gate: false, tracking: mode === "hardware" });
     }
     function enqueue(task) {
@@ -137,7 +213,7 @@
       const activeHome = homing().active;
       if ((armed || activeHome) && now - lastHeartbeat > 1.5) await fail("Control tab heartbeat expired. Output stopped; rearm explicitly.");
       else if ((running && dt > 0.25) || (activeHome && dt > 1)) await fail("Motion scheduling deadline missed. No catch-up targets were sent.");
-      signal = engine.step(paused ? 0 : Math.min(dt, 0.25), { gate, running, tracking: mode === "hardware" });
+      signal = timedStep(paused ? 0 : Math.min(dt, 0.25), { gate, running, tracking: mode === "hardware" });
       if (transport && (running || now - lastIO >= (homing().active ? 0.1 : 0.5))) {
         lastIO = now;
         const ioEpoch = epoch, recoveriesBefore = transport.status().communication_recoveries || 0;
@@ -148,20 +224,61 @@
           } else if (running) {
             // A guard read can take tens of milliseconds. Sample the trajectory
             // after that read, immediately before submitting the current target.
+            let submittedTravel = null;
             lastHardware = await transport.command(() => {
-              if (ioEpoch !== epoch || !running) throw new Error("Output stopped before target generation.");
-              const sampledAt = clock(), elapsed = sampledAt - lastTick;
-              if (sampledAt - lastHeartbeat > 1.5) throw new Error("Control tab heartbeat expired before target generation.");
-              if (!Number.isFinite(elapsed) || elapsed < 0 || elapsed > .25 || sampledAt - lastTargetSampled > .25) {
-                throw new Error("Motion scheduling deadline missed. No catch-up targets were sent.");
+              const check = sampledAt => {
+                if (ioEpoch !== epoch || !running) throw new Error("Output stopped before target generation.");
+                if (sampledAt - lastHeartbeat > 1.5) throw new Error("Control tab heartbeat expired before target generation.");
+                const elapsed = sampledAt - lastTick;
+                if (!Number.isFinite(elapsed) || elapsed < 0 || elapsed > .25 || sampledAt - lastTargetSampled > .25) {
+                  throw new Error("Motion scheduling deadline missed. No catch-up targets were sent.");
+                }
+                if ((transport.status().communication_recoveries || 0) > recoveriesBefore) {
+                  throw new Error("Serial recovery interrupted the continuous trajectory. Stop and Play to recapture from stationary feedback.");
+                }
+                const travel = engine.commandedTravelUpper() - lastAcceptedTravel;
+                if (!Number.isFinite(travel) || travel < -1e-12) throw new Error("Commanded-motion history changed unexpectedly.");
+                const budget = trackingBudgetOf(transport.status());
+                if (travel > budget + 1e-12) {
+                  if (lastContinuityGap === null) {
+                    const hw = transport.status(), span = spanOf(hw), countsPerMm = hw.nominal_counts_per_mm;
+                    const mm = raw => Number.isFinite(countsPerMm) && countsPerMm > 0 ? raw / countsPerMm : null;
+                    // Preserve the rejected state before fail()/Stop resets
+                    // the trajectory. This allocation happens only on fault.
+                    lastContinuityGap = { elapsed_run_s: sampledAt - diagnosticRunStarted,
+                      unsent_travel_normalized: travel, unsent_travel_raw: travel * span, unsent_travel_mm: mm(travel * span),
+                      budget_normalized: budget, budget_raw: budget * span, budget_mm: mm(budget * span),
+                      elapsed_since_last_target_sample_s: sampledAt - lastTargetSampled,
+                      last_target_sampled_at_s: lastTargetSampled,
+                      last_target_sample_elapsed_run_s: lastTargetSampled - diagnosticRunStarted,
+                      pending_engine_pva: engine.trajectory.pva() };
+                  }
+                  throw Object.assign(new Error("Motion continuity lost: unsent travel exceeded the tracking corridor. No catch-up target was sent."),
+                    { code: "MOTION_CONTINUITY_GAP" });
+                }
+                return elapsed;
+              };
+              // Capture planning can consume several milliseconds. Advance
+              // across that work too, rather than submitting an old point and
+              // making the next frame jump ahead. Bounded corrective samples
+              // still produce exactly one wire target; all original fences
+              // apply before and after every advance.
+              for (let sample = 0; sample < 3; sample++) {
+                const sampledAt = clock(), elapsed = check(sampledAt);
+                signal = timedStep(elapsed, { gate, running: true, tracking: true });
+                lastTick = sampledAt;
+                const completedAt = clock(); check(completedAt);
+                if (completedAt - sampledAt <= .001 || sample === 2) break;
               }
-              if ((transport.status().communication_recoveries || 0) > recoveriesBefore) {
-                throw new Error("Serial recovery interrupted the continuous trajectory. Stop and Play to recapture from stationary feedback.");
-              }
-              signal = engine.step(elapsed, { gate, running: true, tracking: true });
-              lastTick = lastTargetSampled = sampledAt;
+              transport.recordPlannerSample?.(lastTick, signal.velocity, signal.acceleration);
+              lastTargetSampled = lastTick;
+              submittedTravel = engine.commandedTravelUpper();
               return signal.command;
             });
+            // A resolver invocation alone is not acceptance: retain the
+            // previous anchor if the write/reply was uncertain or cancelled.
+            if (submittedTravel !== null && ioEpoch === epoch && running
+                && (lastHardware?.communication_recoveries || 0) === recoveriesBefore) lastAcceptedTravel = submittedTravel;
           }
           else if (transport.status().connected && !fault) lastHardware = await transport.snapshot();
           // An uncertain write cannot freeze a position reference while its
@@ -196,13 +313,14 @@
       return { ports: allowed.map((port) => {
         const info = port.getInfo?.() || {}, id = remember(port);
         const usb = info.usbVendorId !== undefined ? `USB ${info.usbVendorId.toString(16).padStart(4, "0")}:${(info.usbProductId || 0).toString(16).padStart(4, "0")}` : "Serial adapter";
-        return { device: id, description: usb };
+        return { device: id, description: usb, identity: identity(port) };
       }) };
     }
     // Called directly from a click handler to retain transient user activation.
     function choosePort() {
       if (closed) return Promise.reject(new Error("This synth session is closed. Reload to start a new session."));
       if (!supported) return Promise.reject(new Error("Direct USB connection needs a browser with Web Serial, such as desktop Chrome or Edge."));
+      if (typeof serial.requestPort !== "function") return Promise.reject(new Error("Choose the USB adapter in the main browser window."));
       const requestedEpoch = epoch;
       return serial.requestPort().then((port) => {
         if (closed || requestedEpoch !== epoch) throw new Error("Adapter selection was cancelled. Choose again when ready.");
@@ -230,6 +348,12 @@
         const proposed = engineAPI.validateParams(payload.params, engine.params);
         if (armed && (proposed.lower !== engine.params.lower || proposed.upper !== engine.params.upper)) throw new Error("Stop output before changing maximum travel limits.");
         engine.configure(proposed);
+        if (running && transport && diagnosticTransport === transport) {
+          if (configurationChanges.length === CONFIGURATION_HISTORY_CAPACITY) {
+            configurationChanges.shift(); configurationChangesDropped++;
+          }
+          configurationChanges.push({ elapsed_s: clock() - diagnosticRunStarted, parameters: copy(engine.params) });
+        }
       } else if (name === "home_start") {
         if (!motionReady()) throw new Error("The local continuous-motion planner is not ready. Reload after its assets have loaded.");
         if (!Number.isInteger(payload.control_revision) || payload.control_revision !== revision) throw new Error("Controls changed since this Home request. Refresh status and start again.");
@@ -274,9 +398,11 @@
             const hw = await transport.start(); await assertCurrent();
             engine.trajectory.reset(hw.position_normalized);
             signal = engine.step(0, { running: false, gate: false, tracking: true });
+            beginRunDiagnostics();
           } catch (error) { await motionError("Cannot resume", error); }
         }
         paused = false; armed = running = true; lastTick = lastIO = lastHeartbeat = clock();
+        lastAcceptedTravel = engine.commandedTravelUpper();
         lastTargetSampled = lastTick; wakeAutomatic();
       } else if (name === "run") {
         if (!armed || running || fault) throw new Error("Arm a stopped, healthy synth before running.");
@@ -284,9 +410,11 @@
           try {
             const hw = await transport.start(); await assertCurrent();
             engine.reset({ position: hw.position_normalized }); signal = engine.step(0, { running: false, tracking: true });
+            beginRunDiagnostics();
           } catch (error) { await motionError("Cannot start", error); }
         }
         running = true; lastTick = lastIO = lastHeartbeat = clock();
+        lastAcceptedTravel = engine.commandedTravelUpper();
         lastTargetSampled = lastTick; wakeAutomatic();
       } else if (name === "gate") {
         if (typeof payload.value !== "boolean") throw new Error("Gate must be true or false.");
@@ -340,6 +468,19 @@
       if (path === "/api/session") return Promise.resolve({ token: "browser-session" });
       if (path === "/api/state") return Promise.resolve(state());
       if (path === "/api/ports") return listPorts();
+      if (path === "/api/motion-diagnostics") {
+        if (running || armed || homing().active || stoppingCount) return Promise.reject(new Error("Stop output before saving motion diagnostics."));
+        if (!transport?.motionDiagnostics) return Promise.reject(new Error("No motor diagnostics are available."));
+        const recordedRun = diagnosticTransport === transport;
+        return Promise.resolve({ parameters: recordedRun ? copy(initialRunParameters) : null,
+          parameters_at_export: copy(engine.params), run_started_at_s: recordedRun ? diagnosticRunStarted : null,
+          configuration_changes: recordedRun ? copy(configurationChanges) : [],
+          configuration_changes_capacity: CONFIGURATION_HISTORY_CAPACITY,
+          configuration_changes_dropped: recordedRun ? configurationChangesDropped : 0,
+          timer_lateness: timerDiagnostics(recordedRun),
+          last_continuity_gap: recordedRun ? copy(lastContinuityGap) : null,
+          fault, motion: transport.motionDiagnostics() });
+      }
       if (path !== "/api/action" || !payload || typeof payload.action !== "string") return Promise.reject(new Error("Expected an action object."));
       if (closed) return Promise.reject(new Error("This synth session is closed. Reload to start a new session."));
       const allowed = { configure: ["params"], gate: ["value"], connect: ["port"], home_start: ["direction", "control_revision"] };
@@ -390,17 +531,20 @@
     async function automaticTick() {
       if (automaticRunning || closed) return;
       automaticRunning = true;
-      let batchStarted = performance.now(), cycles = 0;
+      synchronousPlannerMs = 0;
+      let cycles = 0;
       try {
         do {
           if (busy) await chain;
           if (closed) break;
           await tick();
           if (!(mode === "hardware" && running)) break;
-          // Native serial awaits normally yield already. Bound synchronous
-          // fake/very-fast completions too, without a per-target timer floor.
-          if (++cycles >= 32 || performance.now() - batchStarted >= 3) {
-            await yieldTask(); cycles = 0; batchStarted = performance.now();
+          // Native serial awaits yield already. Count synchronous planner work,
+          // not time spent awaiting replies, in the responsiveness budget.
+          // The cycle bound also covers immediate/fake completions and the
+          // small synchronous bookkeeping outside the planner.
+          if (++cycles >= 32 || synchronousPlannerMs >= 3) {
+            await yieldTask(); cycles = 0; synchronousPlannerMs = 0;
           }
         } while (!closed);
       }
@@ -412,7 +556,7 @@
     if (automaticEnabled) timer = setTimeout(automaticTick, 10);
     return { request, choosePort, autoConnect, tick, state, stop, supported, ready: engineAPI.ready,
       async close() {
-        closed = true; clearTimeout(timer); yieldResolve?.(); yieldResolve = null;
+        closed = true; clearTimeout(timer); stopDiagnosticTimer(); yieldResolve?.(); yieldResolve = null;
         yieldChannel?.port1.close(); yieldChannel?.port2.close();
         await stop(); if (transport) await transport.close();
         serial?.removeEventListener?.("disconnect", onDisconnect); serial?.removeEventListener?.("connect", onConnect);

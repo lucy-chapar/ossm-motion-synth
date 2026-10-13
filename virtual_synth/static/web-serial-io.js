@@ -82,9 +82,9 @@
     if (operation === "enable" || operation === "inhibit") return frame([1, 6, 0, 1, 0, operation === "enable" ? 1 : 0]);
     throw new TransportError("Unsupported output operation.");
   }
-  const CONFIG_REGISTERS = new Set([0, 2, 3, 9, 10, 24, 25]);
+  const CONFIG_REGISTERS = new Set([0, 2, 3, 7, 9, 10, 24, 25]);
   function configRequest(register, value) {
-    if (!CONFIG_REGISTERS.has(register) || !Number.isInteger(value) || value < 0 || value > 65535) throw new TransportError("Unsupported configuration register or value.");
+    if (!CONFIG_REGISTERS.has(register) || !Number.isInteger(value) || value < 0 || value > 65535 || (register === 7 && value !== 3000)) throw new TransportError("Unsupported configuration register or value.");
     return frame([1, 6, 0, register, value >>> 8, value & 255]);
   }
   function validateRequest(value) {
@@ -94,7 +94,9 @@
     if (tx[0] !== 1 || tx[2] !== 0) throw new TransportError("Only fixed slave 1 registers are supported.");
     if (tx[1] === 3 && tx.length === 8 && tx[4] === 0 &&
         ((tx[3] === 0 && tx[5] === 26) || STATUS_GROUPS.some(([start, count]) => tx[3] === start && tx[5] === count))) return tx;
-    if (tx[1] === 6 && tx.length === 8 && (CONFIG_REGISTERS.has(tx[3]) || (tx[3] === 1 && tx[4] === 0 && tx[5] <= 1))) return tx;
+    if (tx[1] === 6 && tx.length === 8 &&
+        ((CONFIG_REGISTERS.has(tx[3]) && (tx[3] !== 7 || (tx[4] === 11 && tx[5] === 184))) ||
+         (tx[3] === 1 && tx[4] === 0 && tx[5] <= 1))) return tx;
     if (tx[1] === 16 && tx.length === 13 && tx[4] === 0 && tx[5] === 2 && tx[6] === 4) {
       if (tx[3] === 12 && tx.slice(7, 11).every(value => value === 0)) return tx;
       if (tx[3] === 22 && tx.slice(7, 11).some(value => value !== 0)) return tx;
@@ -119,6 +121,11 @@
   }
   const now = () => performance.now();
   const delay = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
+  // One mutable numeric tuple per connection, never a per-request object.
+  // Sequence/function identify the exchange; only a finite validated_ms marks
+  // successful completion. Receive times are reader-pump observations, not
+  // timestamps supplied by the USB adapter or the motor.
+  const EXCHANGE_TIMING_FIELDS = Object.freeze(["sequence", "function", "write_submitted_ms", "write_settled_ms", "first_response_ms", "last_response_ms", "validated_ms"]);
   function bounded(promise, milliseconds, message) {
     let timer;
     return Promise.race([
@@ -151,6 +158,8 @@
       this._writePromise = null;
       this._pumpPromise = null;
       this._closePromise = null;
+      this.exchangeTiming = new Float64Array(EXCHANGE_TIMING_FIELDS.length).fill(NaN);
+      this._exchangeTimingSequence = this._timingActiveSequence = 0;
     }
     async open() {
       if (this._opened || this._opening || this._closing || this.poisoned) throw new TransportError("Connection cannot be opened in its current state.");
@@ -181,6 +190,10 @@
           if (value && value.length) {
             this._buffer.push(...bytes(value));
             this._lastReceiveAt = this._clock();
+            if (this._timingActiveSequence === this.exchangeTiming[0]) {
+              if (!Number.isFinite(this.exchangeTiming[4])) this.exchangeTiming[4] = this._lastReceiveAt;
+              this.exchangeTiming[5] = this._lastReceiveAt;
+            }
           }
           if (this._buffer.length > 256) throw new TransportError("Unexpected serial input exceeded the response buffer.");
           this._wake?.();
@@ -257,6 +270,8 @@
       try { return await operation; } finally { this._queued--; }
     }
     async _exchange(tx, timeoutSeconds, beforeWrite) {
+      const timing = this.exchangeTiming, timingSequence = ++this._exchangeTimingSequence;
+      timing.fill(NaN); timing[0] = timingSequence; timing[1] = tx[1]; this._timingActiveSequence = 0;
       this._requireOpen();
       const recovering = this._resyncAfter !== null;
       const fastPair = !recovering && tx[1] === 0x7b && this._lastSuccessfulFunction === 0x7b;
@@ -268,7 +283,7 @@
         // boundary. Contiguous clean FC7b exchanges have no post-response delay,
         // matching the motor's dedicated protocol and upstream OSSM-RS driver.
         do { await this._idleBoundary(); }
-        while (this._buffer.length || (this._lastReceiveAt !== null && this._clock() - this._lastReceiveAt < 2));
+        while (this._buffer.length || (this._lastReceiveAt !== null && this._clock() < this._lastReceiveAt + 2));
       }
       this._requireOpen();
       if (this._receiveError) throw this._receiveError;
@@ -295,16 +310,21 @@
         if (tx[1] !== 0x7b || current[1] !== 0x7b) throw new TransportError("Only a dedicated position frame may be replaced before writing.");
         tx = current;
       }
-      const deadline = this._clock() + timeoutSeconds * 1000;
+      const submittedAt = this._clock(), deadline = submittedAt + timeoutSeconds * 1000;
       let writeSettled = false;
       this._lastSuccessfulFunction = null;
       this._lastResponseDeadline = deadline;
-      const write = this._writer.write(tx);
+      timing[2] = submittedAt; this._timingActiveSequence = timingSequence;
+      let write;
+      try { write = this._writer.write(tx); }
+      catch (error) { this._timingActiveSequence = 0; throw error; }
       this._writePromise = write;
-      write.then(() => { writeSettled = true; }, () => { writeSettled = true; });
+      const settled = () => { writeSettled = true; if (timing[0] === timingSequence) timing[3] = this._clock(); };
+      write.then(settled, settled);
       try {
         await bounded(write, deadline - this._clock(), "Write timeout; transmission and software stop are unconfirmed.");
       } catch (error) {
+        this._timingActiveSequence = 0;
         if (!writeSettled) {
           // A still-pending native write must never race a later inhibit or be
           // treated as successful cleanup. Permanently quarantine this object.
@@ -329,8 +349,10 @@
         if (this._buffer.length) throw new TransportError("Unexpected trailing response bytes.");
         const response = validateResponse(tx, Uint8Array.from([...head, ...tail]));
         this._lastSuccessfulFunction = tx[1];
+        timing[6] = this._clock(); this._timingActiveSequence = 0;
         return response;
       } catch (error) {
+        this._timingActiveSequence = 0;
         this._resyncAfter = deadline;
         // The write completed. A missing/corrupt response can be recovered by
         // fresh feedback; a pending/failed write or closed stream cannot.
@@ -343,6 +365,7 @@
     }
     async close() {
       if (this._closePromise) return this._closePromise;
+      this._timingActiveSequence = 0;
       this._closing = true;
       this._wake?.();
       this._closePromise = this._finishClose();
@@ -373,5 +396,5 @@
       }
     }
   }
-  return { WebSerialConnection, TransportError, crc16, frame, snapshotRequest, parseSnapshot, statusRequest, parseStatus, signedPosition, pending, absoluteRequest, fastPositionRequest, outputRequest, configRequest };
+  return { WebSerialConnection, TransportError, EXCHANGE_TIMING_FIELDS, crc16, frame, snapshotRequest, parseSnapshot, statusRequest, parseStatus, signedPosition, pending, absoluteRequest, fastPositionRequest, outputRequest, configRequest };
 });
