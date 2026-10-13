@@ -685,7 +685,7 @@
     $("refresh-ports").textContent = "Choose adapter";
     $("refresh-ports").dataset.tooltip = "Open the browser's serial-device chooser. Choosing an adapter grants this page access; Connect reads motor status without moving it.";
     $("port-select").dataset.tooltip = "Select an adapter you have allowed this website to access. Choose adapter opens the browser permission dialog.";
-    $("connect-button").dataset.tooltip = "Choose your USB–RS485 adapter and connect to the motor at 19200 baud. If an adapter is already selected, connect to it directly. Then Home → Play.";
+    $("connect-button").dataset.tooltip = "Choose your USB–RS485 adapter. Connect detects the supported motor baud automatically; a selected adapter connects directly. Then Home → Play.";
     document.querySelector("#hardware-details .panel-description").textContent = "Connect directly to your USB–RS485 adapter through Web Serial.";
     document.querySelector("footer span").lastChild.textContent = "RUNS IN YOUR BROWSER · NO INSTALL REQUIRED";
   }
