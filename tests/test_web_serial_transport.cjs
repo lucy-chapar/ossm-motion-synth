@@ -18,7 +18,7 @@ class FakeConnection {
   constructor({native = false, homeIgnored = false} = {}) {
     this.values = Array(26).fill(0);
     this.values[0] = 1; this.values[2] = 1800; this.values[3] = 60098;
-    this.values[11] = 800; this.values[21] = 1;
+    this.values[7] = 3000; this.values[11] = 800; this.values[21] = 1;
     this.position(20000);
     this.native = native; this.homeIgnored = homeIgnored;
     this.nativeActive = false; this.nativeReads = 0;
@@ -174,6 +174,185 @@ async function running(options) {
   await context.transport.connect(); await context.transport.arm(); await context.transport.start();
   return context;
 }
+
+test("stopped motion diagnostics retain bounded target/encoder timing without changing live guards", async () => {
+  const {transport, motor, clock} = await running({fastPositions:true, baudRate:115200});
+  assert.throws(() => transport.motionDiagnostics(), /Stop output/);
+  const exchange = motor.exchange.bind(motor);
+  motor.exchange = async (tx, timeout, beforeWrite) => {
+    if (tx[1] === 0x7b) await clock.wait(.003);
+    const reply = await exchange(tx, timeout, beforeWrite);
+    if (tx[1] === 0x7b) await clock.wait(.005);
+    return reply;
+  };
+  for (let i = 0; i < 4100; i++) await transport.command(.51);
+  assert.equal(transport.status().command_reply_count,4100);
+  assert.equal(transport.status().command_trace_count,4096);
+  await transport.stop();
+  const trace = transport.motionDiagnostics();
+  assert.equal(trace.rows.length,4096); assert.equal(trace.stop_confirmed,true);
+  assert.equal(trace.commands_total,4100); assert.equal(trace.trace_rows_dropped,4);
+  assert.equal(trace.guard_max_age_s,.25);
+  const field = name => trace.fields.indexOf(name);
+  for (const row of trace.rows) {
+    assert.ok(row[field("cycle_started_s")] <= row[field("guards_ready_s")]);
+    assert.ok(Math.abs(row[field("submitted_s")] - row[field("guards_ready_s")] - .003) < 1e-9);
+    assert.ok(Math.abs(row[field("replied_s")] - row[field("submitted_s")] - .005) < 1e-9);
+    assert.equal(row[field("tracking_error_raw")],row[field("encoder_raw")] - row[field("previous_target_raw")]);
+    assert.ok(row[field("guard_age_s")] <= .25);
+    assert.ok(row.slice(field("native_write_submitted_s")).every(value => value === null),"connections without IO timing export optional fields as null");
+  }
+  const sent = motor.destinations.at(-1);
+  trace.rows.at(-1)[field("target_raw")] = 0;
+  assert.equal(transport.motionDiagnostics().rows.at(-1)[field("target_raw")],sent,"export is a detached copy");
+  await transport.arm(); await transport.start();
+  await transport.command(.5); await transport.stop();
+  const fresh = transport.motionDiagnostics();
+  assert.equal(fresh.rows.length,1,"new Play starts a fresh trace");
+  assert.equal(fresh.commands_total,1); assert.equal(fresh.trace_rows_dropped,0);
+  await transport.close();
+});
+
+test("command trace copies only current native exchange timestamps into seconds relative to trace start", async () => {
+  const motor = new FakeConnection(); motor.exchangeTiming = new Float64Array(7).fill(NaN);
+  const context = make({motor,fastPositions:true,baudRate:115200}), {transport,clock} = context;
+  const exchange = motor.exchange.bind(motor), tuple = motor.exchangeTiming;
+  let sequence = 0;
+  motor.exchange = async (tx,timeout,beforeWrite) => {
+    tuple.fill(NaN); tuple[0] = ++sequence; tuple[1] = tx[1];
+    const reply = await exchange(tx,timeout,() => {
+      const replacement = beforeWrite?.(); tuple[2] = clock.now() * 1000; return replacement;
+    });
+    await clock.wait(.002); tuple[3] = clock.now() * 1000;
+    await clock.wait(.003); tuple[4] = clock.now() * 1000;
+    await clock.wait(.001); tuple[5] = clock.now() * 1000;
+    await clock.wait(.004); tuple[6] = clock.now() * 1000;
+    return reply;
+  };
+  await transport.connect(); await transport.arm(); await transport.start();
+  await transport.command(.51); await transport.command(.52); await transport.stop();
+  const trace = transport.motionDiagnostics(), field = name => trace.fields.indexOf(name);
+  assert.equal(trace.rows.length,2); assert.equal(motor.exchangeTiming,tuple);
+  for (const row of trace.rows) {
+    const submitted = row[field("submitted_s")];
+    for (const [name,delta] of [["native_write_submitted_s",0],["writer_promise_settled_s",.002],["first_response_chunk_s",.005],["last_response_chunk_s",.006],["exchange_validated_s",.010]]) {
+      assert.ok(Math.abs(row[field(name)] - submitted - delta) < 1e-9,name);
+    }
+    assert.ok(Math.abs(row[field("exchange_validated_s")] - row[field("replied_s")]) < 1e-9);
+    assert.equal(row[field("tracking_failures")],0);
+  }
+  assert.equal(trace.rows[0][field("native_write_submitted_s")],0);
+  const saved = trace.rows.map(row => row.slice(field("native_write_submitted_s")));
+  tuple.fill(999999); assert.deepEqual(transport.motionDiagnostics().rows.map(row => row.slice(field("native_write_submitted_s"))),saved,"later IO mutations cannot rewrite retained trace rows");
+  await transport.close();
+});
+
+test("stale, wrong-function and unsuccessful IO metadata cannot appear as current target timings", async () => {
+  for (const failure of ["stale","function","incomplete"]) {
+    const motor = new FakeConnection(); motor.exchangeTiming = new Float64Array([99,0x7b,100,102,105,106,110]);
+    const exchange = motor.exchange.bind(motor);
+    motor.exchange = async (tx,timeout,beforeWrite) => {
+      const reply = await exchange(tx,timeout,beforeWrite);
+      if (failure !== "stale") {
+        motor.exchangeTiming[0]++;
+        motor.exchangeTiming[1] = failure === "function" ? 3 : tx[1];
+        if (failure === "incomplete") motor.exchangeTiming[6] = NaN;
+      }
+      return reply;
+    };
+    const {transport} = await running({motor,fastPositions:true,baudRate:115200});
+    await transport.command(.51); await transport.stop(); const trace = transport.motionDiagnostics();
+    assert.equal(trace.rows.length,1);
+    assert.ok(trace.rows[0].slice(trace.fields.indexOf("native_write_submitted_s")).every(value => value === null),failure);
+    await transport.close();
+  }
+});
+
+test("diagnostic trace includes the third validated tracking violation before fault cleanup", async () => {
+  const {transport,motor} = await running({fastPositions:true});
+  motor.onCommand = (_, operation, tx) => {
+    if (tx[1] !== 0x7b) return;
+    const actual = transport._target - 1000;
+    return frame([1,0x7b,actual >>> 8 & 255,actual & 255,actual >>> 24 & 255,actual >>> 16 & 255]);
+  };
+  await transport.command(.51); await transport.command(.51);
+  await assert.rejects(transport.command(.51), /three fresh samples/);
+  const trace = transport.motionDiagnostics();
+  assert.equal(trace.rows.length,3); assert.equal(trace.stop_confirmed,true);
+  assert.deepEqual(trace.rows.map(row => row[trace.fields.indexOf("tracking_failures")]),[1,2,3]);
+  assert.match(trace.fault,/Tracking error/);
+  await transport.close();
+});
+
+test("new-run diagnostics clear prior recovery evidence while runtime recovery counts remain monotonic", async () => {
+  const {transport,motor,clock} = await running({fastPositions:true,baudRate:115200});
+  await clock.wait(.1);
+  motor.onRead = async () => {motor.onRead=null; await clock.wait(.02); throw droppedReply();};
+  await transport.command(.5); await transport.stop();
+  const recovered = transport.motionDiagnostics();
+  assert.equal(recovered.communication_recoveries,1);
+  assert.equal(recovered.last_communication_function,3); assert.equal(recovered.last_communication_register,0);
+  assert.equal(recovered.last_communication_operation,"full_status");
+  assert.ok(Math.abs(recovered.last_communication_elapsed_s-.02)<1e-9);
+  await transport.arm(); await transport.start(); await transport.command(.5); await transport.stop();
+  const healthy = transport.motionDiagnostics();
+  assert.equal(healthy.communication_recoveries,0); assert.equal(healthy.lifetime_communication_recoveries,1);
+  assert.equal(transport.status().communication_recoveries,1,"active runtime fences depend on the lifetime counter");
+  for (const field of ["last_communication_error","last_communication_operation","last_communication_function","last_communication_register","last_communication_elapsed_s"]) assert.equal(healthy[field],null);
+  await transport.close();
+});
+
+test("communication diagnostics keep a differently failing recovery retry in one complete tuple", async () => {
+  const {transport, motor, clock} = await running({fastPositions:true, baudRate:115200});
+  const failure = message => Object.assign(new TransportError(message), {recoverableResponse:true});
+  motor.onCommand = async (_, operation, tx) => {
+    if (tx[1] !== 0x7b) return;
+    await clock.wait(.003); throw failure("Response CRC mismatch.");
+  };
+  let recoveryReads = 0;
+  motor.onRead = async () => {
+    if (recoveryReads++ === 0) {
+      await clock.wait(.01); throw failure("Response timeout; no retry was sent.");
+    }
+    if (recoveryReads === 2) {
+      await clock.wait(.017); throw failure("Response CRC mismatch.");
+    }
+    motor.onRead = null;
+  };
+  await assert.rejects(transport.command(.51), /Response CRC mismatch/);
+  const diagnostics = transport.motionDiagnostics();
+  assert.equal(diagnostics.last_communication_error, "Response CRC mismatch.");
+  assert.equal(diagnostics.last_communication_operation, "full_status");
+  assert.equal(diagnostics.last_communication_function, 3); assert.equal(diagnostics.last_communication_register, 0);
+  assert.ok(Math.abs(diagnostics.last_communication_elapsed_s - .017) < 1e-9,
+    "error text and timing describe the same failed retry");
+  assert.equal(motor.destinations.length, 1, "the uncertain motion target is never retransmitted");
+  assert.equal(diagnostics.stop_confirmed, true, "independent cleanup still proves inhibited stationary output");
+  await transport.close();
+});
+
+test("communication diagnostics replace a target error completely when a cleanup acknowledgement fails", async () => {
+  const {transport, motor, clock} = await running({fastPositions:true, baudRate:115200});
+  const failure = message => Object.assign(new TransportError(message), {recoverableResponse:true});
+  motor.onCommand = async (_, operation, tx) => {
+    if (tx[1] === 0x7b) {
+      await clock.wait(.003); throw failure("Response CRC mismatch.");
+    }
+    if (operation === "clear") {
+      await clock.wait(.006); throw failure("Response function mismatch.");
+    }
+  };
+  await transport.command(.51); await transport.stop();
+  const diagnostics = transport.motionDiagnostics();
+  assert.equal(diagnostics.last_communication_error, "Response function mismatch.");
+  assert.equal(diagnostics.last_communication_operation, "clear");
+  assert.equal(diagnostics.last_communication_function, 16); assert.equal(diagnostics.last_communication_register, null);
+  assert.ok(Math.abs(diagnostics.last_communication_elapsed_s - .006) < 1e-9);
+  assert.equal(diagnostics.communication_recoveries, 2); assert.equal(transport.status().communication_recoveries, 2);
+  assert.equal(motor.destinations.length, 1); assert.equal(diagnostics.stop_confirmed, true);
+  await transport.close();
+});
+
 async function homing(reverse = false, motor = new FakeConnection({native: true})) {
   const context = make({motor});
   await context.transport.connect(); await context.transport.begin_home(reverse);
@@ -401,7 +580,7 @@ test("reconnecting read-only discards previous Home calibration and stopped feed
   assertReadOnlyProbes(new Map([[19200,motor]])); await transport.close();
 });
 
-const MOTION_PROFILE_CASES = [["streaming",60098,6000], ["ramped",2000,1200], ["servo_ramped",50000,6000]];
+const MOTION_PROFILE_CASES = [["streaming",60098,6000], ["ramped",2000,1200], ["servo_ramped",50000,6000], ["servo_direct",60000,6000]];
 
 test("motion profiles retain streaming defaults and independent host acceleration budgets", () => {
   const streaming = make().transport.status();
@@ -415,7 +594,7 @@ test("motion profiles retain streaming defaults and independent host acceleratio
   }
   for (const motionProfile of ["", "fast", "constructor", "toString", null, 2000, {}]) {
     const motor = new FakeConnection();
-    assert.throws(() => make({motor, motionProfile}), /Motion profile must be streaming, ramped, or servo_ramped/);
+    assert.throws(() => make({motor, motionProfile}), /Motion profile must be streaming, ramped, servo_ramped, or servo_direct/);
     assert.equal(motor.openCount, 0); assert.deepEqual(motor.transmissions, []);
   }
 });
@@ -461,6 +640,8 @@ test("successful Home restores each selected profile before arming", async () =>
     assert.equal(result.max_acceleration_raw_s2, accelerationMmS2 * 32768 / 40);
     assert.deepEqual(motor.values.slice(0, 4), [1,0,1800,setting]);
     assert.deepEqual(motor.settings.filter(([register]) => register === 3).at(-1), [3,setting]);
+    assert.deepEqual(motor.settings.filter(([register]) => register === 7), motionProfile === "servo_direct" ? [[7,3000],[7,3000]] : []);
+    assert.equal(transport._baseline[7], 3000);
     const otherSettings = MOTION_PROFILE_CASES.filter(([name]) => name !== motionProfile).map(([, value]) => value);
     assert.ok(!motor.settings.some(([register,value]) => register === 3 && otherSettings.includes(value)));
     await transport.arm(); await transport.start(); await transport.command(.51); await transport.stop(); await transport.close();
@@ -479,9 +660,140 @@ test("cancelled Home restores each selected profile while inhibited", async () =
     assert.equal(result.stop_confirmed, true); assert.equal(result.homed, false); assert.equal(result.motion_profile, motionProfile);
     assert.deepEqual(motor.values.slice(0, 4), [1,0,1800,setting]);
     assert.deepEqual(motor.settings.filter(([register]) => register === 3).at(-1), [3,setting]);
+    assert.deepEqual(motor.settings.filter(([register]) => register === 7), motionProfile === "servo_direct" ? [[7,3000],[7,3000]] : []);
+    assert.equal(transport._baseline[7], 3000);
     await transport.close();
    }
   }
+});
+
+test("servo_direct Home replaces experimental gain only after fresh inhibited feedback and verifies both writes", async () => {
+  for (const nativeHome of [false,true]) {
+    const motor = new FakeConnection({native:true}); motor.contacts = [-140563,23277]; motor.values[7] = 6000; motor.values[1] = 1;
+    const context = make({motor,motionProfile:"servo_direct",nativeHome}), {transport} = context;
+    motor.onSetting = (m,register,value) => {
+      if (register !== 7) return;
+      assert.equal(value,3000); assert.equal(m.values[0],1); assert.equal(m.values[1],0);
+      assert.equal(m.values[16],0); assert.equal(m.values[19],0); assert.equal(m.values[10],0);
+      assert.equal(m.values[12] | m.values[13] << 16,0);
+      assert.deepEqual(Array.from(m.transmissions.at(-2).slice(0,6)),[1,3,0,0,0,26],"a fresh snapshot immediately precedes the gain write");
+    };
+    motor.onCommand = (m,operation) => { if (operation === "enable" || operation === "absolute") assert.equal(m.values[7],3000); };
+    await transport.connect(); await transport.begin_home(); const result = await advance(context);
+    assert.equal(result.homed,true); assert.equal(result.stop_confirmed,true); assert.equal(result.position_gain_raw,3000);
+    assert.equal(result.position_feedforward_pct,0); assert.equal(result.acceleration_setting_raw,60000);
+    assert.equal(transport._baseline[7],3000);
+    for (let i = 0; i < motor.transmissions.length; i++) {
+      const tx = motor.transmissions[i];
+      if (tx[1] === 6 && tx[3] === 7) assert.deepEqual(Array.from(motor.transmissions[i+1].slice(0,6)),[1,3,0,0,0,26],"gain acknowledgement is followed by independent readback");
+    }
+    assert.deepEqual(motor.settings.filter(([r]) => r === 7),[[7,3000],[7,3000]]);
+    assert.ok(!motor.settings.some(([r]) => r === 20)); await transport.close();
+  }
+});
+
+test("legacy profiles preserve their captured position gain through Home without gain writes", async () => {
+  for (const motionProfile of ["streaming","ramped","servo_ramped"]) {
+    for (const nativeHome of [false,true]) {
+      const motor = new FakeConnection({native:true}); motor.values[7] = 6000; motor.contacts = [-140563,23277];
+      const context = make({motor,motionProfile,nativeHome}), {transport} = context;
+      await transport.connect(); await transport.begin_home(); const result = await advance(context);
+      assert.equal(result.homed,true); assert.equal(result.position_gain_raw,6000); assert.equal(transport._baseline[7],6000);
+      assert.deepEqual(motor.settings.filter(([r]) => r === 7),[]);
+      await transport.arm(); await transport.start(); await transport.stop(); await transport.close();
+    }
+  }
+});
+
+test("servo_direct cancellation restores fixed gain even before its preparation write", async () => {
+  for (const phase of ["setting_home_position_gain","first_contact"]) {
+    const motor = new FakeConnection({native:true}); motor.values[7] = 6000; motor.contacts = [-140563,23277];
+    const context = make({motor,motionProfile:"servo_direct",nativeHome:false}), {transport} = context;
+    await transport.connect(); await transport.begin_home(); await advance(context,phase);
+    const result = await transport.stop();
+    assert.equal(result.stop_confirmed,true); assert.equal(result.homed,false); assert.equal(result.position_gain_raw,3000);
+    assert.equal(motor.values[3],60000); assert.equal(transport._baseline[7],3000);
+    assert.equal(motor.settings.filter(([r]) => r === 7).length,phase === "first_contact" ? 2 : 1);
+    assert.ok(!motor.settings.some(([r]) => r === 20)); await transport.close();
+  }
+});
+
+test("servo_direct gain setup rejects contradictory fresh feedback before any enabling or active gain write", async () => {
+  for (const failure of ["enabled","pending","pwm","speed","mode","alarm","configuration","drift"]) {
+    const motor = new FakeConnection({native:true}); motor.values[7] = 6000;
+    const context = make({motor,motionProfile:"servo_direct",nativeHome:false}), {transport} = context;
+    await transport.connect(); await transport.begin_home(); await advance(context,"setting_home_position_gain");
+    const commands = motor.commands.length, position = transport.status().position_raw;
+    motor.onSetting = (_,register) => { if (register === 7) assert.equal(transport._inCleanup,true,"contradictory active setup cannot write gain"); };
+    if (failure === "enabled") motor.values[1] = 1;
+    if (failure === "pending") motor.remaining(3);
+    if (failure === "pwm") motor.values[19] = 1;
+    if (failure === "speed") motor.values[16] = 2;
+    if (failure === "mode") motor.values[0] = 0;
+    if (failure === "alarm") motor.values[14] = 1;
+    if (failure === "configuration") motor.values[5]++;
+    if (failure === "drift") motor.position(position + 5);
+    await assert.rejects(transport.poll_home(),/gain setup requires fresh/);
+    assert.ok(!motor.commands.slice(commands).includes("enable")); assert.deepEqual(motor.destinations,[]);
+    await transport.close();
+  }
+});
+
+test("Stop cancels a blocked gain preflight without sending the cancelled gain or enabling Home", async () => {
+  const motor = new FakeConnection({native:true}); motor.values[7] = 6000;
+  const context = make({motor,motionProfile:"servo_direct",nativeHome:false}), {transport} = context;
+  await transport.connect(); await transport.begin_home(); await advance(context,"setting_home_position_gain");
+  const entered = deferred(), release = deferred();
+  motor.onRead = async () => { motor.onRead = null; entered.resolve(); await release.promise; };
+  motor.onSetting = (_,register) => { if (register === 7) assert.equal(transport._inCleanup,true); };
+  const poll = assert.rejects(transport.poll_home(),/cancel/i); await entered.promise;
+  const stop = transport.stop(); release.resolve(); await Promise.all([poll,stop]);
+  assert.equal(transport.status().stop_confirmed,true); assert.equal(transport.status().homed,false);
+  assert.deepEqual(motor.settings.filter(([r]) => r === 7),[[7,3000]]);
+  assert.ok(!motor.commands.includes("enable")); await transport.close();
+});
+
+test("uncertain gain acknowledgement is never resent and only matching inhibited readback restores confirmation", async () => {
+  for (const applied of [false,true]) {
+    const motor = new FakeConnection({native:true}); motor.values[7] = 6000;
+    const context = make({motor,motionProfile:"servo_direct",nativeHome:false}), {transport} = context;
+    await transport.connect(); await transport.begin_home(); await advance(context,"setting_home_position_gain");
+    motor.onSetting = (m,register) => {
+      if (register === 7) { if (!applied) m.values[7] = 6000; throw new TransportError("Response timeout; gain acknowledgement unknown"); }
+    };
+    await assert.rejects(transport.poll_home(),/acknowledgement unknown/);
+    const result = transport.status();
+    assert.equal(result.stop_confirmed,applied); assert.equal(result.homed,false); assert.equal(result.output_raw,0);
+    assert.deepEqual(motor.settings.filter(([r]) => r === 7),[[7,3000]]);
+    assert.deepEqual(motor.destinations,[]); assert.ok(!motor.commands.includes("enable"));
+    if (!applied) assert.match(result.cleanup_errors.join(";"),/readback 6000.*fixed 3000; no retry/);
+    await transport.close(); assert.deepEqual(motor.settings.filter(([r]) => r === 7),[[7,3000]]);
+  }
+});
+
+test("an echoed gain write without matching readback faults Home before enabling and is not retried", async () => {
+  const motor = new FakeConnection({native:true}); motor.values[7] = 6000;
+  const context = make({motor,motionProfile:"servo_direct",nativeHome:false}), {transport} = context;
+  await transport.connect(); await transport.begin_home(); await advance(context,"setting_home_position_gain");
+  motor.onSetting = (m,register) => { if (register === 7) m.values[7] = 6000; };
+  await assert.rejects(transport.poll_home(),/readback 6000.*fixed 3000; no retry/);
+  assert.equal(transport.status().stop_confirmed,false); assert.equal(transport.status().homed,false);
+  assert.deepEqual(motor.settings.filter(([r]) => r === 7),[[7,3000]]);
+  assert.ok(!motor.commands.includes("enable")); await transport.close();
+});
+
+test("servo_direct requires fixed gain before arm and catches gain drift before a streamed target", async () => {
+  for (const gain of [0,2999,3001,4000,6000]) {
+    const motor = new FakeConnection(); motor.values[3] = 60000; motor.values[7] = gain;
+    const {transport} = make({motor,motionProfile:"servo_direct"}); await transport.connect();
+    await assert.rejects(transport.arm(),/Require position gain 3000/);
+    assert.deepEqual(motor.commands,[]); assert.deepEqual(motor.settings,[]); await transport.close();
+  }
+  const motor = new FakeConnection(); motor.values[3] = 60000;
+  const {transport,clock} = await running({motor,motionProfile:"servo_direct",fastPositions:true,baudRate:115200});
+  await clock.wait(.1); motor.values[7] = 6000;
+  await assert.rejects(transport.command(.51),/Require position gain 3000/);
+  assert.deepEqual(motor.destinations,[]); assert.equal(transport.status().running,false); await transport.close();
 });
 
 test("normal motion matches Python transport status and exact control-frame trace", async () => {
@@ -1735,6 +2047,166 @@ test("confirmed communication fault resets on the same connection without motion
  await transport.close();
 });
 
+async function measuredContinuousTransport(options = {}) {
+ const motor = new FakeConnection({native:true}); motor.contacts = [-140563,23277];
+ const context = make({motor,nativeHome:false,motionProfile:"servo_direct",fastPositions:true,baudRate:115200,...options});
+ await context.transport.connect(); await context.transport.begin_home(); await advance(context);
+ await context.transport.arm(); await context.transport.start();
+ return context;
+}
+async function rejectUnsentGap(context) {
+ const count = context.motor.destinations.length;
+ await assert.rejects(context.transport.command(() => {
+   throw Object.assign(new Error("Motion continuity lost: unsent travel exceeded the tracking corridor. No catch-up target was sent."),
+     {code:"MOTION_CONTINUITY_GAP"});
+ }), error => error.code === "MOTION_CONTINUITY_GAP" && /Motion continuity lost/.test(error.message));
+ assert.equal(context.motor.destinations.length,count,"the rejected gap submits no position frame");
+ assert.equal(context.transport.status().homed,false);
+ assert.equal(context.transport.status().fault_code,"MOTION_CONTINUITY_GAP");
+}
+
+test("an unsent continuity gap resets only after three fresh stopped reads and preserves the measured rail", async () => {
+ const context = await measuredContinuousTransport(), {transport,motor} = context;
+ try {
+   const measured = transport.status(), baseline = transport._baseline.slice();
+   await rejectUnsentGap(context);
+   assert.equal(transport.status().stop_confirmed,true);
+   const reads = motor.readCount, commands = motor.commands.length;
+   const cleared = await transport.reset_fault();
+   assert.equal(motor.readCount-reads,3); assert.equal(motor.commands.length,commands,"reset sends no controls or targets");
+   assert.equal(cleared.fault,null); assert.equal(cleared.fault_code,null); assert.equal(cleared.homed,true);
+   assert.equal(cleared.armed,false); assert.equal(cleared.running,false); assert.equal(cleared.owned,false);
+   assert.equal(cleared.stop_confirmed,true); assert.equal(cleared.output_enabled,false);
+   assert.deepEqual(cleared.raw_bounds,measured.raw_bounds); assert.deepEqual(cleared.measured_endpoints_raw,measured.measured_endpoints_raw);
+   assert.deepEqual(transport._baseline,baseline);
+   await transport.arm(); await transport.start();
+   assert.equal(transport.status().running,true,"only explicit rearm/start moves the retained calibration back into RUN");
+ } finally {await transport.stop(); await transport.close();}
+});
+
+test("continuity reset rejects changed configuration, alarm, outside the original rail and absent Stop proof", async () => {
+ for (const failure of ["configuration","alarm","outside_rail","unconfirmed_stop"]) {
+   const context = await measuredContinuousTransport(), {transport,motor} = context;
+   try {
+     await rejectUnsentGap(context);
+     if (failure === "configuration") motor.values[5]++;
+     if (failure === "alarm") motor.values[14] = 1;
+     if (failure === "outside_rail") {
+       // A position inside the legacy 128-count feedback padding must still
+       // fail the stricter calibration-retention proof.
+       motor.position(transport._high+1); transport._stop_position = transport._high+1;
+     }
+     if (failure === "unconfirmed_stop") transport._stop_confirmed = false;
+     const targets = motor.destinations.length;
+     await assert.rejects(transport.reset_fault(),/configuration changed|alarm0|original measured rail bounds|Reconnect or Home/);
+     assert.equal(transport.status().homed,false); assert.equal(transport.status().fault_code,"MOTION_CONTINUITY_GAP");
+     assert.equal(motor.destinations.length,targets); assert.equal(transport.status().armed,false); assert.equal(transport.status().running,false);
+   } finally {await transport.close();}
+ }
+});
+
+test("cleanup failure preserves the original continuity code but cannot clear before a later confirmed Stop", async () => {
+ const context = await measuredContinuousTransport(), {transport,motor} = context;
+ try {
+   motor.onCommand = (_,operation) => { if (operation === "inhibit") throw new TransportError("Inhibit acknowledgement lost without recovery proof"); };
+   await rejectUnsentGap(context);
+   assert.equal(transport.status().stop_confirmed,false); assert.equal(transport.status().owned,true);
+   assert.match(transport.status().cleanup_errors.join(";"),/Inhibit acknowledgement/);
+   assert.match(transport.status().fault,/Motion continuity lost/);
+   await assert.rejects(transport.reset_fault(),/Reconnect or Home/);
+   motor.onCommand = null;
+   assert.equal((await transport.stop()).stop_confirmed,true);
+   const cleared = await transport.reset_fault();
+   assert.equal(cleared.fault_code,null); assert.equal(cleared.homed,true); assert.equal(cleared.running,false);
+ } finally {motor.onCommand=null;await transport.stop();await transport.close();}
+});
+
+test("a typed unsent gap without a previous measured Home cannot restore calibration", async () => {
+ const context = await running({fastPositions:true}), {transport} = context;
+ try {
+   await rejectUnsentGap(context);
+   assert.equal(transport.status().stop_confirmed,true);
+   await assert.rejects(transport.reset_fault(),/Reconnect or Home/);
+   assert.equal(transport.status().homed,false); assert.equal(transport.status().fault_code,"MOTION_CONTINUITY_GAP");
+ } finally {await transport.close();}
+});
+
+test("continuity reset requires every fresh sample to remain inhibited and stationary", async () => {
+ for (const failure of ["pending","pwm","speed","encoder_motion"]) {
+   const context = await measuredContinuousTransport(), {transport,motor} = context;
+   try {
+     await rejectUnsentGap(context);
+     const reference = transport.status().position_raw, targets = motor.destinations.length;
+     if (failure === "pending") motor.remaining(3);
+     if (failure === "pwm") motor.values[19] = 1;
+     if (failure === "speed") motor.values[16] = 2;
+     if (failure === "encoder_motion") {let sample=0;motor.onRead=m=>{m.position(reference+(sample++%3)*50);};}
+     await assert.rejects(transport.reset_fault(),/Stopped feedback changed|stationary inhibited|Encoder moved during fault reset/);
+     assert.equal(transport.status().homed,false); assert.equal(transport.status().running,false); assert.equal(motor.destinations.length,targets);
+     assert.equal(transport.status().fault_code,"MOTION_CONTINUITY_GAP");
+   } finally {motor.onRead=null;await transport.close();}
+ }
+});
+
+test("a real hardware following fault never acquires software-gap reset eligibility", async () => {
+ const context = await measuredContinuousTransport({fastPositions:false}), {transport,motor} = context;
+ try {
+   const held = transport.status().position_raw, offset = Math.ceil((transport._high-transport._low)*.2);
+   motor.onRead = m => { m.position(held+offset); };
+   await transport.command(.5); await transport.command(.5);
+   await assert.rejects(transport.command(.5),/Tracking error exceeded/);
+   assert.equal(transport.status().fault_code,null); assert.equal(transport.status().homed,false);
+   assert.equal(transport.status().stop_confirmed,true);
+   motor.onRead = null;
+   await assert.rejects(transport.reset_fault(),/Reconnect or Home/);
+ } finally {motor.onRead=null;await transport.close();}
+});
+
+test("actual runtime clears an unsent gap with retained Home and explicit Play recaptures the current encoder", async () => {
+ const clock = new Clock(), motor = new FakeConnection({native:true}); motor.contacts = [-140563,23277];
+ const port = {getInfo:()=>({usbVendorId:0x1234,usbProductId:0x5678})};
+ let transport;
+ const runtime = createRuntime({autoStart:false,clock:clock.now,storage:null,
+   serial:{getPorts:async()=>[port],requestPort:async()=>port},
+   transportFactory:selected=>transport=new MotorTransport(selected,{allowMotion:true,nativeHome:false,fastPositions:true,
+     motionProfile:"servo_direct",baudRate:115200,clock:clock.now,wait:clock.wait,connectionFactory:()=>motor})});
+ const action = (name,fields={}) => runtime.request("/api/action",{action:name,...fields});
+ const tick = async dt => {await clock.wait(dt);await action("heartbeat");await runtime.tick();return runtime.state();};
+ try {
+   await action("connect",{port:await runtime.choosePort()});
+   let state = runtime.state(); await action("home_start",{direction:"normal",control_revision:state.control_revision});
+   for (let i=0;i<800 && runtime.state().homing.active;i++) {state=await tick(.11);assert.equal(state.fault,null);}
+   assert.equal(runtime.state().hardware.homed,true);
+   const bounds = runtime.state().hardware.raw_bounds.slice(), endpoints = runtime.state().hardware.measured_endpoints_raw.slice();
+   await action("configure",{params:{rate_hz:1.5,stroke:.7}}); await action("play");
+   for (let i=0;i<600;i++) {
+     state=await tick(.005); assert.equal(state.fault,null);
+     if (i>400 && state.signal.reference_phase>.46 && state.signal.reference_phase<.49) break;
+   }
+   const targets = motor.destinations.length;
+   state=await tick(.2091);
+   assert.equal(motor.destinations.length,targets); assert.equal(state.running,false); assert.equal(state.hardware.homed,false);
+   assert.equal(state.hardware.stop_confirmed,true); assert.equal(state.hardware.fault_code,"MOTION_CONTINUITY_GAP");
+   assert.match(state.fault,/Motion continuity lost/);
+   // Confirmed disabled settling is allowed within the original fixed rail;
+   // subsequent Play must capture this actual position instead of an old plan.
+   motor.position(transport.status().position_raw+50);
+   const reads = motor.readCount, controls = motor.commands.length;
+   state=await action("reset");
+   assert.equal(motor.readCount-reads,3); assert.equal(motor.commands.length,controls);
+   assert.equal(state.fault,null); assert.equal(state.hardware.fault_code,null); assert.equal(state.hardware.homed,true);
+   assert.equal(state.running,false); assert.equal(state.armed,false); assert.equal(state.hardware.output_enabled,false);
+   assert.deepEqual(state.hardware.raw_bounds,bounds); assert.deepEqual(state.hardware.measured_endpoints_raw,endpoints);
+   const current = state.hardware.position_normalized;
+   state=await action("play");
+   assert.equal(state.signal.command,current); assert.equal(state.signal.velocity,0); assert.equal(state.signal.acceleration,0);
+   state=await tick(.005);
+   assert.equal(state.running,true); assert.equal(state.fault,null); assert.equal(motor.destinations.length,targets+1);
+   assert.ok(Math.abs(state.signal.command-current)<.01,"fresh finite-jerk capture begins near the actual encoder");
+   assert.deepEqual(state.hardware.raw_bounds,bounds);
+ } finally {await runtime.close();}
+});
+
 test("disabled post-stop settling accepts 1mm but cannot accumulate unbounded drift", async () => {
  const {transport,motor}=await running();await transport.stop();const stopped=transport.status().position_raw;
  motor.position(stopped+200);assert.equal((await transport.snapshot()).stop_confirmed,true);
@@ -1798,8 +2270,119 @@ test("fast stream interleaves every guard group and uses encoder replies", async
   await transport.close();
 });
 
-test("every baud reuses fresh guards and staggers genuine receipt timestamps", async () => {
- for (const baudRate of [19200,38400,115200]) {
+test("115200 refreshes every guard atomically at100ms and records the real full-reply receipt", async () => {
+  const {transport,motor,clock} = await running({fastPositions:true,baudRate:115200});
+  const initialAt = clock.now(), before = motor.transmissions.length;
+  await clock.wait(.099); await transport.command(.5);
+  assert.ok(motor.transmissions.slice(before).every(tx => tx[1] === 0x7b));
+  assert.ok(transport._status_group_at.every(at => at === initialAt));
+  motor.onRead = async (_,tx) => {
+    assert.equal(tx[3],0); assert.equal(tx[5],26);
+    motor.onRead = null; await clock.wait(.021);
+  };
+  await clock.wait(.001); await transport.command(.5);
+  const receivedAt = initialAt + .121;
+  assert.ok(transport._status_group_at.every(at => Math.abs(at - receivedAt) < 1e-9));
+  const reads = motor.transmissions.slice(before).filter(tx => tx[1] === 3);
+  assert.equal(reads.length,1); assert.equal(reads[0][5],26);
+  await clock.wait(.099); await transport.command(.5);
+  assert.equal(motor.transmissions.slice(before).filter(tx => tx[1] === 3).length,1,
+    "a new full reply starts the next100ms receipt budget");
+  await transport.stop(); await transport.close();
+});
+
+test("115200 atomic guards refuse every changed configuration, alarm, output and rail before a target resolves", async () => {
+  const changes = [[0,0],[1,0],[2,1801],[3,2000],[4,1],[5,1],[6,1],[7,1],[8,1],[9,1],
+    [10,1],[11,801],[14,1],[20,1],[21,2],[24,1],[25,1],"low rail","high rail"];
+  for (const change of changes) {
+    const {transport,motor,clock} = await running({fastPositions:true,baudRate:115200});
+    const saved = motor.values.slice(), before = motor.transmissions.length; let resolved = false;
+    if (typeof change === "string") motor.position(change === "low rail" ? transport._low - 129 : transport._high + 129);
+    else motor.values[change[0]] = change[1];
+    await clock.wait(.1);
+    await assert.rejects(transport.command(() => {resolved = true; return .51;}), /Require|configuration changed|fixed motion window/);
+    assert.equal(resolved,false,String(change)); assert.deepEqual(motor.destinations,[]);
+    const first = motor.transmissions[before]; assert.equal(first[1],3); assert.equal(first[5],26);
+    assert.equal(transport.status().running,false);
+    motor.values = saved; motor.values[1] = 0;
+    await transport.stop(); await transport.close();
+  }
+});
+
+test("Stop cancels a late115200 full guard reply and all waiting targets before native submission", async () => {
+  const {transport,motor,clock} = await running({fastPositions:true,baudRate:115200});
+  const entered = deferred(), release = deferred(); let resolved = 0;
+  await clock.wait(.1);
+  motor.onRead = async (_,tx) => {
+    assert.equal(tx[3],0); assert.equal(tx[5],26);
+    motor.onRead = null; entered.resolve(); await release.promise;
+  };
+  const active = assert.rejects(transport.command(() => {resolved++;return .51;}), /cancel/i);
+  await entered.promise;
+  const queued = assert.rejects(transport.command(() => {resolved++;return .52;}), /cancel/i);
+  const stopping = transport.stop(); release.resolve();
+  await Promise.all([active,queued,stopping]);
+  assert.equal(resolved,0); assert.deepEqual(motor.destinations,[]); assert.equal(motor.maxActive,1);
+  assert.equal(transport.status().stop_confirmed,true); assert.equal(transport.status().fault,null);
+  await transport.close();
+});
+
+test("an incomplete or corrupt115200 atomic reply cannot authorize a target", async () => {
+  for (const failure of ["short","crc","wrong count"]) {
+    const {transport,motor,clock} = await running({fastPositions:true,baudRate:115200});
+    await clock.wait(.1); let resolved = false;
+    motor.onRead = m => {
+      motor.onRead = null;
+      const reply = frame([1,3,52,...m.values.flatMap(value => [value >>> 8,value & 255])]);
+      if (failure === "short") return reply.slice(0,-2);
+      if (failure === "crc") {reply[6] ^= 1;return reply;}
+      return frame([1,3,14,...m.values.slice(0,7).flatMap(value => [value >>> 8,value & 255])]);
+    };
+    await assert.rejects(transport.command(() => {resolved = true;return .51;}), /CRC|length|byte count/);
+    assert.equal(resolved,false); assert.deepEqual(motor.destinations,[]);
+    assert.equal(transport.status().stop_confirmed,true); await transport.close();
+  }
+});
+
+test("atomic guards reduce same-wire adapter occupancy while retaining bounded larger full-reply gaps", async () => {
+  async function measure(policyBaud) {
+    const {transport,motor,clock} = await running({fastPositions:true,baudRate:policyBaud});
+    const exchange = motor.exchange.bind(motor), times = [];
+    let previous = null, sequence = 0, readCount = 0, wireBytes = 0, maximumGuardAge = 0;
+    motor.exchange = async (request,timeout,beforeWrite) => {
+      if (!(request[1] === 0x7b && previous === 0x7b)) await clock.wait(.002);
+      const reply = await exchange(request,timeout,() => {
+        const replacement = beforeWrite?.();
+        if (request[1] === 0x7b) {
+          const age = Math.max(...transport._status_group_at.map(at => clock.now() - at));
+          assert.ok(age <= .25); maximumGuardAge = Math.max(maximumGuardAge,age); times.push(clock.now());
+        }
+        return replacement;
+      });
+      if (request[1] === 3) readCount++;
+      wireBytes += request.length + reply.length;
+      // Compare only the guard policy: both fake drives use exactly the same
+      //115200 wire and4–6ms adapter model, with no browser or servo model.
+      await clock.wait(.004 + ((sequence++ * 7) % 17) / 16 * .002 + (request.length + reply.length) * 10 / 115200);
+      previous = request[1]; return reply;
+    };
+    const began = clock.now();
+    for (let i = 0; i < 1000; i++) await transport.command(.5);
+    const elapsed = clock.now() - began, gaps = times.slice(1).map((time,i) => time - times[i]);
+    const result = {elapsed,wireBytes,readCount,maximumGuardAge,maximumGap:Math.max(...gaps)};
+    assert.equal(motor.maxActive,1); await transport.stop(); await transport.close(); return result;
+  }
+  const partial = await measure(38400), atomic = await measure(115200);
+  assert.ok(atomic.elapsed < partial.elapsed / 1.4,"fewer full round trips recover modeled target throughput");
+  assert.ok(atomic.readCount < partial.readCount / 4,"one atomic receipt replaces four repeated USB exchanges");
+  assert.ok(atomic.wireBytes < partial.wireBytes * .85,"guard payload overhead falls at equal target count");
+  assert.ok(atomic.maximumGap > partial.maximumGap,"the model retains the longer isolated full-reply tradeoff");
+  assert.ok(atomic.maximumGap < .025 && partial.maximumGap < .025);
+  assert.ok(atomic.maximumGuardAge < .1 && partial.maximumGuardAge < .1);
+});
+
+test("slower baud reuses fresh guards and staggers genuine receipt timestamps", async () => {
+ for (const baudRate of [19200,38400]) {
   const {transport, motor, clock} = await running({fastPositions:true, baudRate});
   const before = motor.transmissions.length, began = clock.now(), snapshotAt = transport._status_group_at.slice();
   for (let i = 0; i < 24; i++) { await clock.wait(.001); await transport.command(.5); }
@@ -1819,7 +2402,7 @@ test("every baud reuses fresh guards and staggers genuine receipt timestamps", a
 });
 
 test("adaptive streaming refreshes the oldest group rather than a fresher round-robin group", async () => {
-  const {transport, motor, clock} = await running({fastPositions:true, baudRate:115200});
+  const {transport, motor, clock} = await running({fastPositions:true, baudRate:38400});
   const now = clock.now(), ages = [.03, .04, .16, .12];
   transport._status_group_at = ages.map(age => now - age); transport._status_group_next = 0;
   const before = motor.transmissions.length;
@@ -1854,8 +2437,8 @@ test("each overdue adaptive guard refuses changed configuration, output or alarm
 test("adaptive status deadlines remain bounded through modeled 20 ms and 10 ms target scheduling", async () => {
   for (const period of [.02, .01]) {
     const {transport, motor, clock} = await running({fastPositions:true, baudRate:115200});
-    const exchange = motor.exchange.bind(motor), guardGroups = [0,0,0,0], targetTimes = [];
-    const starts = [0,7,14,21], began = clock.now();
+    const exchange = motor.exchange.bind(motor), targetTimes = [];
+    const began = clock.now(); let fullReads = 0;
     motor.exchange = async (request, timeout, beforeWrite) => {
       await clock.wait(.003);
       const checkedWrite = () => {
@@ -1868,7 +2451,7 @@ test("adaptive status deadlines remain bounded through modeled 20 ms and 10 ms t
       };
       const response = await exchange(request, timeout, checkedWrite);
       await clock.wait(.010 + (request.length + response.length) * 10 / 115200);
-      if (request[1] === 3) guardGroups[starts.indexOf(request[3])]++;
+      if (request[1] === 3) {assert.equal(request[3],0);assert.equal(request[5],26);fullReads++;}
       return response;
     };
     for (let index = 0; index < 300; index++) {
@@ -1876,8 +2459,8 @@ test("adaptive status deadlines remain bounded through modeled 20 ms and 10 ms t
       const result = await transport.command(.5);
       assert.equal(result.fault, null); assert.ok(result.status_check_age_s <= .25);
     }
-    assert.equal(targetTimes.length, 300); assert.ok(guardGroups.every(count => count > 0));
-    assert.ok(guardGroups.reduce((sum, count) => sum + count, 0) < 300, "finer target scheduling should reduce status transactions");
+    assert.equal(targetTimes.length, 300); assert.ok(fullReads > 0);
+    assert.ok(fullReads < 60, "atomic guards avoid one status transaction per target");
     await transport.stop(); await transport.close();
   }
 });
@@ -1900,7 +2483,7 @@ test("a stalled adaptive cycle or native quiet gap refuses expired guard data wi
 });
 
 test("urgent guard draining refreshes expired siblings before evaluating any target", async () => {
-  const {transport, motor, clock} = await running({fastPositions:true, baudRate:115200});
+  const {transport, motor, clock} = await running({fastPositions:true, baudRate:38400});
   await clock.wait(.16); let resolved = false;
   motor.onRead = async () => { motor.onRead = null; await clock.wait(.1); };
   const before = motor.transmissions.length;
@@ -1934,7 +2517,7 @@ test("adaptive guard recovery validates a complete snapshot and refreshes every 
   motor.onRead = () => { motor.onRead = null; throw droppedReply(); };
   const result = await transport.command(.51);
   assert.equal(result.communication_recoveries, 1); assert.equal(result.running, true);
-  assert.deepEqual(motor.transmissions.slice(before).map(tx => [tx[1], tx[1] === 3 ? tx[5] : null]), [[3,7], [3,26], [0x7b,null]]);
+  assert.deepEqual(motor.transmissions.slice(before).map(tx => [tx[1], tx[1] === 3 ? tx[5] : null]), [[3,26], [3,26], [0x7b,null]]);
   assert.ok(transport._status_group_at.every(time => time === clock.now()));
   const resumed = motor.transmissions.length;
   await transport.command(.52);
@@ -2067,8 +2650,16 @@ test("the real runtime planner includes final native placement delay in the tran
     await clock.wait(.025); await runtime.tick();
     assert.equal(runtime.state().fault,null); assert.ok(submitted);
     assert.ok(Math.abs(submitted.time - began - .1) < 1e-9);
-    assert.ok(Math.abs(submitted.signal.phase - .1) < 1e-9,
-      "the planner advances through both guard scheduling and the final75ms placement wait");
+    const {Engine} = require("../virtual_synth/static/browser-engine.js");
+    const expected = new Engine({rate_hz:1,stroke:.1}), limits = transport.status();
+    expected.reset({position:.5,vmax:limits.max_velocity_raw_s/148000,
+      amax:limits.max_acceleration_raw_s2/148000,jmax:limits.max_jerk_raw_s3/148000});
+    expected.step(.025,{running:true,tracking:true});
+    const atSubmission = expected.step(.075,{running:true,tracking:true});
+    assert.ok(Math.abs(submitted.signal.phase - atSubmission.phase) < 1e-9,
+      "the aligned oscillator advances through the final75ms placement wait");
+    assert.ok(Math.abs(submitted.signal.command - atSubmission.command) < 1e-9,
+      "the actual startup PVA, not only its phase, includes placement latency");
     const target = submitted.frame[2] << 24 | submitted.frame[3] << 16 | submitted.frame[4] << 8 | submitted.frame[5];
     assert.equal(target,transport.status().target_raw);
     assert.ok(Math.abs(target - (126000 + 148000 * submitted.signal.command)) <= .5);
@@ -2357,7 +2948,7 @@ test("completion-driven guards retain bounded refresh bursts with irregular adap
  for (const baudRate of [19200,38400,115200]) {
   const {transport,motor,clock} = await running({fastPositions:true,baudRate});
   const exchange = motor.exchange.bind(motor), starts = [0,7,14,21], groups = [0,0,0,0];
-  let previous = null, index = 0, guards = 0, maximumGuards = 0, maximumAge = 0;
+  let previous = null, index = 0, guards = 0, maximumGuards = 0, maximumAge = 0, fullReads = 0;
   const targetTimes = [];
   motor.exchange = async (request,timeout,beforeWrite) => {
     if (!(request[1] === 0x7b && previous === 0x7b)) await clock.wait(.002);
@@ -2373,12 +2964,22 @@ test("completion-driven guards retain bounded refresh bursts with irregular adap
     // 8N1 wire time plus bounded deterministic USB adapter variability.
     await clock.wait(.010 + ((index++ * 7) % 17) / 16 * .006 + (request.length + reply.length) * 10 / baudRate);
     previous = request[1];
-    if (request[1] === 3 && request[5] !== 26) {groups[starts.indexOf(request[3])]++; guards++;}
+    if (request[1] === 3) {
+      guards++;
+      if (request[5] === 26) fullReads++;
+      else groups[starts.indexOf(request[3])]++;
+    }
     return reply;
   };
   for (let i = 0; i < 600; i++) await transport.command(.5);
   assert.equal(targetTimes.length,600); assert.equal(motor.maxActive,1);
-  assert.ok(groups.every(count => count > 0)); assert.ok(groups.reduce((a,b) => a + b) <= 1200,"refresh stays bounded to at most two reads per modeled target");
+  if (baudRate === 115200) {
+    assert.ok(fullReads > 0 && fullReads < 120,"atomic snapshot cadence avoids repeated USB turnarounds");
+    assert.deepEqual(groups,[0,0,0,0]);
+  } else {
+    assert.ok(groups.every(count => count > 0)); assert.equal(fullReads,0);
+    assert.ok(groups.reduce((a,b) => a + b) <= 1200,"refresh stays bounded to at most two reads per modeled target");
+  }
   assert.ok(maximumGuards <= (baudRate === 19200 ? 2 : 1),"additional due reads are bounded to the headroom needed at slow baud");
   assert.ok(maximumAge < .15,"freshness retains100ms headroom at modeled native writes");
   const gaps = targetTimes.slice(1).map((time,i) => time - targetTimes[i]);
@@ -2387,7 +2988,7 @@ test("completion-driven guards retain bounded refresh bursts with irregular adap
  }
 });
 
-test("115200 guards survive 13.248 ms reads and bounded 12–42 ms completion jitter", async () => {
+test("115200 atomic guards survive22ms full replies and bounded12–42ms completion jitter", async () => {
  for (const jitterStep of [.0008,.003]) {
   const {transport,motor,clock} = await running({fastPositions:true,baudRate:115200});
   const exchange = motor.exchange.bind(motor); let previous = null, sequence = 0, targetCount = 0;
@@ -2400,7 +3001,7 @@ test("115200 guards survive 13.248 ms reads and bounded 12–42 ms completion ji
       }
       return replacement;
     });
-    await clock.wait(request[1] === 3 ? .013248 : .012 + ((sequence++ * 3) % 11) * jitterStep);
+    await clock.wait(request[1] === 3 ? .022 : .012 + ((sequence++ * 3) % 11) * jitterStep);
     previous = request[1]; return reply;
   };
   for (let i = 0; i < 800; i++) assert.equal((await transport.command(.5)).fault,null);

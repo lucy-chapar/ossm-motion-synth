@@ -14,14 +14,15 @@ The October 13 revision uses continuous jerk-limited trajectories. Use
 [planner audit](MOTION_PLANNER_AUDIT.md) records the continuous-state design and
 earlier 19200-baud / 20000 RPM/s drive trials.
 
-The browser serial path is completion driven, with no fixed 20/50 Hz
-target cap. The tested drive was separately commissioned to 115200 baud and
-power cycled; normal Connect does not change baud. Two series of three guarded physical
-trials with the 50000 RPM/s native ramp passed through a Node harness using
-production browser modules, with confirmed Stop after each. Measured link and
-motion results are in the [serial throughput audit](SERIAL_THROUGHPUT_AUDIT.md).
-The final Chrome Home → Play → Stop check also passed at 115200. Its saw
-trial displayed 80–85 command updates/s and confirmed Stop.
+The browser serial path is completion driven, with no fixed 20/50 Hz target
+cap. A dedicated worker owns the planner, watchdog and serial streams; the
+page sends controls and displays feedback. The tested drive was separately
+commissioned to 115200 baud and power cycled; normal Connect does not change
+baud. Home applies `servo_direct`: native acceleration bypass with zero
+position feedforward, a fixed position gain of 3000, and unchanged host V/A/J
+limits. The [tuning record](TUNING-2026-10-13.md) separates retained ramp/gain
+comparisons from worker validation. Earlier link results remain in the
+[serial audit](SERIAL_THROUGHPUT_AUDIT.md).
 
 **Wiring:** With power off, disconnect the 4-pin signal cable that runs to the
 OSSM motherboard. This setup only needs 24 V power and USB–RS485 wired directly
@@ -148,19 +149,22 @@ and restores the previous output/stall setting. The waveform planner uses
 this measured working span, keeping its existing physical velocity and
 acceleration and jerk limits when converting normalized positions to encoder counts.
 After parking, browser Home restores a 1800 RPM ceiling and the selected
-profile. The browser default is `servo_ramped`: a 50000 RPM/s drive ramp
-(nominal 33333 mm/s²), with nominal host ceilings of 1080 mm/s, 6000 mm/s²
-and 100000 mm/s³.
-This retains drive headroom while shaping the gaps between discrete targets.
+profile. The browser default is `servo_direct`: register 3 = 60000 disables
+the native acceleration process and selects zero position feedforward. It is
+not a 60000 RPM/s acceleration value. Nominal host ceilings remain 1080 mm/s,
+6000 mm/s² and 100000 mm/s³. Home sets position gain 3000 only with fresh
+stationary, inhibited feedback, verifies the acknowledgement and independent
+readback, and locks it into the configuration baseline. It does not save
+parameters to EEPROM. An uncertain gain write is never resent.
 The `streaming` comparison profile uses 60098 (98% position feedforward, no
 internal ramp); its watched 1 Hz test was visibly pulsing. The older `ramped`
-profile retains 2000 RPM/s and a 1200 mm/s² host ceiling. Faster requested fixed
+profile retains 2000 RPM/s and a 1200 mm/s² host ceiling. The retained
+`servo_ramped` comparison uses 50000 RPM/s. Faster requested fixed
 waves are retimed to fit their selected budget. The historical 20000 RPM/s
 servo-ramped 1 Hz trial reduced sampled speed bursts. Later 19200-baud
 continuous-planner acceptance and the current 115200-baud guarded trials are
 recorded separately in the [planner](MOTION_PLANNER_AUDIT.md) and
 [serial](SERIAL_THROUGHPUT_AUDIT.md) audits.
-These local changes have not been deployed.
 Centering uses the slower
 35 RPM / 75 RPM/s calibration profile. The Python bridge retains its earlier
 profile. Modulated patterns can still be limited by the physical budget.
@@ -242,16 +246,17 @@ Play clears pending motion, checks stationary disabled readback, enables the
 drive and checks the enabled hold before sending bounded targets. The current
 local browser retains host limits of **1080 nominal mm/s** and **6000 mm/s²**
 and adds **100000 mm/s³ jerk**. These are 884736 counts/s, 4915200 counts/s²
-and 81920000 counts/s³ at the assumed 819.2 counts/mm. The `servo_ramped`
-drive setting is 1800 RPM and 50000 RPM/s. The faster native ramp replaces
-20000 RPM/s after a following fault during dense updates; host velocity,
-acceleration and jerk limits are unchanged. Baud commissioning on the tested
+and 81920000 counts/s³ at the assumed 819.2 counts/mm. The `servo_direct`
+drive setting is 1800 RPM and register 3 = 60000, with position gain 3000.
+The host shapes acceleration and jerk; the native position/speed loops remain
+active. Baud commissioning on the tested
 drive was a separate explicit operation; Connect itself remains read-only.
 
 The hardware planner carries commanded position, velocity and acceleration
 between updates. Startup and changes capture a future moving state through the
 local Ruckig core. Intermediate same-direction samples keep their derivatives;
-actual reversals use zero velocity and acceleration. Triangle, square and saw
+actual reversals stop velocity. Sine endpoints retain their analytic inward
+acceleration; finite-leg endpoints use their planned derivatives. Triangle, square and saw
 use finite jerk-limited legs, and fixed sines are retimed against velocity,
 acceleration and jerk demand. Their references reserve 95% of each host limit
 for capture headroom. Full trajectory extrema and jerk-aware stopping paths
@@ -276,7 +281,8 @@ and no fixed rate cap or queue of missed positions. The live trajectory is
 sampled after the serial queue and quiet-line waits, immediately before native
 submission. Stop and guard freshness are rechecked around that resolver; the
 actual replacement frame is validated before writing. All supported baud rates
-reuse fresh status groups. Their refreshes are phased after a full snapshot and
+reuse fresh status groups. At 115200, a single complete snapshot refreshes all
+guards every 100 ms. At 19200/38400, partial refreshes are phased after a full snapshot and
 become due 100 ms after each subsequent receipt. Normally one due group is
 read; further due groups are drained when any remaining group has 100 ms or
 less before the hard age limit. The four groups still cover every checked
@@ -284,7 +290,11 @@ register, and any group older
 than 250 ms prevents a target before the native write. Connect, Home, arming and
 Stop retain complete snapshots. The planner advances the waveform and modulation
 in steps of at most 2 ms internally; only the final current target reaches the
-wire. The previous 50 ms cycles at 19200/38400 and 20 ms cycles at 115200 are
+wire. Final sampling also advances across synchronous planning work. Unsent
+path length, including reversals, is bounded across those advances; exceeding
+the existing following corridor rejects the next target before submission.
+Only successful current-epoch target completion advances that anchor.
+The previous 50 ms cycles at 19200/38400 and 20 ms cycles at 115200 are
 historical, not current limits.
 
 Ordinary exchanges and transitions to/from FC7b retain a 2 ms idle boundary
@@ -448,20 +458,20 @@ is checked against the preceding accepted target,
 matching the connected drive's observed response timing. A stuck or excessively
 lagging encoder still faults after three fresh samples.
 
-The browser selects `servo_ramped`, with internal acceleration
-at 50000 RPM/s (nominal 33333 mm/s²) and the retained 6000 mm/s² host ceiling.
-The earlier 20000 RPM/s trials, 2000 RPM/s / 1200 mm/s² profile and ramp-bypass
-trials are historical.
+The browser selects `servo_direct`, with native acceleration bypass and zero
+feedforward. The host retains its 6000 mm/s² ceiling. Earlier ramp and
+98% feedforward comparisons are retained separately; see
+[the tuning record](TUNING-2026-10-13.md).
 The October 13 continuous-planner revision passed 267/267 browser checks, including 13 core checks;
 500 independent native/WASM trajectories agreed within 1.31e-13. These are
 software checks. The earlier watched 19200-baud / 20000 RPM/s 1.5 Hz sine was
-accepted as smooth, and its browser Home/Play/Stop passed. The current guarded
+accepted as smooth, and its browser Home/Play/Stop passed. Earlier guarded
 115200-baud trials completed a 1.5 Hz / 70% sine, a 2.5 Hz / 30% sine and a
 2.5 Hz / 37.9% requested saw, with the saw retimed to 1.905 Hz. Each confirmed
 Stop. Those runs used production browser modules through an exclusive Node
 serial harness. The final Chrome Home → Play → Stop check also passed,
 displaying 80–85 command updates/s for the saw and confirmed Stop afterward.
-The current revision passes 292 browser tests and 132 Python tests. Other loads and
+The current revision passes 376 browser tests and 134 Python tests. Other loads and
 stock-firmware parity remain unverified. See the
 [current serial audit](SERIAL_THROUGHPUT_AUDIT.md),
 [earlier planner results](MOTION_PLANNER_AUDIT.md) and

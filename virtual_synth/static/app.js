@@ -24,6 +24,7 @@
   let scopeWidth = 0, scopeHeight = 0, pixelRatio = 1;
   let lastSuccessfulRequest = 0, lastStateReceipt = 0, motionEpoch = 0;
   let connecting = false, homeCancelledByTab = false;
+  let displayedDiagnosticTrace = null;
   const canvas = $("scope"), ctx = canvas.getContext("2d");
   const paramInputs = Array.from(document.querySelectorAll("[data-param]"));
   const audioPreview = (() => {
@@ -39,6 +40,7 @@
   function clamp(value, low = 0, high = 1) { return Math.min(high, Math.max(low, value)); }
   function format(value, places = 2) { return finite(value).toFixed(places); }
   function isHardware() { return state && state.mode === "hardware"; }
+  function isConnectedHardware() { return isHardware() && state.hardware?.connected !== false; }
   function isHoming() { return Boolean(state && state.homing && state.homing.active); }
   function currentParams() { return { ...DEFAULTS, ...(state ? state.params : {}), ...pendingParams }; }
   function report(message, error = false) {
@@ -259,7 +261,7 @@
     if (!state || rendering) return;
     rendering = true;
     const params = currentParams(), signal = state.signal || {};
-    const hw = isHardware(), canMove = !hw || state.allow_motion === true;
+    const hw = isHardware(), connected = isConnectedHardware(), canMove = !hw || (connected && state.allow_motion === true);
     $("scope-corner").textContent = hw ? "HARDWARE · ENCODER WHEN AVAILABLE" : "SIMULATED OUTPUT";
     const runningLabel = state.stopping ? "STOPPING" : state.unconfirmed_stop ? "STOP UNCONFIRMED" : state.fault ? "FAULT" : isHoming() ? "HOMING" : state.running ? "RUNNING" : state.paused ? "PAUSED" : state.armed ? "ARMED" : "STOPPED";
     $("run-status").replaceChildren();
@@ -277,7 +279,7 @@
     $("reset-button").disabled = !online || isHoming() || Boolean(state.running || state.unconfirmed_stop);
     $("scope-empty").hidden = Boolean(state.running || (state.history && state.history.length > 1));
     $("actual-legend").hidden = !hw || !(state.history || []).some((sample) => Number.isFinite(sample.actual));
-    $("transport-message").textContent = hw ? state.running ? "Hardware running · Stop to finish" : canMove ? state.homing?.valid ? "Motor homed · Press Play" : "Motor connected · Home before playing" : "Read-only connection · motion locked" : state.running ? "Simulated motion · no motor commands" : "Simulation · no motor connected";
+    $("transport-message").textContent = hw ? !connected ? "No USB connection · Reconnect, then Home before playing" : state.running ? "Hardware running · Stop to finish" : canMove ? state.homing?.valid ? "Motor homed · Press Play" : "Motor connected · Home before playing" : "Read-only connection · motion locked" : state.running ? "Simulated motion · no motor commands" : "Simulation · no motor connected";
     for (const input of paramInputs) {
       const key = input.dataset.param;
       if (document.activeElement !== input && !(key in pendingParams)) setInput(input, params[key]);
@@ -321,16 +323,26 @@
   }
 
   function renderHardware() {
-    const connected = isHardware(), hardware = state.hardware || {};
+    const hasSession = isHardware(), hardware = state.hardware || {};
+    const connected = hasSession && hardware.connected !== false;
+    const preview = $("motion-diagnostics-json");
+    if (!connected || state.running || state.armed || state.stopping || isHoming()
+        || hardware.command_trace_started_s !== displayedDiagnosticTrace) {
+      if (!preview.hidden || preview.textContent) { preview.hidden = true; preview.textContent = ""; }
+    }
     const canSelectPort = browserRuntime ? browserRuntime.supported : Boolean($("port-select").value);
     $("connect-button").disabled = !online || connecting || isHoming() || connected || !canSelectPort || Boolean(state.armed || state.running || state.paused || state.stopping);
     $("connect-button").textContent = connecting ? "Connecting…" : "Connect";
     $("connect-button").setAttribute("aria-busy", String(connecting));
-    $("disconnect-button").disabled = !online || !connected || isHoming();
+    $("disconnect-button").disabled = !online || !hasSession || isHoming();
     $("port-select").disabled = connecting || connected || Boolean(state.armed || state.running || state.paused);
     if (browserRuntime) $("refresh-ports").disabled = !browserRuntime.supported || connecting || connected || Boolean(state.armed || state.running || state.paused || state.stopping);
     $("hardware-metrics").hidden = !connected;
-    $("hardware-status").textContent = connected ? `${hardware.port ? `Connected: ${hardware.port}` : hardware.device ? `Connected: ${hardware.device}` : "Connected to motor interface."}${hardware.notice ? ` ${hardware.notice}` : ""}` : state.connection_notice || "No motor connected.";
+    $("save-motion-diagnostics").hidden = !browserRuntime || !connected;
+    $("save-motion-diagnostics").disabled = !connected || !hardware.command_trace_count || Boolean(state.running || state.armed || state.paused || state.stopping || isHoming());
+    $("show-motion-diagnostics").hidden = $("save-motion-diagnostics").hidden;
+    $("show-motion-diagnostics").disabled = $("save-motion-diagnostics").disabled;
+    $("hardware-status").textContent = connected ? `${hardware.port ? `Connected: ${hardware.port}` : hardware.device ? `Connected: ${hardware.device}` : "Connected to motor interface."}${hardware.notice ? ` ${hardware.notice}` : ""}` : hasSession ? `No USB connection. ${state.connection_notice || "Reconnect the adapter, then Connect → Home → Play."}` : state.connection_notice || "No motor connected.";
     $("encoder-raw").textContent = Number.isFinite(hardware.position_raw) ? `${hardware.position_raw} counts` : "No feedback";
     $("current-raw").textContent = Number.isFinite(hardware.current_raw) ? `${hardware.current_raw} raw` : "No feedback";
     $("serial-baud").textContent = Number.isFinite(hardware.baud) ? String(hardware.baud) : "—";
@@ -339,13 +351,13 @@
       ? `${hardware.command_reply_rate_hz.toFixed(0)}/s` : "—";
     // A latched motion fault remains visible independently of electrical stop
     // proof. The transport flag includes fresh speed/encoder settling checks.
-    const confirmed = hardware.stop_confirmed === true
+    const confirmed = connected && hardware.stop_confirmed === true
       && hardware.output_enabled === false
       && Number.isInteger(hardware.pending_raw) && Math.abs(hardware.pending_raw) <= 2
       && hardware.pwm_raw === 0 && hardware.alarm === 0
       && hardware.owned === false && hardware.running === false
       && !state.running && !state.unconfirmed_stop && !state.stopping;
-    $("stop-confirmed").textContent = confirmed ? "Confirmed" : "Unconfirmed";
+    $("stop-confirmed").textContent = !connected ? "No feedback" : confirmed ? "Confirmed" : "Unconfirmed";
     $("stop-confirmed").classList.toggle("unconfirmed", !confirmed);
     $("hardware-boundary").textContent = state.allow_motion ? "Ready for hardware: Connect → Home → Play. Connect only reads status; Home moves the motor." : "Launch ./synth --allow-motion for hardware Home and Run. Connecting here reads status only.";
     $("hardware-boundary").classList.toggle("motion-enabled", Boolean(state.allow_motion));
@@ -612,9 +624,28 @@
       await refreshPorts();
       $("port-select").value = id;
       if (state) renderHardware();
-    } catch (error) { report(browserRuntime.state().connection_notice || error.message, error.name !== "NotFoundError"); }
+    } catch (error) { report(browserRuntime.state()?.connection_notice || error.message, error.name !== "NotFoundError"); }
   });
   $("port-select").addEventListener("change", () => { if (state) renderHardware(); });
+  $("show-motion-diagnostics").addEventListener("click", async () => {
+    const output = $("motion-diagnostics-json");
+    if (!output.hidden) { output.hidden = true; output.textContent = ""; return; }
+    try {
+      output.textContent = JSON.stringify(await api("/api/motion-diagnostics"));
+      displayedDiagnosticTrace = state.hardware?.command_trace_started_s ?? null;
+      output.hidden = false;
+    }
+    catch (error) { report(error.message, true); }
+  });
+  $("save-motion-diagnostics").addEventListener("click", async () => {
+    try {
+      const diagnostics = await api("/api/motion-diagnostics");
+      const blob = new Blob([JSON.stringify(diagnostics, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob), link = document.createElement("a");
+      link.href = url; link.download = "ossm-motion-diagnostics.json";
+      link.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (error) { report(error.message, true); }
+  });
   $("connect-button").addEventListener("click", async () => {
     if ($("connect-button").disabled || connecting) return;
     const epoch = motionEpoch;
@@ -633,7 +664,7 @@
       await action("connect", { port }, true);
       $("hardware-details").open = true;
     } catch (error) {
-      if (epoch === motionEpoch) report(browserRuntime?.state().connection_notice || error.message, error.name !== "NotFoundError");
+      if (epoch === motionEpoch) report(browserRuntime?.state()?.connection_notice || error.message, error.name !== "NotFoundError");
     } finally {
       connecting = false;
       if (state) renderHardware();
@@ -671,6 +702,13 @@
       if (browserRuntime) { motionEpoch++; browserRuntime.stop().then(acceptState).catch(() => {}); }
     }
     else poll();
+  });
+  window.addEventListener("beforeunload", (event) => {
+    if (browserRuntime?.mustStopBeforeClose) {
+      // The native prompt can postpone closing; it is not evidence of Stop.
+      event.preventDefault();
+      event.returnValue = "";
+    }
   });
   window.addEventListener("pagehide", () => {
     stopped = true;

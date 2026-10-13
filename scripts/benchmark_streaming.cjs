@@ -3,6 +3,8 @@
 
 // Offline timing model: no browser, serial port, device, or test suite is opened.
 const assert = require("node:assert/strict");
+const {execFileSync} = require("node:child_process");
+const path = require("node:path");
 const {performance} = require("node:perf_hooks");
 const {createRuntime} = require("../virtual_synth/static/browser-runtime.js");
 const {MotorTransport} = require("../virtual_synth/static/web-serial-transport.js");
@@ -14,6 +16,20 @@ const option = (name, fallback) => {
 const BAUD = option("--baud", 19200), ADAPTER_MS = option("--adapter-ms", 10);
 const JITTER_MS = option("--jitter-ms", 0), TARGETS = option("--targets", 1000);
 const NATIVE_SPIKE_MS = option("--native-spike-ms", 0), NATIVE_SPIKE_EVERY = option("--native-spike-every", 97);
+const baselineIndex = process.argv.indexOf("--baseline-guards");
+const baselineGuards = baselineIndex < 0 ? null : process.argv[baselineIndex + 1];
+if (baselineGuards !== null) {
+  assert.match(baselineGuards, /^[a-f0-9]{7,40}$/, "baseline guards must be a commit hash");
+  const source = execFileSync("git", ["show", `${baselineGuards}:virtual_synth/static/web-serial-transport.js`],
+    {cwd:path.resolve(__dirname,".."),encoding:"utf8"});
+  const baseline = {exports:{}};
+  Function("require","module","exports",source)(name => {
+    assert.equal(name,"./web-serial-io.js"); return require("../virtual_synth/static/web-serial-io.js");
+  },baseline,baseline.exports);
+  // Only substitute the trusted, retained guard policy. Engine, runtime,
+  // frames, adapter model and all actual-write assertions stay current.
+  MotorTransport.prototype._read_stream_guards = baseline.exports.MotorTransport.prototype._read_stream_guards;
+}
 assert.ok([19200,38400,115200].includes(BAUD), "Use --baud 19200, 38400, or 115200");
 assert.ok(Number.isFinite(ADAPTER_MS) && ADAPTER_MS >= 0 && ADAPTER_MS <= 100);
 assert.ok(Number.isFinite(JITTER_MS) && JITTER_MS >= 0 && JITTER_MS <= 50);
@@ -29,7 +45,7 @@ class ModelDrive {
     this.values[0] = 1; this.values[2] = 1800; this.values[3] = 50000;
     this.values[11] = 800; this.values[21] = 1; this.position(200000);
     this.targetTimes = []; this.statusReads = this.fullReads = 0;
-    this.statusGroups = [0,0,0,0]; this.maximumGuardAge = 0;
+    this.statusGroups = [0,0,0,0]; this.maximumGuardAge = 0; this.wireBytes = 0;
     this.maximumGuardBatch = this.guardBatch = 0; this.lastFunction = null;
     this.active = this.maximumActive = this.exchanges = this.nativeCount = 0;
   }
@@ -48,8 +64,9 @@ class ModelDrive {
       let reply;
       if (tx[1] === 3) {
         const start = tx[2] << 8 | tx[3], count = tx[4] << 8 | tx[5];
+        this.guardBatch++;
         if (count === 26) this.fullReads++;
-        else { this.statusReads++; this.statusGroups[[0,7,14,21].indexOf(start)]++; this.guardBatch++; }
+        else { this.statusReads++; this.statusGroups[[0,7,14,21].indexOf(start)]++; }
         reply = frame([1,3,count * 2,...this.values.slice(start,start + count).flatMap(value => [value >>> 8,value & 255])]);
       } else if (tx[1] === 0x7b) {
         const age = Math.max(...this.transport._status_group_at.map(at => this.clock.now() - at));
@@ -69,6 +86,7 @@ class ModelDrive {
       // Deterministic bounded adapter jitter, repeated every 17 exchanges.
       const jitter = JITTER_MS * ((this.exchanges++ * 7) % 17) / 16;
       const elapsed = (ADAPTER_MS + jitter) / 1000 + (tx.length + reply.length) * 10 / BAUD;
+      this.wireBytes += tx.length + reply.length;
       assert.ok(elapsed < timeout, "modeled exchange must fit the transport timeout");
       this.clock.elapsed += elapsed; this.lastFunction = tx[1];
       return reply;
@@ -91,6 +109,7 @@ async function main() {
     transport._homed = true; transport._origin = 200000; transport._low = 126000; transport._high = 274000;
     await action("play");
     const began = clock.now(), cpuBegan = performance.now(), initialStatus = drive.statusReads, initialFull = drive.fullReads;
+    const initialWireBytes = drive.wireBytes;
     drive.guardBatch = 0;
     let heartbeatAt = began;
     for (let index = 0; index < TARGETS; index++) {
@@ -103,8 +122,10 @@ async function main() {
     const intervals = drive.targetTimes.slice(1).map((time,index) => (time - drive.targetTimes[index]) * 1000).sort((a,b) => a - b);
     console.log(JSON.stringify({model:{physical_test:false,baud:BAUD,bits_per_byte:10,
       ordinary_or_transition_gap_ms:2,contiguous_fc7b_gap_ms:0,adapter_ms_per_exchange:ADAPTER_MS,
-      bounded_adapter_jitter_ms:JITTER_MS,native_write_spike_ms:NATIVE_SPIKE_MS,native_write_spike_every:NATIVE_SPIKE_EVERY,scheduler_extra_wait_ms:0,browser_timer_jitter_modeled:false,servo_dynamics_modeled:false},
+      bounded_adapter_jitter_ms:JITTER_MS,native_write_spike_ms:NATIVE_SPIKE_MS,native_write_spike_every:NATIVE_SPIKE_EVERY,scheduler_extra_wait_ms:0,browser_timer_jitter_modeled:false,servo_dynamics_modeled:false,
+      baseline_guard_commit:baselineGuards,guard_policy:baselineGuards ? "retained baseline" : BAUD === 115200 ? "atomic100ms" : "staggered partials"},
       result:{targets:drive.targetTimes.length,targets_per_second:rounded(TARGETS / elapsed),
+        total_wire_bytes:drive.wireBytes - initialWireBytes,wire_occupancy_fraction:rounded((drive.wireBytes - initialWireBytes) * 10 / BAUD / elapsed),
         streamed_status_reads:drive.statusReads - initialStatus,streamed_full_reads:drive.fullReads - initialFull,
         guard_group_reads:drive.statusGroups,maximum_guard_reads_per_target:drive.maximumGuardBatch,
         interval_min_ms:percentile(intervals,0),interval_median_ms:percentile(intervals,.5),interval_p95_ms:percentile(intervals,.95),

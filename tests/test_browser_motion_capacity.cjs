@@ -79,8 +79,10 @@ test("an infeasible 4 Hz sine retimes its reference while the ideal requested ph
   const a=.7*.4*spanMm,expected=Math.sqrt(reserve*6000/a)/(2*Math.PI);
   assert.equal(r.signal.rate_limited,true);assert.ok(Math.abs(r.signal.planned_rate_hz-expected)<1e-9);
   assert.ok(Math.abs(r.span-r.nominalSpan)<r.nominalSpan*.01);assert.ok(r.rms<.5);
-  assert.ok(Math.abs(engine.phase-wrap(4*r.elapsed))<1e-9,"requested oscillator keeps its original rate");
-  assert.ok(Math.abs(engine.reference_phase-wrap(expected*r.elapsed))<1e-8,"planned oscillator follows its feasible rate");
+  const requestedPhase=engine.phase, plannedPhase=engine.reference_phase, dt=.137;
+  engine.step(dt,{running:true,tracking:true});
+  assert.ok(Math.abs(engine.phase-wrap(requestedPhase+4*dt))<1e-9,"requested oscillator keeps its original rate from its aligned origin");
+  assert.ok(Math.abs(engine.reference_phase-wrap(plannedPhase+expected*dt))<1e-8,"planned oscillator follows its feasible rate from its aligned origin");
 });
 
 test("square transitions reach both endpoints at 1.5 Hz within all motion bounds",()=>{

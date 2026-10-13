@@ -32,13 +32,13 @@ class FakePort {
   async close() { this.closes++; }
 }
 
-function timedConnection(port, { onWait = null } = {}) {
+function timedConnection(port, { onWait = null, onClock = null } = {}) {
   const timing = { time: 0, waits: [], writes: [], onWait };
   const onWrite = port.onWrite;
   port.onWrite = (tx, owner) => { timing.writes.push(timing.time); return onWrite(tx, owner); };
   const connection = new WebSerialConnection(port, {
     baudRate: 115200,
-    clock: () => timing.time,
+    clock: () => { onClock?.(); return timing.time; },
     wait: async milliseconds => {
       assert.ok(milliseconds > 0, "quiet waits must advance time");
       timing.waits.push(milliseconds); timing.time += milliseconds;
@@ -48,6 +48,73 @@ function timedConnection(port, { onWait = null } = {}) {
   });
   return { connection, timing };
 }
+
+test("position gain requests permit only fixed volatile gain 3000, including raw-frame validation", async () => {
+  const request = frame([1,6,0,7,11,184]);
+  assert.deepEqual(configRequest(7,3000), request);
+  for (const gain of [0,60,2999,3001,4000,6000,30000,65535,3000.5,NaN]) assert.throws(() => configRequest(7,gain), /Unsupported/);
+  const port = new FakePort(), {connection} = timedConnection(port);
+  try {
+    await connection.open();
+    for (const gain of [0,60,2999,3001,4000,6000,30000,65535]) {
+      await assert.rejects(connection.exchange(frame([1,6,0,7,gain >>> 8,gain & 255])), /outside the supported/);
+    }
+    assert.deepEqual(port.writes, []);
+    assert.deepEqual(await connection.exchange(request), request);
+    assert.deepEqual(port.writes, [request]);
+  } finally { await connection.close(); }
+});
+
+test("numeric exchange timing distinguishes fragmented early RX from delayed writer settlement", async () => {
+  const response = frame([1,0x7b,0,1,0,0]);
+  let timing;
+  const port = new FakePort(async (_,owner) => {
+    timing.time += 3; owner.emit(response.slice(0,3)); await Promise.resolve();
+    timing.time += 2; owner.emit(response.slice(3)); await Promise.resolve();
+    timing.time += 10;
+  });
+  const context = timedConnection(port), {connection} = context; timing = context.timing;
+  const tuple = connection.exchangeTiming;
+  try {
+    await connection.open(); const submitted = timing.time;
+    assert.deepEqual(await connection.exchange(io.fastPositionRequest(123)),response);
+    assert.equal(connection.exchangeTiming,tuple,"the same fixed numeric tuple is reused");
+    assert.deepEqual(Array.from(tuple),[1,0x7b,submitted,submitted+15,submitted+3,submitted+5,submitted+15]);
+    assert.equal(port.writes.length,1); assert.equal(connection.poisoned,false);
+  } finally { await connection.close(); }
+});
+
+test("numeric exchange timing identifies delayed RX after an already-settled write", async () => {
+  const response = frame([1,0x7b,0,1,0,0]), port = new FakePort(() => {});
+  const {connection,timing} = timedConnection(port);
+  try {
+    await connection.open(); const submitted = timing.time;
+    const exchange = connection.exchange(io.fastPositionRequest(123));
+    for (let i = 0; i < 20 && !Number.isFinite(connection.exchangeTiming[3]); i++) await Promise.resolve();
+    assert.equal(connection.exchangeTiming[3],submitted); assert.ok(Number.isNaN(connection.exchangeTiming[4]));
+    timing.time += 20; port.emit(response); assert.deepEqual(await exchange,response);
+    assert.deepEqual(Array.from(connection.exchangeTiming),[1,0x7b,submitted,submitted,submitted+20,submitted+20,submitted+20]);
+    assert.equal(port.writes.length,1);
+  } finally { await connection.close(); }
+});
+
+test("timing validity resets for failed, recovered and cancelled exchanges without stale RX metadata", async () => {
+  const response = frame([1,0x7b,0,1,0,0]), bad = response.slice(); bad[6] ^= 1;
+  const port = new FakePort((_,owner) => owner.emit(bad)), {connection,timing} = timedConnection(port);
+  try {
+    await connection.open(); const tuple = connection.exchangeTiming;
+    await assert.rejects(connection.exchange(io.fastPositionRequest(123)),/CRC/);
+    assert.equal(tuple[0],1); assert.ok(Number.isFinite(tuple[4])); assert.ok(Number.isNaN(tuple[6]));
+    const failedRx = tuple[4];
+    port.onWrite = (_,owner) => { timing.time += 4; owner.emit(response); };
+    assert.deepEqual(await connection.exchange(io.fastPositionRequest(124)),response);
+    assert.equal(connection.exchangeTiming,tuple); assert.equal(tuple[0],2); assert.equal(tuple[1],0x7b);
+    assert.ok(tuple[2] > failedRx); assert.equal(tuple[4],tuple[2]+4); assert.equal(tuple[5],tuple[4]); assert.ok(Number.isFinite(tuple[6]));
+    await assert.rejects(connection.exchange(outputRequest("inhibit"),.1,() => { throw new TransportError("Operation cancelled by Stop."); }),/cancelled/);
+    assert.equal(tuple[0],3); assert.equal(tuple[1],6);
+    assert.ok(Array.from(tuple.slice(2)).every(Number.isNaN)); assert.equal(port.writes.length,2);
+  } finally { await connection.close(); }
+});
 
 test("clean dedicated FC7b pairs have zero artificial quiet wait and retain one reader", async () => {
   const response = frame([1, 0x7b, 0, 1, 0, 0]);
@@ -145,6 +212,31 @@ test("ordinary guard-to-target and target-to-guard transitions retain the 2 ms b
     assert.deepEqual(timing.waits, [2]);
     assert.deepEqual(timing.writes.map(time => time - timing.writes[0]), [0, 2, 2, 4]);
   } finally { await connection.close(); }
+});
+
+test("fractional receive timestamps finish the exact 2 ms boundary without a clock-resolution spin", async () => {
+  for (const arriveQuiet of [false, true]) {
+    let monitorClock = false, clockReads = 0;
+    const port = new FakePort(), { connection, timing } = timedConnection(port, {
+      onClock() {
+        if (monitorClock) assert.ok(++clockReads < 100, "An already-satisfied quiet boundary must not spin waiting for another clock tick");
+      },
+    });
+    try {
+      await connection.open();
+      timing.time = 254.02;
+      await connection.exchange(snapshotRequest());
+      const receivedAt = timing.time, quietAt = receivedAt + 2;
+      assert.ok(quietAt - receivedAt < 2, "Fixture crosses a floating-point precision boundary");
+      if (arriveQuiet) timing.time = quietAt;
+      timing.waits.length = 0; monitorClock = true;
+      await connection.exchange(io.fastPositionRequest(123));
+      monitorClock = false;
+      assert.deepEqual(timing.waits, arriveQuiet ? [] : [quietAt - receivedAt]);
+      assert.equal(timing.writes.at(-1), quietAt, "Native submission still waits until the absolute 2 ms boundary");
+      assert.equal(port.writes.length, 2, "There is one request per exchange");
+    } finally { monitorClock = false; await connection.close(); }
+  }
 });
 
 test("new unsolicited ordinary input moves the idle boundary to its receive time", async () => {

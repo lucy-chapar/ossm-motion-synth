@@ -20,6 +20,14 @@ ASSETS = {"/": ("index.html", "text/html; charset=utf-8"),
           "/audio.js": ("audio.js", "text/javascript; charset=utf-8"),
           "/tooltips.js": ("tooltips.js", "text/javascript; charset=utf-8"),
           "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+          "/worker.js": ("worker.js", "text/javascript; charset=utf-8"),
+          "/worker-client.js": ("worker-client.js", "text/javascript; charset=utf-8"),
+          "/browser-runtime.js": ("browser-runtime.js", "text/javascript; charset=utf-8"),
+          "/browser-engine.js": ("browser-engine.js", "text/javascript; charset=utf-8"),
+          "/web-serial-io.js": ("web-serial-io.js", "text/javascript; charset=utf-8"),
+          "/web-serial-transport.js": ("web-serial-transport.js", "text/javascript; charset=utf-8"),
+          "/ruckig-core.js": ("ruckig-core.js", "text/javascript; charset=utf-8"),
+          "/ruckig-core.wasm": ("ruckig-core.wasm", "application/wasm"),
           "/style.css": ("style.css", "text/css; charset=utf-8")}
 MAX_BODY = 16384
 
