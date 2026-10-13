@@ -333,6 +333,10 @@
     $("hardware-status").textContent = connected ? `${hardware.port ? `Connected: ${hardware.port}` : hardware.device ? `Connected: ${hardware.device}` : "Connected to motor interface."}${hardware.notice ? ` ${hardware.notice}` : ""}` : state.connection_notice || "No motor connected.";
     $("encoder-raw").textContent = Number.isFinite(hardware.position_raw) ? `${hardware.position_raw} counts` : "No feedback";
     $("current-raw").textContent = Number.isFinite(hardware.current_raw) ? `${hardware.current_raw} raw` : "No feedback";
+    $("serial-baud").textContent = Number.isFinite(hardware.baud) ? String(hardware.baud) : "—";
+    $("command-rate-label").textContent = state.running ? "Command updates" : "Last command updates";
+    $("command-rate").textContent = Number.isFinite(hardware.command_reply_rate_hz) && hardware.command_reply_rate_hz > 0
+      ? `${hardware.command_reply_rate_hz.toFixed(0)}/s` : "—";
     const confirmed = hardware.stop_confirmed === true
       && hardware.output_enabled === false
       && hardware.pending_raw === 0 && hardware.pwm_raw === 0

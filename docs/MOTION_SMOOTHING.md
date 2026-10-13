@@ -1,10 +1,11 @@
 # Browser motion smoothing — historical trials and October 13 continuation
 
-The current **local, not deployed** browser hardware planner is described in the
-[October 13 motion planner audit](MOTION_PLANNER_AUDIT.md). It supersedes the
-position-only tracker and earlier ramped/bypass trials below. The current
-physical acceptance is recorded in the audit. Historical user acceptance applies only
-to its recorded pattern, load and earlier implementation.
+The current **local, not deployed** defaults and guarded physical results are
+recorded in the [serial throughput audit](SERIAL_THROUGHPUT_AUDIT.md). The
+[October 13 motion planner audit](MOTION_PLANNER_AUDIT.md) describes the C2
+planner and earlier 20000 RPM/s trials, superseding the position-only tracker
+below. Historical user acceptance applies only to its recorded pattern, load
+and earlier implementation.
 
 ## October 2–3 changes and results (historical)
 

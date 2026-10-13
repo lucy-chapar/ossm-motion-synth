@@ -128,11 +128,13 @@
   }
 
   class WebSerialConnection {
-    constructor(port, { baudRate = 19200 } = {}) {
+    constructor(port, { baudRate = 19200, clock = now, wait = delay } = {}) {
       if (!port || typeof port.open !== "function" || typeof port.close !== "function") throw new TransportError("An explicitly selected serial port is required.");
       if (!Number.isInteger(baudRate) || ![19200, 38400, 115200].includes(baudRate)) throw new TransportError("Unsupported serial baud rate.");
+      if (typeof clock !== "function" || typeof wait !== "function") throw new TransportError("Invalid serial clock or wait function.");
       this.port = port;
       this.baudRate = baudRate;
+      this._clock = clock; this._wait = wait; // Milliseconds; defaults retain browser timing.
       this.poisoned = false;
       this.closeIncomplete = false;
       this._opened = this._opening = this._closing = false;
@@ -140,6 +142,8 @@
       this._buffer = [];
       this._resyncAfter = null;
       this._lastReceiveAt = null;
+      this._lastSuccessfulFunction = null;
+      this._lastResponseDeadline = null;
       this._receiveError = null;
       this._wake = null;
       this._queue = Promise.resolve();
@@ -159,7 +163,7 @@
         this._writer = this.port.writable.getWriter();
         this._pumpPromise = this._pump();
         // USB adapters can retain bytes from an earlier port session.
-        this._resyncAfter = now() + 150;
+        this._resyncAfter = this._clock() + 150;
         await this._resync();
       } catch (error) {
         try { await this.close(); } catch (_) { /* The original opening failure remains visible. */ }
@@ -176,7 +180,7 @@
           }
           if (value && value.length) {
             this._buffer.push(...bytes(value));
-            this._lastReceiveAt = now();
+            this._lastReceiveAt = this._clock();
           }
           if (this._buffer.length > 256) throw new TransportError("Unexpected serial input exceeded the response buffer.");
           this._wake?.();
@@ -192,12 +196,12 @@
       while (this._buffer.length < count) {
         this._requireOpen();
         if (this._receiveError) throw this._receiveError;
-        if (now() >= deadline) throw new TransportError("Response timeout; no retry was sent.");
+        if (this._clock() >= deadline) throw new TransportError("Response timeout; no retry was sent.");
         try {
-          await bounded(new Promise(resolve => { this._wake = resolve; }), deadline - now(), "Response timeout; no retry was sent.");
+          await bounded(new Promise(resolve => { this._wake = resolve; }), deadline - this._clock(), "Response timeout; no retry was sent.");
         } finally { this._wake = null; }
       }
-      if (now() >= deadline) throw new TransportError("Response timeout; no retry was sent.");
+      if (this._clock() >= deadline) throw new TransportError("Response timeout; no retry was sent.");
       return Uint8Array.from(this._buffer.splice(0, count));
     }
     async _resync(quietMs = 10) {
@@ -206,14 +210,14 @@
       // Discard that reply through its original response window, then require
       // silence before allowing an independent cleanup request onto the wire.
       const notBefore = this._resyncAfter;
-      const deadline = Math.max(now(), notBefore) + 250;
-      let quietSince = Math.max(now(), notBefore);
+      const deadline = Math.max(this._clock(), notBefore) + 250;
+      let quietSince = Math.max(this._clock(), notBefore);
       while (true) {
         this._requireOpen();
         if (this._receiveError) throw this._receiveError;
         this._buffer.length = 0;
         quietSince = Math.max(quietSince, this._lastReceiveAt ?? quietSince);
-        const time = now();
+        const time = this._clock();
         if (time >= notBefore && time - quietSince >= quietMs) {
           this._resyncAfter = null;
           return;
@@ -222,7 +226,23 @@
         const wakeAt = Math.min(deadline, Math.max(notBefore, quietSince + quietMs));
         // A timed poll also handles a quiet receive stream without installing
         // another read or changing the sole reader pump's ownership.
-        await delay(Math.max(1, Math.min(10, wakeAt - time)));
+        await this._wait(Math.max(1, Math.min(10, wakeAt - time)));
+      }
+    }
+    async _idleBoundary() {
+      // Ordinary Modbus traffic retains the upstream 2000 us boundary (also
+      // >=3.5 characters at 19200 baud), measured from the final receive chunk.
+      // Do not restart that gap when an already-quiet caller arrives.
+      const deadline = this._clock() + 250;
+      while (true) {
+        this._requireOpen();
+        if (this._receiveError) throw this._receiveError;
+        this._buffer.length = 0; // Only discard unsolicited input before writing.
+        const time = this._clock();
+        const remaining = this._lastReceiveAt === null ? 0 : this._lastReceiveAt + 2 - time;
+        if (remaining <= 0) return;
+        if (time >= deadline) throw new TransportError("Serial input did not become quiet; no new request was sent.");
+        await this._wait(Math.min(10, remaining, deadline - time));
       }
     }
     async exchange(value, timeoutSeconds = 0.15, beforeWrite = null) {
@@ -238,23 +258,52 @@
     }
     async _exchange(tx, timeoutSeconds, beforeWrite) {
       this._requireOpen();
-      // Drain late, unsolicited bytes between complete transactions. Never
-      // discard or retry a response after this request has been written.
       const recovering = this._resyncAfter !== null;
-      if (!recovering) this._resyncAfter = now();
-      // 3 ms exceeds the 3.5-character Modbus gap at 19200 baud.
-      await this._resync(recovering ? 10 : 3);
+      const fastPair = !recovering && tx[1] === 0x7b && this._lastSuccessfulFunction === 0x7b;
+      if (recovering) {
+        this._lastSuccessfulFunction = null;
+        await this._resync(); // Original response window plus 10 ms quarantine.
+      } else if (!fastPair) {
+        // Reads, writes and transitions to/from ordinary Modbus need an idle
+        // boundary. Contiguous clean FC7b exchanges have no post-response delay,
+        // matching the motor's dedicated protocol and upstream OSSM-RS driver.
+        do { await this._idleBoundary(); }
+        while (this._buffer.length || (this._lastReceiveAt !== null && this._clock() - this._lastReceiveAt < 2));
+      }
       this._requireOpen();
+      if (this._receiveError) throw this._receiveError;
+      if (this._buffer.length) {
+        // An extra chunk after a clean fast response cannot silently become
+        // the next response. Quarantine through that original reply window;
+        // no new write or uncertain-target retransmission has occurred.
+        this._resyncAfter = this._lastResponseDeadline ?? this._clock();
+        this._lastSuccessfulFunction = null;
+        const error = new TransportError("Unexpected inter-frame response bytes; no new request was sent.");
+        error.recoverableResponse = true;
+        throw error;
+      }
       // Stop can arrive while the quiet boundary is awaited. Recheck intent
       // at the last synchronous boundary before the native write is submitted.
-      beforeWrite?.();
-      const deadline = now() + timeoutSeconds * 1000;
+      // A live FC7b reference may replace its unsent placeholder here, after
+      // every known queue/quiet wait. Revalidate the actual frame; ordinary
+      // protocol operations cannot change through this callback.
+      const replacement = beforeWrite?.();
+      // Existing guard-only callbacks may return a counter/boolean; preserve
+      // that behavior. Only an explicit byte frame requests replacement.
+      if (replacement instanceof Uint8Array || Array.isArray(replacement)) {
+        const current = validateRequest(replacement);
+        if (tx[1] !== 0x7b || current[1] !== 0x7b) throw new TransportError("Only a dedicated position frame may be replaced before writing.");
+        tx = current;
+      }
+      const deadline = this._clock() + timeoutSeconds * 1000;
       let writeSettled = false;
+      this._lastSuccessfulFunction = null;
+      this._lastResponseDeadline = deadline;
       const write = this._writer.write(tx);
       this._writePromise = write;
       write.then(() => { writeSettled = true; }, () => { writeSettled = true; });
       try {
-        await bounded(write, deadline - now(), "Write timeout; transmission and software stop are unconfirmed.");
+        await bounded(write, deadline - this._clock(), "Write timeout; transmission and software stop are unconfirmed.");
       } catch (error) {
         if (!writeSettled) {
           // A still-pending native write must never race a later inhibit or be
@@ -278,7 +327,9 @@
         } else length = 8;
         const tail = await this._readExactly(length - 3, deadline);
         if (this._buffer.length) throw new TransportError("Unexpected trailing response bytes.");
-        return validateResponse(tx, Uint8Array.from([...head, ...tail]));
+        const response = validateResponse(tx, Uint8Array.from([...head, ...tail]));
+        this._lastSuccessfulFunction = tx[1];
+        return response;
       } catch (error) {
         this._resyncAfter = deadline;
         // The write completed. A missing/corrupt response can be recovered by

@@ -123,20 +123,17 @@ test("connect is read-only; home completes before hardware can arm", async () =>
   assert.ok(command[1] - .5 <= .5 * motor.hw.max_acceleration_raw_s2 / 19660 * .1 ** 2);
 });
 
-test("only verified 115200 baud selects finer target deadlines, including Resume", async () => {
+test("every baud generates one fresh target per completed hardware tick, including Resume", async () => {
   for (const baud of [undefined, 19200, 38400, 115200]) {
     const motor = fakeMotor(); motor.hw.homed = true; motor.hw.baud = baud;
-    const env = setup({factory: () => motor}), period = baud === 115200 ? .020 : .05;
+    const env = setup({factory: () => motor});
     await env.connect(); await env.action("play");
     const count = () => motor.calls.filter(Array.isArray).length;
-    env.advance(period - .001); await env.runtime.tick(); assert.equal(count(), 0);
-    env.advance(.001); await env.runtime.tick(); assert.equal(count(), 1);
-    env.advance(period); await env.runtime.tick(); assert.equal(count(), 2);
-    await env.action("pause"); env.advance(.5); await env.runtime.tick(); assert.equal(count(), 2);
-    await env.action("resume");
-    env.advance(period - .001); await env.runtime.tick(); assert.equal(count(), 2);
-    env.advance(.001); await env.runtime.tick(); assert.equal(count(), 3);
-    await env.action("stop"); env.advance(period); await env.runtime.tick(); assert.equal(count(), 3);
+    for (let i = 0; i < 100; i++) { env.advance(.0005); await env.runtime.tick(); }
+    assert.equal(count(), 100, "no baud-dependent target timer floor");
+    await env.action("pause"); env.advance(.5); await env.runtime.tick(); assert.equal(count(), 100);
+    await env.action("resume"); env.advance(.0005); await env.runtime.tick(); assert.equal(count(), 101);
+    await env.action("stop"); env.advance(.02); await env.runtime.tick(); assert.equal(count(), 101);
     assert.equal(env.runtime.state().fault, null); await env.runtime.close();
   }
 });
@@ -344,29 +341,28 @@ test("hardware arming refuses a missing or invalid physical jerk limit", async (
  }
 });
 
-test("hardware targets are sampled after guard latency and paced from cycle deadlines", async () => {
+test("hardware samples after guards and starts the next cycle on completion without overlap", async () => {
   const motor = fakeMotor(); motor.hw.homed = true;
   const env = setup({factory: () => motor}), sent = [];
+  let active = 0, maximumActive = 0;
   motor.command = async resolve => {
-    env.advance(.024); // Short status group, including adapter latency.
+    maximumActive = Math.max(maximumActive, ++active);
+    env.advance(.024);
     const position = resolve();
     sent.push({time: env.time(), position, phase: env.runtime.state().signal.phase});
-    env.advance(.021); // Dedicated encoder reply.
+    env.advance(.021); active--;
     return motor.status();
   };
   await env.connect(); await env.action("play");
-  for (let i = 0; i < 20; i++) {
-    env.advance(i ? .005 : .05);
-    await env.action("heartbeat"); await env.runtime.tick();
-  }
-  assert.equal(sent.length, 20);
+  for (let i = 0; i < 20; i++) { await env.action("heartbeat"); await env.runtime.tick(); }
+  assert.equal(sent.length, 20); assert.equal(maximumActive, 1);
   for (let i = 0; i < sent.length; i++) {
-    assert.ok(Math.abs(sent[i].time - (.074 + i * .05)) < 1e-9);
+    assert.ok(Math.abs(sent[i].time - (.024 + i * .045)) < 1e-9);
     assert.ok(Math.abs(sent[i].phase - ((sent[i].time * .25) % 1)) < 1e-9,
-      "waveform phase includes the guard read before generating this target");
+      "phase includes guard latency before generating the target");
   }
   env.advance(.004); await env.runtime.tick();
-  assert.equal(sent.length, 20, "no early target while the next deadline is pending");
+  assert.equal(sent.length, 21, "next fresh target is not held for an arbitrary deadline");
   await env.runtime.close();
 });
 
@@ -538,5 +534,58 @@ test("reattachment waits for disconnect cleanup before reconnecting", async () =
   assert.equal(env.counts().opens,2);
   assert.equal(env.runtime.state().running,false);
   assert.equal(env.runtime.state().homing.valid,false);
+  await env.runtime.close();
+});
+
+test("combined reply, scheduling and guard delays cannot bypass the 250 ms target deadline", async () => {
+  const motor = fakeMotor(); motor.hw.homed = true;
+  const env = setup({factory: () => motor}); let generated = 0;
+  motor.command = async resolve => { env.advance(.1); resolve(); generated++; return motor.status(); };
+  await env.connect(); await env.action("play");
+  env.advance(.16); await env.runtime.tick();
+  assert.equal(generated,0); assert.match(env.runtime.state().fault,/scheduling deadline/);
+  assert.equal(env.runtime.state().running,false); await env.runtime.close();
+});
+
+test("automatic hardware loop exceeds 500 Hz fake completion rate and yields promptly to Stop without overlap", async () => {
+  const motor = fakeMotor(); motor.hw.homed = true; motor.hw.baud = 115200;
+  const port = {}, serial = {requestPort:async () => port,getPorts:async () => [port]};
+  let now = 0, active = 0, maximumActive = 0, commands = 0, runtime, stopAt = null;
+  let resolveStopped;
+  const stopped = new Promise(resolve => {resolveStopped = resolve;});
+  motor.command = async resolve => {
+    maximumActive = Math.max(maximumActive,++active);
+    now += .0005; resolve(); commands++; active--;
+    if (commands === 160) setTimeout(() => {stopAt = commands; runtime.stop().then(resolveStopped);},0);
+    return motor.status();
+  };
+  runtime = createRuntime({serial,clock: () => now,storage:null,transportFactory: () => motor});
+  try {
+    const action = (name, details={}) => runtime.request("/api/action",{action:name,...details});
+    await action("connect",{port:await runtime.choosePort()});
+    const automaticBegan = performance.now(); await action("play");
+    let timeout;
+    try { await Promise.race([stopped,new Promise((_,reject) => {timeout = setTimeout(() => reject(new Error("automatic loop did not yield to Stop")),2000);})]); }
+    finally {clearTimeout(timeout);}
+    assert.ok(commands >= 160 && commands <= 416,"timer Stop is serviced within bounded task batches"); assert.ok(commands / now > 500,"no automatic10ms or nested target timer ceiling");
+    assert.ok(commands / ((performance.now() - automaticBegan) / 1000) > 500,"automatic scheduler permits >500 actual fake completions/s");
+    assert.equal(maximumActive,1); assert.equal(commands,stopAt,"Stop fences all further target generation");
+    await new Promise(resolve => setTimeout(resolve,15)); assert.equal(commands,stopAt);
+    assert.equal(runtime.state().running,false); assert.equal(runtime.state().fault,null);
+  } finally {await runtime.close();}
+});
+
+test("fast hardware history stays around 50 Hz over ten seconds instead of every transaction", async () => {
+  const motor = fakeMotor(); motor.hw.homed = true;
+  const env = setup({factory: () => motor});
+  await env.connect(); await env.action("play");
+  for (let i = 0; i < 2400; i++) {
+    env.advance(.005); if (i % 40 === 0) await env.action("heartbeat"); await env.runtime.tick();
+  }
+  const history = env.runtime.state().history;
+  assert.ok(history.length >= 490 && history.length <= 501);
+  assert.ok(history.at(-1).t - history[0].t >= 9.9);
+  assert.ok(history.slice(1).every((sample,index) => sample.t - history[index].t >= .0199));
+  assert.equal(motor.calls.filter(Array.isArray).length,2400);
   await env.runtime.close();
 });

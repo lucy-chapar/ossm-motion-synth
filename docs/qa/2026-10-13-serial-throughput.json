@@ -1,0 +1,497 @@
+{
+  "date": "2026-10-13",
+  "deployment": "local only; no public deployment",
+  "serial": {
+    "adapter_vid_pid": "1a86:7523",
+    "baud": 115200,
+    "commissioned_with_documented_sequence": true,
+    "requires_user_power_cycle": true,
+    "power_cycle_received": true,
+    "crc_verified_readback": true,
+    "readback_original_path": "/private/tmp/ossm-baud-verified-2026-10-13.json",
+    "readback_sha256": "d0e78b49a4c42eb88f17186ccd7902b7d01bc0963cfef511c9e7e0a38bd754d2",
+    "maximum_inflight_exchanges": 1,
+    "contiguous_clean_fc7b_added_gap_ms": 0,
+    "ordinary_or_transition_idle_ms": 2,
+    "guard_refresh_age_ms": 100,
+    "guard_urgent_headroom_ms": 100,
+    "guard_hard_age_limit_ms": 250,
+    "target_sampled_after_queue_and_quiet_waits": true
+  },
+  "motion_limits": {
+    "host_velocity_nominal_mm_s": 1080,
+    "host_acceleration_nominal_mm_s2": 6000,
+    "host_jerk_nominal_mm_s3": 100000,
+    "drive_speed_rpm": 1800,
+    "drive_ramp_rpm_s": 50000,
+    "nominal_counts_per_mm": 819.2
+  },
+  "raw_stationary_link_tests": [
+    {
+      "trace_original_path": "/private/tmp/ossm-link-19200-before-1791917860063.json",
+      "trace_sha256": "660dcd5e359dc82cfde7fbdae44afec8685bb2d5e4f4eab756283927f8abba5a",
+      "observed_at_utc": "2026-10-13T18:57:40.053Z",
+      "baud": 19200,
+      "baseline": true,
+      "io_sha256": "ae075eb1471725df290012dd755cc30218b7441ae8ae191176c4b11f6c456ec5",
+      "targets": 100,
+      "seconds": 1.607023083,
+      "targets_per_second": 62.22685974946882,
+      "transaction_min_ms": 15.557667000000038,
+      "transaction_median_ms": 15.944666999999981,
+      "transaction_p95_ms": 16.64904200000001,
+      "transaction_max_ms": 19.03566699999999,
+      "maximum_target_gap_ms": 19.335624999999936,
+      "stationary_position_raw": -37772,
+      "post_positions": [
+        -37772,
+        -37772,
+        -37772
+      ],
+      "output_enabled": false
+    },
+    {
+      "trace_original_path": "/private/tmp/ossm-link-115200-before-1791918209768.json",
+      "trace_sha256": "3127cc586b08c94d3e7ad9225d9c3daf71e00ba6353400eab34af9c11974b3a9",
+      "observed_at_utc": "2026-10-13T19:03:29.761Z",
+      "baud": 115200,
+      "baseline": true,
+      "io_sha256": "ae075eb1471725df290012dd755cc30218b7441ae8ae191176c4b11f6c456ec5",
+      "targets": 100,
+      "seconds": 1.007742209,
+      "targets_per_second": 99.23172722836698,
+      "transaction_min_ms": 8.613790999999992,
+      "transaction_median_ms": 9.693083999999999,
+      "transaction_p95_ms": 12.084749999999985,
+      "transaction_max_ms": 19.022083000000066,
+      "maximum_target_gap_ms": 17.933166999999912,
+      "stationary_position_raw": 20036,
+      "post_positions": [
+        20036,
+        20036,
+        20036
+      ],
+      "output_enabled": false
+    },
+    {
+      "trace_original_path": "/private/tmp/ossm-link-115200-after-1791918219433.json",
+      "trace_sha256": "32b516e678789f4f8d7abc5bcbd94bd9f4162a01023024282c56c6d90b8947ef",
+      "observed_at_utc": "2026-10-13T19:03:39.430Z",
+      "baud": 115200,
+      "baseline": false,
+      "io_sha256": "06f33fd4ae3265aea8362a82af8b9ac29c50672503ad842c4535d4a99f0655a8",
+      "targets": 100,
+      "seconds": 0.5626019579999999,
+      "targets_per_second": 177.74555985459264,
+      "transaction_min_ms": 4.6997499999999945,
+      "transaction_median_ms": 5.5360840000000735,
+      "transaction_p95_ms": 6.61283299999991,
+      "transaction_max_ms": 8.95491699999991,
+      "maximum_target_gap_ms": 8.939750000000004,
+      "stationary_position_raw": 20036,
+      "post_positions": [
+        20036,
+        20036,
+        20036
+      ],
+      "output_enabled": false
+    }
+  ],
+  "guarded_motion_series": [
+    {
+      "version": "100ms guard lead and factory ramp; before final native-write resampling",
+      "runtime": "production browser JS via exclusive native serial pipe; not Chrome",
+      "trace_original_path": "/private/tmp/ossm-c2-live-2026-10-13T19-42-48-534Z.json",
+      "trace_sha256": "c1bdebe6df28e93013ce43c58151f9fdde8059d5471e47eebcaeacae03a314f4",
+      "source_sha256": {
+        "browser-engine.js": "1244440423ef0e56301c3608659d06bb1e1112cf4946064f1c4887498721ab18",
+        "browser-runtime.js": "e2b65fd65e386514f2a3d714148863092d38052d9fab6bb3b15abbbf3df6186e",
+        "web-serial-io.js": "06f33fd4ae3265aea8362a82af8b9ac29c50672503ad842c4535d4a99f0655a8",
+        "web-serial-transport.js": "2a9d841aa668e01c64c90b1270bde998987ab15b2d3543d690737e7cf3fd4782",
+        "ruckig-core.js": "a797da7e1fbe63c65c02e0d939de66cc0aa2ad5e75af648b9dce1988b46758d0",
+        "ruckig-core.wasm": "6473afda9e511aa18b90a7dced3772423764e88260c4a4d3acb847cc9661d0c3"
+      },
+      "results": [
+        {
+          "stage": "sine_1.5Hz_0.7",
+          "seconds": 6,
+          "targets": 809,
+          "target_rate": 134.83333333333334,
+          "target_span_mm": 98.389892578125,
+          "encoder_span_mm": 97.11669921875,
+          "maximum_target_gap_ms": 35.90020900000468,
+          "sampled_speed_peak_mm_s": 438.6666666666667,
+          "planned_rate": 1.5,
+          "final": {
+            "fault": null,
+            "running": false,
+            "homed": true,
+            "stop_confirmed": true,
+            "output": 0,
+            "pending": 0,
+            "pwm": 0,
+            "speed": 0,
+            "alarm": 0,
+            "position": -19399,
+            "span_mm": 179.697265625,
+            "baud": 115200,
+            "profile": "servo_ramped",
+            "acceleration_setting": 50000,
+            "host_acceleration_mm_s2": 6000,
+            "host_jerk_mm_s3": 100000,
+            "command_reply_rate_hz": 136.0961236033316,
+            "command_reply_count": 809
+          },
+          "median_target_gap_ms": 4.587520999997707,
+          "p95_target_gap_ms": 14.98283300000125,
+          "maximum_postreply_guard_age_ms": 105.98637500000052,
+          "encoder_reply_samples": 809
+        },
+        {
+          "stage": "sine_2.5Hz_0.3",
+          "seconds": 6,
+          "targets": 781,
+          "target_rate": 130.16666666666666,
+          "target_span_mm": 42.16552734375,
+          "encoder_span_mm": 40.771484375,
+          "maximum_target_gap_ms": 19.650083999998458,
+          "sampled_speed_peak_mm_s": 344.1333333333333,
+          "planned_rate": 2.5,
+          "final": {
+            "fault": null,
+            "running": false,
+            "homed": true,
+            "stop_confirmed": true,
+            "output": 0,
+            "pending": 0,
+            "pwm": 0,
+            "speed": 0,
+            "alarm": 0,
+            "position": -8453,
+            "span_mm": 179.697265625,
+            "baud": 115200,
+            "profile": "servo_ramped",
+            "acceleration_setting": 50000,
+            "host_acceleration_mm_s2": 6000,
+            "host_jerk_mm_s3": 100000,
+            "command_reply_rate_hz": 134.5411469614508,
+            "command_reply_count": 781
+          },
+          "median_target_gap_ms": 4.8570834999992485,
+          "p95_target_gap_ms": 15.641124999994815,
+          "maximum_postreply_guard_age_ms": 106.14304200000646,
+          "encoder_reply_samples": 781
+        },
+        {
+          "stage": "saw_2.5Hz_0.379",
+          "seconds": 6,
+          "targets": 714,
+          "target_rate": 119,
+          "target_span_mm": 53.271484375,
+          "encoder_span_mm": 52.872314453125,
+          "maximum_target_gap_ms": 20.71008399998675,
+          "sampled_speed_peak_mm_s": 497.6,
+          "planned_rate": 1.9051668898243204,
+          "final": {
+            "fault": null,
+            "running": false,
+            "homed": true,
+            "stop_confirmed": true,
+            "output": 0,
+            "pending": 0,
+            "pwm": 0,
+            "speed": 0,
+            "alarm": 0,
+            "position": 8233,
+            "span_mm": 179.697265625,
+            "baud": 115200,
+            "profile": "servo_ramped",
+            "acceleration_setting": 50000,
+            "host_acceleration_mm_s2": 6000,
+            "host_jerk_mm_s3": 100000,
+            "command_reply_rate_hz": 124.88738204787265,
+            "command_reply_count": 714
+          },
+          "median_target_gap_ms": 5.348541999993017,
+          "p95_target_gap_ms": 16.71633300000508,
+          "maximum_postreply_guard_age_ms": 107.49570800000185,
+          "encoder_reply_samples": 714
+        }
+      ]
+    },
+    {
+      "version": "final native-write resampling; exact final production source",
+      "runtime": "production browser JS via exclusive native serial pipe; not Chrome",
+      "trace_original_path": "/private/tmp/ossm-c2-live-2026-10-13T19-51-19-248Z.json",
+      "trace_sha256": "1816815a8b506ebfe89abec74766b13580aada16ebeec189dc096478abfc73a8",
+      "source_sha256": {
+        "browser-engine.js": "1244440423ef0e56301c3608659d06bb1e1112cf4946064f1c4887498721ab18",
+        "browser-runtime.js": "e2b65fd65e386514f2a3d714148863092d38052d9fab6bb3b15abbbf3df6186e",
+        "web-serial-io.js": "6baa809c744e235162dca5af6094d9cc42003e17f88871461ee70c94840ac5bc",
+        "web-serial-transport.js": "5fea9cfb6da67c7469e1d1cf865f6c83f1a2b9260f07822c847bfca4231f5ab7",
+        "ruckig-core.js": "a797da7e1fbe63c65c02e0d939de66cc0aa2ad5e75af648b9dce1988b46758d0",
+        "ruckig-core.wasm": "6473afda9e511aa18b90a7dced3772423764e88260c4a4d3acb847cc9661d0c3"
+      },
+      "results": [
+        {
+          "stage": "sine_1.5Hz_0.7",
+          "seconds": 6,
+          "targets": 612,
+          "target_rate": 102,
+          "target_span_mm": 98.394775390625,
+          "encoder_span_mm": 96.9140625,
+          "maximum_target_gap_ms": 53.5621670000026,
+          "sampled_speed_peak_mm_s": 475.2,
+          "planned_rate": 1.5,
+          "final": {
+            "fault": null,
+            "running": false,
+            "homed": true,
+            "stop_confirmed": true,
+            "output": 0,
+            "pending": 0,
+            "pwm": 0,
+            "speed": 0,
+            "alarm": 0,
+            "position": -19387,
+            "span_mm": 179.703369140625,
+            "baud": 115200,
+            "profile": "servo_ramped",
+            "acceleration_setting": 50000,
+            "host_acceleration_mm_s2": 6000,
+            "host_jerk_mm_s3": 100000,
+            "command_reply_rate_hz": 98.66312721087505,
+            "command_reply_count": 612
+          },
+          "median_target_gap_ms": 6.194125000000383,
+          "p95_target_gap_ms": 18.659167000002697,
+          "maximum_postreply_guard_age_ms": 113.70933399999927,
+          "encoder_reply_samples": 612
+        },
+        {
+          "stage": "sine_2.5Hz_0.3",
+          "seconds": 6,
+          "targets": 647,
+          "target_rate": 107.83333333333333,
+          "target_span_mm": 42.16796875,
+          "encoder_span_mm": 40.511474609375,
+          "maximum_target_gap_ms": 22.45262500001388,
+          "sampled_speed_peak_mm_s": 402.2,
+          "planned_rate": 2.5,
+          "final": {
+            "fault": null,
+            "running": false,
+            "homed": true,
+            "stop_confirmed": true,
+            "output": 0,
+            "pending": 0,
+            "pwm": 0,
+            "speed": 0,
+            "alarm": 0,
+            "position": -8049,
+            "span_mm": 179.703369140625,
+            "baud": 115200,
+            "profile": "servo_ramped",
+            "acceleration_setting": 50000,
+            "host_acceleration_mm_s2": 6000,
+            "host_jerk_mm_s3": 100000,
+            "command_reply_rate_hz": 107.3220420676861,
+            "command_reply_count": 647
+          },
+          "median_target_gap_ms": 5.795687000002658,
+          "p95_target_gap_ms": 17.867416000001413,
+          "maximum_postreply_guard_age_ms": 111.2120409999875,
+          "encoder_reply_samples": 647
+        },
+        {
+          "stage": "saw_2.5Hz_0.379",
+          "seconds": 6,
+          "targets": 644,
+          "target_rate": 107.33333333333333,
+          "target_span_mm": 53.272705078125,
+          "encoder_span_mm": 52.87841796875,
+          "maximum_target_gap_ms": 30.585083000005397,
+          "sampled_speed_peak_mm_s": 461.06666666666666,
+          "planned_rate": 1.905143606426568,
+          "final": {
+            "fault": null,
+            "running": false,
+            "homed": true,
+            "stop_confirmed": true,
+            "output": 0,
+            "pending": 0,
+            "pwm": 0,
+            "speed": 0,
+            "alarm": 0,
+            "position": 8904,
+            "span_mm": 179.703369140625,
+            "baud": 115200,
+            "profile": "servo_ramped",
+            "acceleration_setting": 50000,
+            "host_acceleration_mm_s2": 6000,
+            "host_jerk_mm_s3": 100000,
+            "command_reply_rate_hz": 114.31556331126842,
+            "command_reply_count": 644
+          },
+          "median_target_gap_ms": 5.831707999988112,
+          "p95_target_gap_ms": 17.680041999994955,
+          "maximum_postreply_guard_age_ms": 112.64483299999029,
+          "encoder_reply_samples": 644
+        }
+      ]
+    }
+  ],
+  "failed_attempts": [
+    {
+      "trace": "ossm-c2-live-2026-10-13T19-01-26-838Z.json",
+      "reason": "253ms stale guard with capped runtime",
+      "stop_confirmed": true
+    },
+    {
+      "trace": "ossm-c2-live-2026-10-13T19-14-39-955Z.json",
+      "reason": "three fresh samples exceeded unchanged following-error bound with20000RPM/s native ramp",
+      "stop_confirmed": true
+    },
+    {
+      "trace": "ossm-c2-live-2026-10-13T19-31-18-469Z.json",
+      "reason": "264ms stale guard with insufficient urgent-refresh headroom",
+      "stop_confirmed": true
+    },
+    {
+      "trace": "ossm-c2-live-2026-10-13T19-20-23-840Z.json",
+      "reason": "completed slow sine then serial write timeout while idle; cause not isolated",
+      "pattern_stop_confirmed": true,
+      "final_session_stop_confirmed": false,
+      "subsequent_readonly_inhibited_feedback_verified": true,
+      "user_reported_wifi_interruption": true,
+      "wifi_causality_established": false
+    },
+    {
+      "test": "strict stationary raw benchmark retry after final guarded trials",
+      "reason": "read-only precondition check rejected before any FC7b target was sent",
+      "targets_sent": 0,
+      "benchmark_result_available": false
+    }
+  ],
+  "offline_model": {
+    "model": {
+      "physical_test": false,
+      "baud": 115200,
+      "bits_per_byte": 10,
+      "ordinary_or_transition_gap_ms": 2,
+      "contiguous_fc7b_gap_ms": 0,
+      "adapter_ms_per_exchange": 0,
+      "bounded_adapter_jitter_ms": 0,
+      "native_write_spike_ms": 0,
+      "native_write_spike_every": 97,
+      "scheduler_extra_wait_ms": 0,
+      "browser_timer_jitter_modeled": false,
+      "servo_dynamics_modeled": false
+    },
+    "result": {
+      "targets": 1000,
+      "targets_per_second": 550.551316,
+      "streamed_status_reads": 68,
+      "streamed_full_reads": 0,
+      "guard_group_reads": [
+        17,
+        17,
+        17,
+        17
+      ],
+      "maximum_guard_reads_per_target": 1,
+      "interval_min_ms": 1.388889,
+      "interval_median_ms": 1.388889,
+      "interval_p95_ms": 7.732639,
+      "interval_p99_ms": 7.732639,
+      "interval_max_ms": 7.732639,
+      "maximum_guard_age_at_write_ms": 100.197917,
+      "maximum_inflight": 1,
+      "cpu_ms_per_target": 0.036742,
+      "fault": null
+    }
+  },
+  "validation": {
+    "browser_tests": {
+      "passed": 290,
+      "failed": 0,
+      "log": "/private/tmp/ossm-unpaced-browser-tests-final-write.log"
+    },
+    "python_tests": {
+      "passed": 132,
+      "failed": 0,
+      "log": "/private/tmp/ossm-unpaced-python-tests-final.log"
+    },
+    "served_asset_hashes_verified": 14,
+    "wasm_mime": "application/wasm",
+    "chrome_ui": {
+      "url": "http://127.0.0.1:8769/",
+      "runtime": "Chrome Web Serial, exported final source",
+      "home_completed": true,
+      "home_span_nominal_mm_displayed": 179.7,
+      "requested_rate_hz": 2.5,
+      "stroke": 0.379,
+      "shape": "saw",
+      "displayed_command_rate_running_per_s": 80,
+      "displayed_last_command_rate_stopped_per_s": 85,
+      "rate_display_semantics": "rounded one-second reply interval estimate; not whole-run average",
+      "stop_confirmed_ui": true,
+      "left_connected_homed_stopped": true,
+      "screenshot": "docs/images/serial-throughput-2026-10-13.jpg",
+      "screenshot_sha256": "27d707b947d890631b1503e74a55b4531d34cfa078251d3c241a33453c0871b9"
+    }
+  },
+  "limits_of_evidence": [
+    "500Hz is wire-feasible and passed by the ideal timing model; not observed on the connected path.",
+    "Encoder and sparse register speed establish physical movement but do not replace human smoothness assessment.",
+    "Native ramp, guard scheduling and logging changed together; no isolated ramp causal claim."
+  ],
+  "source_sha256": {
+    "browser-engine.js": "1244440423ef0e56301c3608659d06bb1e1112cf4946064f1c4887498721ab18",
+    "browser-runtime.js": "e2b65fd65e386514f2a3d714148863092d38052d9fab6bb3b15abbbf3df6186e",
+    "web-serial-io.js": "6baa809c744e235162dca5af6094d9cc42003e17f88871461ee70c94840ac5bc",
+    "web-serial-transport.js": "5fea9cfb6da67c7469e1d1cf865f6c83f1a2b9260f07822c847bfca4231f5ab7",
+    "ruckig-core.js": "a797da7e1fbe63c65c02e0d939de66cc0aa2ad5e75af648b9dce1988b46758d0",
+    "ruckig-core.wasm": "6473afda9e511aa18b90a7dced3772423764e88260c4a4d3acb847cc9661d0c3"
+  },
+  "source_manifest_sha256": "427aae6729ae6409e538c220f7d8b63bd1db22fd673c2cc41c65c0286227ed56",
+  "human_smoothness_assessment_for_this_revision": "not received",
+  "offline_jitter_model": {
+    "model": {
+      "physical_test": false,
+      "baud": 115200,
+      "bits_per_byte": 10,
+      "ordinary_or_transition_gap_ms": 2,
+      "contiguous_fc7b_gap_ms": 0,
+      "adapter_ms_per_exchange": 10,
+      "bounded_adapter_jitter_ms": 6,
+      "native_write_spike_ms": 75,
+      "native_write_spike_every": 97,
+      "scheduler_extra_wait_ms": 0,
+      "browser_timer_jitter_modeled": false,
+      "servo_dynamics_modeled": false
+    },
+    "result": {
+      "targets": 1000,
+      "targets_per_second": 29.090336,
+      "streamed_status_reads": 1001,
+      "streamed_full_reads": 0,
+      "guard_group_reads": [
+        251,
+        250,
+        250,
+        250
+      ],
+      "maximum_guard_reads_per_target": 3,
+      "interval_min_ms": 11.388889,
+      "interval_median_ms": 33.732639,
+      "interval_p95_ms": 37.107639,
+      "interval_p99_ms": 107.260417,
+      "interval_max_ms": 112.107639,
+      "maximum_guard_age_at_write_ms": 181.975694,
+      "maximum_inflight": 1,
+      "cpu_ms_per_target": 0.101984,
+      "fault": null
+    }
+  }
+}

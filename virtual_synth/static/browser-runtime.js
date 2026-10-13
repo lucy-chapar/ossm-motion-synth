@@ -9,7 +9,7 @@
   if (typeof module === "object" && module.exports) module.exports = exported;
   else root.MotionBrowserRuntime = exported.createRuntime();
 })(globalThis, (engineAPI) => {
-  const HARDWARE_PERIOD = .05, FAST_HARDWARE_PERIOD = .02;
+  const HISTORY_PERIOD = .02, HISTORY_SECONDS = 10;
   const copy = (value) => structuredClone(value);
   const spanOf = (hw) => {
     const bounds = hw.raw_bounds;
@@ -41,18 +41,33 @@
     let connectionNotice = "", autoConnecting = null;
     let paused = false;
     let nextPort = 1, transport = null, connectedPort = null, lastHardware = null;
-    // Only a verified 115200-baud connection selects the finer cadence. Serial
-    // completion can reduce the achieved rate; this is a deadline, not a claim
-    // of deterministic 50 Hz delivery through every USB adapter.
-    // 19200/38400 keep the established cycle; none of this changes drive baud.
-    const hardwarePeriod = () => transport?.status().baud === 115200 ? FAST_HARDWARE_PERIOD : HARDWARE_PERIOD;
     let mode = "simulation", armed = false, running = false, gate = false, fault = null;
     let unconfirmedStop = false, stoppingCount = 0, revision = 0, epoch = 0, busy = false, closed = false;
     let lastTick = clock(), began = lastTick, lastIO = lastTick, lastHeartbeat = lastTick;
-    let nextTargetCycle = lastTick + HARDWARE_PERIOD;
+    let lastHistory = lastTick - HISTORY_PERIOD, lastTargetSampled = lastTick;
     let signal = engine.step(0, { gate: false, running: false }), history = [];
     let chain = Promise.resolve();
     let timer = null;
+    let automaticRunning = false, yieldChannel = null, yieldResolve = null, taskYields = 0;
+    const automaticEnabled = options.autoStart !== false;
+    const yieldTask = () => new Promise(resolve => {
+      // Periodically yield to timers too: repeatedly reposted channel tasks
+      // can otherwise starve timer callbacks in some event loops. This is a
+      // responsiveness yield per batch, never a target cadence timer.
+      if (++taskYields % 8 !== 0 && typeof globalThis.MessageChannel === "function") {
+        if (!yieldChannel) {
+          yieldChannel = new globalThis.MessageChannel();
+          yieldChannel.port1.onmessage = () => { const done = yieldResolve; yieldResolve = null; done?.(); };
+          yieldChannel.port1.unref?.(); yieldChannel.port2.unref?.();
+        }
+        yieldResolve = resolve; yieldChannel.port2.postMessage(0);
+      } else setTimeout(resolve, 0);
+    });
+    function wakeAutomatic() {
+      if (!automaticEnabled || automaticRunning || closed) return;
+      clearTimeout(timer); timer = null;
+      queueMicrotask(automaticTick);
+    }
     const remember = (port) => {
       for (const [id, known] of ports) if (known === port) return id;
       const id = `adapter-${nextPort++}`; ports.set(id, port); return id;
@@ -123,7 +138,7 @@
       if ((armed || activeHome) && now - lastHeartbeat > 1.5) await fail("Control tab heartbeat expired. Output stopped; rearm explicitly.");
       else if ((running && dt > 0.25) || (activeHome && dt > 1)) await fail("Motion scheduling deadline missed. No catch-up targets were sent.");
       signal = engine.step(paused ? 0 : Math.min(dt, 0.25), { gate, running, tracking: mode === "hardware" });
-      if (transport && (running ? now + 1e-9 >= nextTargetCycle : now - lastIO >= (homing().active ? 0.1 : 0.5))) {
+      if (transport && (running || now - lastIO >= (homing().active ? 0.1 : 0.5))) {
         lastIO = now;
         const ioEpoch = epoch, recoveriesBefore = transport.status().communication_recoveries || 0;
         try {
@@ -137,19 +152,16 @@
               if (ioEpoch !== epoch || !running) throw new Error("Output stopped before target generation.");
               const sampledAt = clock(), elapsed = sampledAt - lastTick;
               if (sampledAt - lastHeartbeat > 1.5) throw new Error("Control tab heartbeat expired before target generation.");
-              if (!Number.isFinite(elapsed) || elapsed < 0 || elapsed > .25) {
+              if (!Number.isFinite(elapsed) || elapsed < 0 || elapsed > .25 || sampledAt - lastTargetSampled > .25) {
                 throw new Error("Motion scheduling deadline missed. No catch-up targets were sent.");
               }
               if ((transport.status().communication_recoveries || 0) > recoveriesBefore) {
                 throw new Error("Serial recovery interrupted the continuous trajectory. Stop and Play to recapture from stationary feedback.");
               }
               signal = engine.step(elapsed, { gate, running: true, tracking: true });
-              lastTick = sampledAt;
+              lastTick = lastTargetSampled = sampledAt;
               return signal.command;
             });
-            // Keep wall-clock cycle deadlines; never wait a whole period AFTER
-            // I/O or queue missed targets when a transaction runs long.
-            nextTargetCycle = Math.max(nextTargetCycle + hardwarePeriod(), clock());
           }
           else if (transport.status().connected && !fault) lastHardware = await transport.snapshot();
           // An uncertain write cannot freeze a position reference while its
@@ -158,14 +170,19 @@
           if ((lastHardware?.communication_recoveries || 0) > recoveriesBefore) {
             if (running) throw new Error("Serial recovery interrupted the continuous trajectory. Stop and Play to recapture from stationary feedback.");
             lastTick = lastIO = clock();
-            nextTargetCycle = lastTick + hardwarePeriod();
           }
         } catch (error) { if (ioEpoch === epoch) await fail(`RS485: ${error.message || error}`); }
       }
-      const hw = hardware();
-      history.push({ t: Math.round((lastTick - began) * 1e4) / 1e4, requested: signal.requested, command: signal.command,
-        actual: mode === "hardware" && hw && !fault ? hw.position_normalized ?? null : null, envelope: signal.envelope });
-      if (history.length > 500) history.shift();
+      // Scope/DOM consumers run independently of the transaction cadence.
+      // Keep roughly 50 samples/s and ten seconds even on a fast connection.
+      if (lastTick - lastHistory >= HISTORY_PERIOD - 1e-9) {
+        lastHistory = lastTick;
+        const hw = hardware();
+        history.push({ t: Math.round((lastTick - began) * 1e4) / 1e4, requested: signal.requested, command: signal.command,
+          actual: mode === "hardware" && hw && !fault ? hw.position_normalized ?? null : null, envelope: signal.envelope });
+      }
+      while (history.length && history[0].t < lastTick - began - HISTORY_SECONDS) history.shift();
+      while (history.length > Math.ceil(HISTORY_SECONDS / HISTORY_PERIOD) + 1) history.shift();
     }
     function tick() {
       if (busy || closed) return Promise.resolve();
@@ -260,7 +277,7 @@
           } catch (error) { await motionError("Cannot resume", error); }
         }
         paused = false; armed = running = true; lastTick = lastIO = lastHeartbeat = clock();
-        nextTargetCycle = lastTick + hardwarePeriod();
+        lastTargetSampled = lastTick; wakeAutomatic();
       } else if (name === "run") {
         if (!armed || running || fault) throw new Error("Arm a stopped, healthy synth before running.");
         if (transport) {
@@ -270,7 +287,7 @@
           } catch (error) { await motionError("Cannot start", error); }
         }
         running = true; lastTick = lastIO = lastHeartbeat = clock();
-        nextTargetCycle = lastTick + hardwarePeriod();
+        lastTargetSampled = lastTick; wakeAutomatic();
       } else if (name === "gate") {
         if (typeof payload.value !== "boolean") throw new Error("Gate must be true or false.");
         if (payload.value && (!armed || !running || fault)) throw new Error("Start the armed synth before opening the envelope gate.");
@@ -371,17 +388,35 @@
     serial?.addEventListener?.("disconnect", onDisconnect);
     serial?.addEventListener?.("connect", onConnect);
     async function automaticTick() {
-      try { await tick(); }
+      if (automaticRunning || closed) return;
+      automaticRunning = true;
+      let batchStarted = performance.now(), cycles = 0;
+      try {
+        do {
+          if (busy) await chain;
+          if (closed) break;
+          await tick();
+          if (!(mode === "hardware" && running)) break;
+          // Native serial awaits normally yield already. Bound synchronous
+          // fake/very-fast completions too, without a per-target timer floor.
+          if (++cycles >= 32 || performance.now() - batchStarted >= 3) {
+            await yieldTask(); cycles = 0; batchStarted = performance.now();
+          }
+        } while (!closed);
+      }
       finally {
-        if (!closed) {
-          const seconds = mode === "hardware" && running && !busy ? Math.max(.001, nextTargetCycle - clock()) : .01;
-          timer = setTimeout(automaticTick, seconds * 1000);
-        }
+        automaticRunning = false;
+        if (!closed) timer = setTimeout(automaticTick, 10);
       }
     }
-    if (options.autoStart !== false) timer = setTimeout(automaticTick, 10);
+    if (automaticEnabled) timer = setTimeout(automaticTick, 10);
     return { request, choosePort, autoConnect, tick, state, stop, supported, ready: engineAPI.ready,
-      async close() { closed = true; clearTimeout(timer); await stop(); if (transport) await transport.close(); serial?.removeEventListener?.("disconnect", onDisconnect); serial?.removeEventListener?.("connect", onConnect); } };
+      async close() {
+        closed = true; clearTimeout(timer); yieldResolve?.(); yieldResolve = null;
+        yieldChannel?.port1.close(); yieldChannel?.port2.close();
+        await stop(); if (transport) await transport.close();
+        serial?.removeEventListener?.("disconnect", onDisconnect); serial?.removeEventListener?.("connect", onConnect);
+      } };
   }
   return { createRuntime };
 });

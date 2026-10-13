@@ -1,9 +1,15 @@
 # Motion planner audit — October 3 and 13, 2026
 
-The October 13 continuation describes the current **local browser hardware
-planner**. It supersedes the October 3 trajectory implementation below. The new
-revision has not been deployed. Its watched 1.5 Hz sine and browser-control
-checks are recorded below.
+The later [serial throughput audit](SERIAL_THROUGHPUT_AUDIT.md) supersedes the
+serial cadence, connected baud and 20000 RPM/s drive default recorded here.
+It documents the current completion-driven 115200 path, 50000 RPM/s native ramp
+and final guarded physical comparisons. The C2 planner and host budgets below
+remain in use; their earlier measurements are preserved as historical evidence.
+
+The October 13 continuation records the **local browser hardware planner**
+before the later throughput and native-ramp changes. It superseded the October 3
+trajectory implementation below and has not been deployed. Its watched 1.5 Hz
+sine and browser-control checks are recorded below.
 Historical acceptance applies only to the particular earlier version and run.
 Neither offline results nor those trials establish general smoothness or parity
 with stock firmware.

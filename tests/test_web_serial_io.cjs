@@ -32,6 +32,216 @@ class FakePort {
   async close() { this.closes++; }
 }
 
+function timedConnection(port, { onWait = null } = {}) {
+  const timing = { time: 0, waits: [], writes: [], onWait };
+  const onWrite = port.onWrite;
+  port.onWrite = (tx, owner) => { timing.writes.push(timing.time); return onWrite(tx, owner); };
+  const connection = new WebSerialConnection(port, {
+    baudRate: 115200,
+    clock: () => timing.time,
+    wait: async milliseconds => {
+      assert.ok(milliseconds > 0, "quiet waits must advance time");
+      timing.waits.push(milliseconds); timing.time += milliseconds;
+      timing.onWait?.(milliseconds);
+      await Promise.resolve(); // Deliver queued receive chunks through the sole reader.
+    },
+  });
+  return { connection, timing };
+}
+
+test("clean dedicated FC7b pairs have zero artificial quiet wait and retain one reader", async () => {
+  const response = frame([1, 0x7b, 0, 1, 0, 0]);
+  const port = new FakePort((_, owner) => owner.emit(response));
+  let readers = 0;
+  const getReader = port.readable.getReader.bind(port.readable);
+  port.readable.getReader = (...args) => { readers++; return getReader(...args); };
+  const { connection, timing } = timedConnection(port);
+  try {
+    await connection.open();
+    assert.ok(timing.time >= 160, "startup quarantine must remain in force");
+    timing.waits.length = 0;
+    await connection.exchange(io.fastPositionRequest(123), .1);
+    for (const target of [124, 125, 126]) assert.deepEqual(await connection.exchange(io.fastPositionRequest(target), .1), response);
+    assert.deepEqual(timing.waits, []);
+    assert.deepEqual(timing.writes, Array(4).fill(timing.time));
+    assert.equal(readers, 1);
+  } finally { await connection.close(); }
+});
+
+test("lazy FC7b frames sample after the ordinary transition quiet wait and retain the clean fast path", async () => {
+  const port = new FakePort(), {connection, timing} = timedConnection(port);
+  try {
+    await connection.open(); await connection.exchange(snapshotRequest());
+    const before = timing.time;
+    let sampledAt = null, resolved = 0;
+    // Model a delayed browser task while the final ordinary idle wait runs.
+    timing.onWait = () => { timing.time += 75; timing.onWait = null; };
+    await connection.exchange(io.fastPositionRequest(123), .1, () => {
+      resolved++; sampledAt = timing.time;
+      return io.fastPositionRequest(Math.round(sampledAt));
+    });
+    assert.equal(sampledAt, before + 77);
+    assert.equal(resolved, 1);
+    assert.deepEqual(port.writes.at(-1), io.fastPositionRequest(Math.round(sampledAt)));
+    assert.notDeepEqual(port.writes.at(-1), io.fastPositionRequest(123), "the placeholder never reaches the wire");
+    assert.equal(timing.writes.at(-1), sampledAt, "no await separates frame sampling from native submission");
+    timing.waits.length = 0;
+    await connection.exchange(io.fastPositionRequest(123), .1, () => io.fastPositionRequest(456));
+    assert.deepEqual(timing.waits, []);
+    assert.deepEqual(port.writes.at(-1), io.fastPositionRequest(456));
+  } finally { await connection.close(); }
+});
+
+test("lazy replacement validates the actual frame and cannot change ordinary protocol operations", async () => {
+  const invalidCRC = io.fastPositionRequest(456); invalidCRC[7] ^= 1;
+  const cases = [
+    [io.fastPositionRequest(123), invalidCRC, /CRC/],
+    [io.fastPositionRequest(123), frame([1, 0x7b, 0, 0, 0, 0]), /supported motor protocol/],
+    [io.fastPositionRequest(123), configRequest(2, 7), /Only a dedicated position/],
+    [configRequest(2, 7), io.fastPositionRequest(456), /Only a dedicated position/],
+    [io.fastPositionRequest(123), [1, 0x7b, 256], /Invalid byte/],
+  ];
+  for (const [placeholder, replacement, expected] of cases) {
+    const port = new FakePort(), {connection} = timedConnection(port);
+    try {
+      await connection.open();
+      await assert.rejects(connection.exchange(placeholder, .1, () => replacement), expected);
+      assert.deepEqual(port.writes, [], "an invalid actual frame cannot transmit its placeholder");
+      assert.equal(connection._resyncAfter, null, "nothing was written or left uncertain");
+    } finally { await connection.close(); }
+  }
+});
+
+test("ordinary Modbus boundary waits only the unelapsed portion since the final received chunk", async () => {
+  const port = new FakePort(), { connection, timing } = timedConnection(port);
+  try {
+    await connection.open();
+    await connection.exchange(configRequest(2, 7));
+    const received = connection._lastReceiveAt;
+    timing.time += .75; timing.waits.length = 0;
+    await connection.exchange(configRequest(3, 15));
+    assert.deepEqual(timing.waits, [1.25]);
+    assert.equal(timing.writes[1] - received, 2);
+    timing.time += 3; timing.waits.length = 0;
+    await connection.exchange(configRequest(2, 7));
+    assert.deepEqual(timing.waits, [], "a caller arriving after the required gap needs no new quiet delay");
+  } finally { await connection.close(); }
+});
+
+test("ordinary guard-to-target and target-to-guard transitions retain the 2 ms boundary", async () => {
+  const port = new FakePort((tx, owner) => owner.emit(tx[1] === 3
+    ? frame([1, 3, tx[5] * 2, ...Array(tx[5] * 2).fill(0)]) : ack(tx)));
+  const { connection, timing } = timedConnection(port);
+  try {
+    await connection.open();
+    await connection.exchange(io.statusRequest(0, 7));
+    timing.waits.length = 0;
+    await connection.exchange(io.fastPositionRequest(123));
+    assert.deepEqual(timing.waits, [2]);
+    timing.waits.length = 0;
+    await connection.exchange(io.fastPositionRequest(124));
+    assert.deepEqual(timing.waits, []);
+    await connection.exchange(io.statusRequest(7, 7));
+    assert.deepEqual(timing.waits, [2]);
+    assert.deepEqual(timing.writes.map(time => time - timing.writes[0]), [0, 2, 2, 4]);
+  } finally { await connection.close(); }
+});
+
+test("new unsolicited ordinary input moves the idle boundary to its receive time", async () => {
+  const port = new FakePort(), { connection, timing } = timedConnection(port);
+  try {
+    await connection.open(); await connection.exchange(configRequest(2, 7));
+    timing.time += .25; timing.waits.length = 0;
+    let injected = false;
+    timing.onWait = () => { if (!injected) { injected = true; port.emit([99]); } };
+    await connection.exchange(configRequest(3, 15));
+    assert.deepEqual(timing.waits, [1.75, 2]);
+    assert.equal(timing.writes[1] - timing.writes[0], 4);
+    assert.equal(connection._buffer.length, 0);
+  } finally { await connection.close(); }
+});
+
+test("startup keeps 150 ms quarantine followed by 10 ms silence without a request", async () => {
+  const port = new FakePort(), { connection, timing } = timedConnection(port);
+  let late = false;
+  timing.onWait = () => { if (timing.time >= 160 && !late) { late = true; port.emit([255, 1, 3]); } };
+  try {
+    await connection.open();
+    assert.equal(timing.time, 170, "late startup bytes restart the final 10 ms silence");
+    assert.equal(connection._buffer.length, 0);
+    assert.equal(connection._resyncAfter, null);
+    assert.equal(port.writes.length, 0);
+  } finally { await connection.close(); }
+});
+
+test("buffered junk after a clean fast reply prevents a new target and quarantines the original reply window", async () => {
+  const port = new FakePort(), { connection, timing } = timedConnection(port);
+  try {
+    await connection.open();
+    await connection.exchange(io.fastPositionRequest(123), .05);
+    const deadline = connection._lastResponseDeadline;
+    port.emit([99]); await Promise.resolve();
+    timing.waits.length = 0;
+    let guarded = 0;
+    await assert.rejects(connection.exchange(io.fastPositionRequest(124), .05, () => guarded++),
+      error => error.recoverableResponse === true && /inter-frame.*no new request/.test(error.message));
+    assert.equal(guarded, 0); assert.equal(port.writes.length, 1);
+    assert.equal(connection._resyncAfter, deadline);
+    assert.deepEqual(timing.waits, []);
+    await connection.exchange(outputRequest("inhibit"), .1, () => guarded++);
+    assert.equal(timing.writes[1], deadline + 10);
+    assert.equal(guarded, 1);
+    assert.deepEqual(port.writes.map(tx => tx[1]), [0x7b, 6]);
+    assert.equal(connection._buffer.length, 0);
+  } finally { await connection.close(); }
+});
+
+test("fast response failures retain the original deadline and 10 ms recovery before independent inhibit", async () => {
+  for (const failure of ["function", "crc", "trailing"]) {
+    const port = new FakePort((tx, owner) => {
+      if (owner.writes.length === 1) {
+        if (failure === "function") owner.emit(ack(configRequest(2, 7)));
+        else {
+          const response = ack(tx);
+          if (failure === "crc") response[7] ^= 1;
+          owner.emit(failure === "trailing" ? [...response, 99] : response);
+        }
+      } else owner.emit(ack(tx));
+    });
+    const { connection, timing } = timedConnection(port);
+    try {
+      await connection.open();
+      await assert.rejects(connection.exchange(io.fastPositionRequest(123), .05), /function|CRC|trailing/);
+      const deadline = connection._lastResponseDeadline;
+      assert.equal(port.writes.length, 1, "an uncertain write is never repeated");
+      let late = false;
+      timing.onWait = () => { if (timing.time >= deadline && !late) { late = true; port.emit([77, 88]); } };
+      await connection.exchange(outputRequest("inhibit"));
+      assert.equal(timing.writes[1], deadline + 10);
+      assert.deepEqual(port.writes.map(tx => tx[1]), [0x7b, 6]);
+      assert.equal(connection._buffer.length, 0);
+    } finally { await connection.close(); }
+  }
+});
+
+test("Stop cancels a contiguous fast write and a write waiting for ordinary quiet", async () => {
+  for (const transition of ["fast", "ordinary"]) {
+    const port = new FakePort(), { connection, timing } = timedConnection(port);
+    try {
+      await connection.open(); await connection.exchange(io.fastPositionRequest(123));
+      let stopped = transition === "fast", guarded = 0;
+      timing.onWait = () => { stopped = true; };
+      await assert.rejects(connection.exchange(transition === "fast" ? io.fastPositionRequest(124) : configRequest(2, 7), .1, () => {
+        guarded++; if (stopped) throw new TransportError("Operation cancelled by Stop.");
+      }), /cancelled/);
+      assert.equal(guarded, 1); assert.equal(port.writes.length, 1);
+      timing.onWait = null;
+      await connection.exchange(outputRequest("inhibit"));
+      assert.deepEqual(port.writes.map(tx => tx[1]), [0x7b, 6]);
+    } finally { await connection.close(); }
+  }
+});
+
 test("construction is inert, open preserves the default serial profile, close releases locks", async () => {
   const port = new FakePort(), connection = new WebSerialConnection(port);
   assert.equal(port.opens.length, 0);

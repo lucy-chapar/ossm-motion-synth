@@ -112,3 +112,19 @@ test("a Position patch names its motion source instead of the bypassed carrier r
   assert.equal(ui.node("motion-readout").textContent,
     "Requested travel ≈ 56.0 mm · Position patch controls motion");
 });
+
+test("measured command cadence is distinct from motion frequency and unavailable telemetry stays unknown", async () => {
+  const sample = state({hardware: {baud:115200, command_reply_rate_hz:176.73},
+    signal: {planned_rate_hz:.78, requested_span_normalized:.496}});
+  const ui = await display(sample);
+  assert.equal(ui.node('serial-baud').textContent,'115200');
+  assert.equal(ui.node('command-rate').textContent,'177/s');
+  assert.equal(ui.node('command-rate-label').textContent,'Command updates');
+  assert.match(ui.node('motion-readout').textContent,/Planned rate 0.78 Hz/);
+  sample.running = false; await ui.refresh();
+  assert.equal(ui.node('command-rate-label').textContent,'Last command updates');
+  sample.hardware.command_reply_rate_hz = null; sample.hardware.baud = null;
+  await ui.refresh();
+  assert.equal(ui.node('command-rate').textContent,'—');
+  assert.equal(ui.node('serial-baud').textContent,'—');
+});
