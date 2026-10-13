@@ -24,4 +24,4 @@ ossm-motion-synth = "virtual_synth.server:main"
 include = ["virtual_synth*"]
 
 [tool.setuptools.package-data]
-virtual_synth = ["static/*.html", "static/*.css", "static/*.js"]
+virtual_synth = ["static/*.html", "static/*.css", "static/*.js", "static/*.wasm", "static/*.txt"]
