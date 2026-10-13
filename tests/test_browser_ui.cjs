@@ -128,3 +128,50 @@ test("measured command cadence is distinct from motion frequency and unavailable
   assert.equal(ui.node('command-rate').textContent,'—');
   assert.equal(ui.node('serial-baud').textContent,'—');
 });
+
+function verifiedStoppedState() {
+  const sample = state({hardware:{stop_confirmed:true, output_enabled:false,
+    pending_raw:0, pwm_raw:0, alarm:0, owned:false, running:false}});
+  Object.assign(sample,{running:false, armed:false, stopping:false, unconfirmed_stop:false});
+  return sample;
+}
+
+test("verified Stop remains Confirmed after a latched following fault while motion stays locked", async () => {
+  const sample = verifiedStoppedState();
+  sample.fault = "RS485: Tracking error exceeded the motion budget for three fresh samples";
+  sample.hardware.fault = "TransportError: Tracking error exceeded the motion budget for three fresh samples";
+  const ui = await display(sample);
+  assert.equal(ui.node("stop-confirmed").textContent,"Confirmed");
+  assert.equal(ui.node("stop-confirmed").classes.has("unconfirmed"),false);
+  assert.equal(ui.node("fault-notice").hidden,false);
+  assert.match(ui.node("fault-text").textContent,/Tracking error/);
+  assert.equal(ui.node("run-button").disabled,true);
+  assert.equal(ui.node("home-button").disabled,true);
+});
+
+test("Stop display accepts the transport's two-count pending tolerance but rejects contradictory or unknown evidence", async () => {
+  const sample = verifiedStoppedState(), ui = await display(sample);
+  for (const pending of [-2,-1,0,1,2]) {
+    sample.hardware.pending_raw = pending; await ui.refresh();
+    assert.equal(ui.node("stop-confirmed").textContent,"Confirmed",`stationary pending ${pending}`);
+  }
+  for (const pending of [-3,3,.5,"0",null,undefined,NaN,Infinity]) {
+    sample.hardware.pending_raw = pending; await ui.refresh();
+    assert.equal(ui.node("stop-confirmed").textContent,"Unconfirmed",`invalid pending ${String(pending)}`);
+  }
+  sample.hardware.pending_raw = 0;
+  const contradictions = [
+    [sample.hardware,"stop_confirmed",false], [sample.hardware,"stop_confirmed",undefined],
+    [sample.hardware,"output_enabled",true], [sample.hardware,"output_enabled",null],
+    [sample.hardware,"pwm_raw",1], [sample.hardware,"alarm",1], [sample.hardware,"alarm",null],
+    [sample.hardware,"owned",true], [sample.hardware,"running",true],
+    [sample,"running",true], [sample,"unconfirmed_stop",true], [sample,"stopping",true],
+  ];
+  for (const [object,key,value] of contradictions) {
+    const original = object[key]; object[key] = value; await ui.refresh();
+    assert.equal(ui.node("stop-confirmed").textContent,"Unconfirmed",`${key}=${String(value)}`);
+    assert.equal(ui.node("stop-confirmed").classes.has("unconfirmed"),true);
+    object[key] = original;
+  }
+  await ui.refresh(); assert.equal(ui.node("stop-confirmed").textContent,"Confirmed");
+});

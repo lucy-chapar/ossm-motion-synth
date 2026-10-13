@@ -337,11 +337,14 @@
     $("command-rate-label").textContent = state.running ? "Command updates" : "Last command updates";
     $("command-rate").textContent = Number.isFinite(hardware.command_reply_rate_hz) && hardware.command_reply_rate_hz > 0
       ? `${hardware.command_reply_rate_hz.toFixed(0)}/s` : "—";
+    // A latched motion fault remains visible independently of electrical stop
+    // proof. The transport flag includes fresh speed/encoder settling checks.
     const confirmed = hardware.stop_confirmed === true
       && hardware.output_enabled === false
-      && hardware.pending_raw === 0 && hardware.pwm_raw === 0
+      && Number.isInteger(hardware.pending_raw) && Math.abs(hardware.pending_raw) <= 2
+      && hardware.pwm_raw === 0 && hardware.alarm === 0
       && hardware.owned === false && hardware.running === false
-      && !hardware.fault && !state.fault && !state.running && !state.unconfirmed_stop;
+      && !state.running && !state.unconfirmed_stop && !state.stopping;
     $("stop-confirmed").textContent = confirmed ? "Confirmed" : "Unconfirmed";
     $("stop-confirmed").classList.toggle("unconfirmed", !confirmed);
     $("hardware-boundary").textContent = state.allow_motion ? "Ready for hardware: Connect → Home → Play. Connect only reads status; Home moves the motor." : "Launch ./synth --allow-motion for hardware Home and Run. Connecting here reads status only.";

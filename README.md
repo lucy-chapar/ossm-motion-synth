@@ -140,7 +140,7 @@ against the Python engine for the shared preview behavior. All browser assets,
 including the prebuilt local Ruckig WASM core, are bundled and run without a CDN.
 Normal use and export need no frontend build. The pinned source, portable build
 recipe and numerical checks are documented in [vendor/ruckig](vendor/ruckig/README.md).
-The current revision passes 290 browser tests and 132 Python tests, including 13 core checks;
+The current revision passes 292 browser tests and 132 Python tests, including 13 core checks;
 these software checks do not establish physical smoothness or firmware parity.
 
 The optional Python bridge binds to loopback and accepts only same-origin

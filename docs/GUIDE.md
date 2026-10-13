@@ -461,7 +461,7 @@ accepted as smooth, and its browser Home/Play/Stop passed. The current guarded
 Stop. Those runs used production browser modules through an exclusive Node
 serial harness. The final Chrome Home → Play → Stop check also passed,
 displaying 80–85 command updates/s for the saw and confirmed Stop afterward.
-The current revision passes 290 browser tests and 132 Python tests. Other loads and
+The current revision passes 292 browser tests and 132 Python tests. Other loads and
 stock-firmware parity remain unverified. See the
 [current serial audit](SERIAL_THROUGHPUT_AUDIT.md),
 [earlier planner results](MOTION_PLANNER_AUDIT.md) and
