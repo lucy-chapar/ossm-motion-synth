@@ -1,0 +1,110 @@
+{
+  "name": "Ruckig Community",
+  "version": "0.15.3",
+  "repository": "https://github.com/pantor/ruckig",
+  "tag": "v0.15.3",
+  "commit": "37b6e7a4c60f5befd2506741d5f7d0ae7eefb3db",
+  "source_archive": "https://github.com/pantor/ruckig/archive/37b6e7a4c60f5befd2506741d5f7d0ae7eefb3db.tar.gz",
+  "license": "MIT",
+  "cloud_client": false,
+  "upstream_files": {
+    "upstream/LICENSE": "f0880ac5e5026c92e12c9e2859a7b338c593aaca1a435f29498bd96cbb64d7d3",
+    "upstream/include/ruckig/block.hpp": "be36a9854fa0830c283df3aaef5f80c38f59ca29270981a1e1cc8b3c81a40d48",
+    "upstream/include/ruckig/brake.hpp": "f4d30e1f19b239564e9f1d54eb5de7e6b761c797f42a49cbccb43677d0e89b59",
+    "upstream/include/ruckig/calculator.hpp": "24fb044a409dfbed598a4b83a315ed6ce339efc184694bccac27ef2ae3bd9036",
+    "upstream/include/ruckig/calculator_cloud.hpp": "a5a48e945f92956f7cf181bfc3dde66ae5e19149b4cc64b655e0a5a15b646069",
+    "upstream/include/ruckig/calculator_target.hpp": "35b49c0e0dc606646f419e285c6633171df394851dc95c6b4bb99e9f7009aa74",
+    "upstream/include/ruckig/error.hpp": "0c0d0d3b3c29df72207d0358934f604bf4a3b39125fc69bf3c7d00be9e34c071",
+    "upstream/include/ruckig/input_parameter.hpp": "37a4dc34e2093e775e3fd5ae6c34971661fd852ed165ee9e7ddc3dcb0b1cc96d",
+    "upstream/include/ruckig/output_parameter.hpp": "5eaa0374b25e917b9578be8e2d1821f200aba4fec418430f08edab4bf52e2f81",
+    "upstream/include/ruckig/position.hpp": "7d6d15007bd3e38a84c4390087ea0c928d4801c22ff1afbf095b0afa3d8588cf",
+    "upstream/include/ruckig/profile.hpp": "1b7441140a33c8b301fea051e04d559f0b7441c06dd65c77af0626f74ccda571",
+    "upstream/include/ruckig/result.hpp": "67d24ce70ec7b17568099759eae1591fa9983ba9f453bd172de375223eb477bc",
+    "upstream/include/ruckig/roots.hpp": "7fea5fa50b14a2dca3e7814f55c1c561b38812ef48f7900595739e666f2578aa",
+    "upstream/include/ruckig/ruckig.hpp": "ea063b1939b20773037a985b88f4891cec637511404eb469f488633d7597dee6",
+    "upstream/include/ruckig/trajectory.hpp": "a9ad8b37c041645d943b8fad1f1b0cba4db9789735375472f575acd4602760dd",
+    "upstream/include/ruckig/utils.hpp": "f17266d17a0dc7f725402a9732c763af8fe84d32d53f7e8d748eff79f3cddee9",
+    "upstream/include/ruckig/velocity.hpp": "3bd62b430b304b5a140346b03bdf097024411287cd0cb27db53bd0e35e0e7dff",
+    "upstream/src/ruckig/brake.cpp": "7868192cf3b83a57a57f49e553319c8fdc8e64bebbaf6fc54a486450dbd8090a",
+    "upstream/src/ruckig/position_first_step1.cpp": "db27cc0fa9c1b61932e47f65049e8366e8eb7b015955141ae41952934085fad6",
+    "upstream/src/ruckig/position_first_step2.cpp": "4d810791dc0b48735f1e78db2059615d1eded944112b456bf322b0a718eed7d8",
+    "upstream/src/ruckig/position_second_step1.cpp": "d03a1ef6edb2932ea61352a40a56e59879940002db410fce38d8dbd1dd774c8b",
+    "upstream/src/ruckig/position_second_step2.cpp": "fccf0f7f56069cdfea8309be626c29c7dcc36380e267e5d1f11c5f2e20b0c40e",
+    "upstream/src/ruckig/position_third_step1.cpp": "48b2589c77257e34e724c7f86f42ce2ac9d8e8119c581078abf6c905a712828f",
+    "upstream/src/ruckig/position_third_step2.cpp": "84e560a3a2621e293f55de5c6b8cb6f3b7dba88905345145aca9567ad4a81790",
+    "upstream/src/ruckig/velocity_second_step1.cpp": "00f27088b1172244660b4091d751bac6ef9593bfed7b7b75e06bf3b667b9762d",
+    "upstream/src/ruckig/velocity_second_step2.cpp": "fcae4250f109c85b2161322ac2b83e164638a7064c241a534c10847868edd0bf",
+    "upstream/src/ruckig/velocity_third_step1.cpp": "053de9e6eb5662c069ab1dc88fadef6f42f72fa28be375a1fa9c78c6f77c7b85",
+    "upstream/src/ruckig/velocity_third_step2.cpp": "fac6aac5bbc55ca6ab5eff3409cad47a7a33ff7eb40af9eb52b4b6be3bab8b14"
+  },
+  "bindings_sha256": "82496b4701c91593258b5be8ccbefcd2243d90489f272045f4195e59d5062a89",
+  "toolchain": {
+    "name": "WASI SDK",
+    "version": "34",
+    "archive": "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-34/wasi-sdk-34.0-arm64-macos.tar.gz",
+    "sha256": "9c59398106b417f8f14913380fdf0097a8cc0ff4af9eb3ce0065a859e88d49e9",
+    "wasi_libc_commit": "2e6fb9d8ee0cdf9e431fbcabe8af3115de000a13",
+    "llvm_commit": "895aa2c896ada719451be2e3673c83da8ddf1141"
+  },
+  "build": {
+    "compiler": "clang version 23.1.0-wasi-sdk (https://github.com/llvm/llvm-project 895aa2c896ada719451be2e3673c83da8ddf1141)",
+    "flags": [
+      "--target=wasm32-wasip1",
+      "-mexec-model=reactor",
+      "-std=c++17",
+      "-O3",
+      "-fno-exceptions",
+      "-fno-rtti",
+      "-ffunction-sections",
+      "-fdata-sections",
+      "-Ivendor/ruckig/upstream/include"
+    ],
+    "link_flags": [
+      "-Wl,--gc-sections",
+      "-Wl,--strip-all",
+      "-Wl,-z,stack-size=262144",
+      "-Wl,--initial-memory=524288",
+      "-Wl,--max-memory=16777216"
+    ],
+    "exports": [
+      "ruckig_create_planner",
+      "ruckig_destroy_planner",
+      "ruckig_create_plan",
+      "ruckig_destroy_plan",
+      "ruckig_copy_plan",
+      "ruckig_calculate",
+      "ruckig_plan_metadata",
+      "ruckig_sample",
+      "ruckig_reset",
+      "ruckig_update",
+      "ruckig_state"
+    ]
+  },
+  "artifact": {
+    "path": "virtual_synth/static/ruckig-core.wasm",
+    "bytes": 170258,
+    "sha256": "6473afda9e511aa18b90a7dced3772423764e88260c4a4d3acb847cc9661d0c3"
+  },
+  "runtime_licenses": {
+    "LLVM libc++ / compiler runtime": {
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/895aa2c896ada719451be2e3673c83da8ddf1141/libcxx/LICENSE.TXT",
+      "sha256": "539dd7aed86e8a4f12cbdd0e6c50c189c7d74847e4fecc64ce2c6ee3a01da38b"
+    },
+    "WASI libc overview": {
+      "url": "https://raw.githubusercontent.com/WebAssembly/wasi-libc/2e6fb9d8ee0cdf9e431fbcabe8af3115de000a13/LICENSE",
+      "sha256": "2711a8b5a5cdfef0e639f96c1aca12ae23d7d64a02d0507f1bdf14d2b27bbc3a"
+    },
+    "WASI libc MIT option": {
+      "url": "https://raw.githubusercontent.com/WebAssembly/wasi-libc/2e6fb9d8ee0cdf9e431fbcabe8af3115de000a13/LICENSE-MIT",
+      "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+    },
+    "musl libc": {
+      "url": "https://raw.githubusercontent.com/WebAssembly/wasi-libc/2e6fb9d8ee0cdf9e431fbcabe8af3115de000a13/libc-top-half/musl/COPYRIGHT",
+      "sha256": "b870108ec5e7790e9f9919064f1b9421d62d5f9b0e6c230c6adf7ea2da62e97b"
+    },
+    "cloudlibc": {
+      "url": "https://raw.githubusercontent.com/WebAssembly/wasi-libc/2e6fb9d8ee0cdf9e431fbcabe8af3115de000a13/libc-bottom-half/cloudlibc/LICENSE",
+      "sha256": "c8b789cf5a746611e6300a0cc7750dbf92b61912a709d04e639245f7290656d0"
+    }
+  }
+}

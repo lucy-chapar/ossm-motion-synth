@@ -1,10 +1,16 @@
-# Browser motion smoothing — 2026-10-02
+# Browser motion smoothing — historical trials and October 13 continuation
 
-The later [motion planner audit](MOTION_PLANNER_AUDIT.md) supersedes the ramped
-and bypass-streaming defaults described in the historical trials below. The
-local browser now uses a 20000 RPM/s servo ramp with the 6000 mm/s² host budget;
-the watched comparison is recorded in that audit. These entries retain the
-actual earlier attempts and their validation limits.
+The current **local, not deployed** browser hardware planner is described in the
+[October 13 motion planner audit](MOTION_PLANNER_AUDIT.md). It supersedes the
+position-only tracker and earlier ramped/bypass trials below. The current
+physical acceptance is recorded in the audit. Historical user acceptance applies only
+to its recorded pattern, load and earlier implementation.
+
+## October 2–3 changes and results (historical)
+
+These entries retain the actual earlier attempts and their validation limits,
+including the lack of jerk limiting at that time. Historical benchmark values
+are not expected to reproduce unchanged after the October 13 planner replacement.
 
 Local development against `0ad919ebf362c7a617ffeb46c92cbaffa42aa5dd`.
 This revision is local and has not been deployed. Connected tests are recorded
@@ -192,3 +198,35 @@ smooth visible movement for this slow pattern; faster patterns, a live browser
 event loop, and 115200 operation remain unverified. No baud commissioning
 sequence was transmitted. Browser source was unchanged for this test, so the
 206-test pass above is retained rather than rerun.
+
+
+## October 13 continuation
+
+The old tracker retained ordinary velocity but could chatter in acceleration or
+invoke a rest-point fallback near a still-rising sine turn. This was reproduced
+in host commands; native velocity reset at every FC7b target remains undocumented.
+The current hardware planner carries PVA through future-state captures and
+compatible intermediate points, using local Ruckig trajectories with finite
+velocity, acceleration and jerk. Finite triangle, square and saw legs end with
+zero velocity and acceleration at their actual reversals. Sine turns retain
+nonzero acceleration. Intermediate USB samples preserve their moving PVA state.
+
+The existing 1080 mm/s / 6000 mm/s² host limits, 20000 RPM/s servo ramp and
+19200-baud comparison are retained. Host jerk is 100000 mm/s³, and references
+reserve 95% of V/A/J for capture. The fixed-sine rate cap now includes jerk demand
+`J = (2πf)³A`; triangle, square and saw use finite legs. The core loads a bundled
+WASM asset before allowing motion, then computes synchronously offline. Full
+source/build/license details are in [vendor/ruckig](../vendor/ruckig/README.md).
+
+A recovered guard reply or uncertain target acknowledgment during a running
+pattern now inhibits output and requires fresh stationary recapture. It never
+replays a missed target or resumes across an unaccounted moving interval.
+
+267/267 browser checks passed, including 13 core checks. Independent comparison
+of 500 native C++/WASM trajectories agreed within 1.31e-13, and the binary rebuilt
+to its pinned SHA-256. These are software checks, not physical acceptance.
+USB timing, the approximately 20 Hz stream at 19200 baud, drive response and
+modulated finite-path fidelity remain practical limits. The watched 1.5 Hz / 70%
+sine was accepted as smooth with useful speed, and browser Home/Play/Stop passed;
+see the current audit for the measured trials. General smoothness and
+stock-firmware parity remain unverified.

@@ -691,6 +691,7 @@
   resizeScope();
   async function initialize() {
     try {
+      if (browserRuntime?.ready) await browserRuntime.ready;
       const session = await api("/api/session");
       if (typeof session.token !== "string" || !session.token) throw new Error("The local app did not provide a session token.");
       token = session.token;

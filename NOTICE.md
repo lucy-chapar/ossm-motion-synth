@@ -24,5 +24,16 @@ the Apache-2.0 firmware linked by
 No Rust source from that project or its GPL-3.0 successor is bundled here.
 
 [pySerial](https://github.com/pyserial/pyserial) retains its own license.
-Dependencies, firmware binaries, vendor documents, private recordings,
+
+The local WebAssembly motion core bundles unmodified calculation source from
+[Ruckig Community 0.15.3](https://github.com/pantor/ruckig/tree/37b6e7a4c60f5befd2506741d5f7d0ae7eefb3db),
+MIT licensed, copyright 2021 Lars Berscheid. The source, license, binding, exact
+build recipe and hashes are retained in `vendor/ruckig/`. The compiled core also
+contains WASI libc/libc++ runtime portions with their upstream licenses.
+See `ruckig-LICENSE.txt` in the exported browser app, or
+`virtual_synth/static/ruckig-LICENSE.txt` in the source checkout, for the full
+Ruckig and runtime license notices. The core runs locally without the Ruckig
+cloud client. Our integration files retain MPL-2.0 licensing.
+
+Firmware binaries, vendor documents, private recordings,
 Wi-Fi configuration and credentials are not included in this repository.

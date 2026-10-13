@@ -18,7 +18,8 @@ function setup({ supported = true, factory, storage } = {}) {
 function fakeMotor({ stopConfirmed = true } = {}) {
   const hw = { connected: false, mode: 1, output_enabled: false, pending_raw: 0, pwm_raw: 0,
     owned: false, running: false, armed: false, homing: false, homed: false, fault: null,
-    position_normalized: 0.5, max_velocity_raw_s: 73728, max_acceleration_raw_s2: 147456, stop_confirmed: true, raw_bounds: [-9830, 9830] };
+    position_normalized: 0.5, max_velocity_raw_s: 73728, max_acceleration_raw_s2: 147456,
+    max_jerk_raw_s3: 81920000, stop_confirmed: true, raw_bounds: [-9830, 9830] };
   const calls = [];
   return { calls, hw, status: () => ({ ...hw }),
     async connect() { calls.push("connect"); hw.connected = true; return this.status(); },
@@ -44,7 +45,7 @@ test("production browser factory retains the full host budget with the faster se
       const profile = new MotorTransport(selectedPort, options).status();
       configured = profile;
       Object.assign(motor.hw, {max_velocity_raw_s: profile.max_velocity_raw_s,
-        max_acceleration_raw_s2: profile.max_acceleration_raw_s2});
+        max_acceleration_raw_s2: profile.max_acceleration_raw_s2, max_jerk_raw_s3: profile.max_jerk_raw_s3});
       return motor;
     }
   }};
@@ -56,6 +57,7 @@ test("production browser factory retains the full host budget with the faster se
     assert.equal(configured.motion_profile, "servo_ramped");
     assert.equal(configured.max_acceleration_raw_s2 / 819.2, 6000);
     assert.equal(configured.max_velocity_raw_s / 819.2, 1080);
+    assert.equal(configured.max_jerk_raw_s3 / 819.2, 100000);
     await action("configure", {params: {rate_hz: 1.5, stroke: .7}});
     await action("play"); now += .1; await runtime.tick();
     assert.equal(runtime.state().signal.rate_limited, false, "ordinary fast sine fits the production budget");
@@ -314,12 +316,32 @@ test("USB disconnect releases old transport and reconnect never starts motion", 
  assert.equal(env.runtime.state().armed,false);assert.equal(env.runtime.state().running,false);
  await env.runtime.close();
 });
-test("reply recovery pauses time instead of faulting or generating catch-up targets", async () => {
+test("uncertain target recovery stops rather than freezing a moving trajectory or replaying points", async () => {
  const motor=fakeMotor();motor.hw.homed=true;const env=setup({factory:()=>motor});
  await env.connect();await env.action('arm');await env.action('run');
  const command=motor.command.bind(motor);motor.command=async target=>{const result=await command(target);env.advance(.35);motor.hw.communication_recoveries=1;return {...result,communication_recoveries:1};};
  env.advance(.1);await env.runtime.tick();env.advance(.02);await env.runtime.tick();
- assert.equal(env.runtime.state().fault,null);assert.equal(env.runtime.state().running,true);await env.runtime.close();
+ assert.match(env.runtime.state().fault,/Serial recovery interrupted the continuous trajectory/);
+ assert.equal(env.runtime.state().running,false);assert.equal(env.runtime.state().hardware.stop_confirmed,true);
+ assert.equal(motor.calls.filter(c=>Array.isArray(c)&&c[0]==='command').length,1);
+ await env.runtime.close();
+});
+
+test("guard recovery stops before generating a stale target even within the motion deadline", async () => {
+ const motor=fakeMotor();motor.hw.homed=true;const env=setup({factory:()=>motor});let generated=0;
+ motor.command=async resolve=>{env.advance(.01);motor.hw.communication_recoveries=1;resolve();generated++;return motor.status();};
+ await env.connect();await env.action('play');env.advance(.05);await env.runtime.tick();
+ assert.equal(generated,0);assert.equal(env.runtime.state().running,false);
+ assert.match(env.runtime.state().fault,/Serial recovery interrupted the continuous trajectory/);
+ assert.equal(env.runtime.state().hardware.stop_confirmed,true);await env.runtime.close();
+});
+
+test("hardware arming refuses a missing or invalid physical jerk limit", async () => {
+ for(const limit of [undefined,0,-1,NaN,Infinity]) {
+  const motor=fakeMotor();motor.hw.homed=true;motor.hw.max_jerk_raw_s3=limit;const env=setup({factory:()=>motor});
+  await env.connect();await assert.rejects(env.action('play'),/motion limits are unavailable/);
+  assert.equal(env.runtime.state().running,false);assert.ok(!motor.calls.includes('start'));await env.runtime.close();
+ }
 });
 
 test("hardware targets are sampled after guard latency and paced from cycle deadlines", async () => {

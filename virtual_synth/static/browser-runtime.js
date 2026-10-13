@@ -26,6 +26,7 @@
       allowMotion: true, fastPositions: true, motionProfile: "servo_ramped", baudRate: "auto",
     }));
     const engine = new engineAPI.Engine();
+    const motionReady = () => Boolean(engineAPI.motionReady?.());
     const ports = new Map();
     const storage = options.storage === undefined ? globalThis.localStorage : options.storage;
     const adapterKey = "motion-synth.adapter";
@@ -65,7 +66,7 @@
       const hw = transport?.status() || {};
       let bounds = null;
       try { spanOf(hw); bounds = hw.raw_bounds; } catch (_) { /* Not measured yet. */ }
-      return { simulated: false, hardware_enabled: supported, active: Boolean(hw.homing), valid: Boolean(hw.homed),
+      return { simulated: false, hardware_enabled: supported && motionReady(), active: Boolean(hw.homing), valid: Boolean(hw.homed),
         phase: hw.home_phase || "disconnected", progress: hw.home_progress || 0, direction: hw.home_direction || "normal",
         position_raw: hw.position_raw ?? null, current_raw: hw.current_raw ?? null, origin_raw: hw.home_origin_raw ?? null,
         fault: hw.fault || null, measured_endpoints_raw: hw.measured_endpoints_raw || null,
@@ -74,7 +75,7 @@
     };
     function state() {
       return copy({ mode, armed, running, paused, gate, fault, params: engine.params, signal, history,
-        connection_notice: connectionNotice, hardware: hardware(), allow_motion: supported, run_remaining_s: null,
+        connection_notice: connectionNotice, hardware: hardware(), allow_motion: supported && motionReady(), run_remaining_s: null,
         unconfirmed_stop: unconfirmedStop, stopping: stoppingCount > 0, control_revision: revision, homing: homing(), web_serial_supported: supported });
     }
     function fence() {
@@ -140,8 +141,7 @@
                 throw new Error("Motion scheduling deadline missed. No catch-up targets were sent.");
               }
               if ((transport.status().communication_recoveries || 0) > recoveriesBefore) {
-                lastTick = sampledAt;
-                return signal.command;
+                throw new Error("Serial recovery interrupted the continuous trajectory. Stop and Play to recapture from stationary feedback.");
               }
               signal = engine.step(elapsed, { gate, running: true, tracking: true });
               lastTick = sampledAt;
@@ -152,9 +152,11 @@
             nextTargetCycle = Math.max(nextTargetCycle + hardwarePeriod(), clock());
           }
           else if (transport.status().connected && !fault) lastHardware = await transport.snapshot();
-          // A bounded recovery pauses the planner. Do not advance through the
-          // missed interval or send catch-up targets afterward.
+          // An uncertain write cannot freeze a position reference while its
+          // velocity and acceleration remain active. Inhibit and require a
+          // new stationary capture; never replay or queue the missed target.
           if ((lastHardware?.communication_recoveries || 0) > recoveriesBefore) {
+            if (running) throw new Error("Serial recovery interrupted the continuous trajectory. Stop and Play to recapture from stationary feedback.");
             lastTick = lastIO = clock();
             nextTargetCycle = lastTick + hardwarePeriod();
           }
@@ -212,6 +214,7 @@
         if (armed && (proposed.lower !== engine.params.lower || proposed.upper !== engine.params.upper)) throw new Error("Stop output before changing maximum travel limits.");
         engine.configure(proposed);
       } else if (name === "home_start") {
+        if (!motionReady()) throw new Error("The local continuous-motion planner is not ready. Reload after its assets have loaded.");
         if (!Number.isInteger(payload.control_revision) || payload.control_revision !== revision) throw new Error("Controls changed since this Home request. Refresh status and start again.");
         if (paused || armed || running || fault || unconfirmedStop) throw new Error("Stop output and clear the fault before homing.");
         if (!transport?.status().connected) throw new Error("Connect a motor before homing.");
@@ -225,6 +228,7 @@
         await assertCurrent();
         return act({ action: "run" }, requestedEpoch);
       } else if (name === "arm") {
+        if (transport && !motionReady()) throw new Error("The local continuous-motion planner is not ready. Reload after its assets have loaded.");
         if (fault || unconfirmedStop) throw new Error("Resolve and reset the fault before arming.");
         if (paused) throw new Error("Resume or Stop the paused session before arming.");
         if (armed) throw new Error("Already armed.");
@@ -233,8 +237,8 @@
           try {
             const hw = await transport.arm(); await assertCurrent();
             const span = spanOf(hw);
-            if (![hw.max_velocity_raw_s, hw.max_acceleration_raw_s2].every(v => Number.isFinite(v) && v > 0)) throw new Error("Motor motion limits are unavailable.");
-            engine.reset({ position: hw.position_normalized, vmax: hw.max_velocity_raw_s / span, amax: hw.max_acceleration_raw_s2 / span });
+            if (![hw.max_velocity_raw_s, hw.max_acceleration_raw_s2, hw.max_jerk_raw_s3].every(v => Number.isFinite(v) && v > 0)) throw new Error("Motor motion limits are unavailable.");
+            engine.reset({ position: hw.position_normalized, vmax: hw.max_velocity_raw_s / span, amax: hw.max_acceleration_raw_s2 / span, jmax: hw.max_jerk_raw_s3 / span });
             signal = engine.step(0, { running: false, tracking: true });
           } catch (error) { await motionError("Cannot arm", error); }
         }
@@ -376,7 +380,7 @@
       }
     }
     if (options.autoStart !== false) timer = setTimeout(automaticTick, 10);
-    return { request, choosePort, autoConnect, tick, state, stop, supported,
+    return { request, choosePort, autoConnect, tick, state, stop, supported, ready: engineAPI.ready,
       async close() { closed = true; clearTimeout(timer); await stop(); if (transport) await transport.close(); serial?.removeEventListener?.("disconnect", onDisconnect); serial?.removeEventListener?.("connect", onConnect); } };
   }
   return { createRuntime };

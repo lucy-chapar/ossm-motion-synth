@@ -39,6 +39,7 @@
   });
   const RUN_SPEED_RPM = 1800;
   const RUN_MAX_VELOCITY = 32768 * RUN_SPEED_RPM / 60 * .9;
+  const RUN_MAX_JERK = COUNTS_PER_MM * 100000;
   const HOME_SPEED_RPM = 70, HOME_ACCEL_RPM_S = 150;
   const HOME_RECHECK_SPEED_RPM = 35, HOME_RECHECK_ACCEL_RPM_S = 75;
   const HOME_COUNTS_PER_SECOND = 32768 * HOME_SPEED_RPM / 60;
@@ -105,6 +106,7 @@
         home_origin_raw: this._home_origin, measured_endpoints_raw: this._measured_endpoints?.slice() ?? null,
         measured_travel_raw: this._measured_travel, nominal_counts_per_mm: COUNTS_PER_MM,
         max_velocity_raw_s: RUN_MAX_VELOCITY, max_acceleration_raw_s2: this._run_max_acceleration,
+        max_jerk_raw_s3: RUN_MAX_JERK,
         position_raw: position, pending_raw: v ? io.pending(v) : null, output_raw: output,
         output_enabled: v && ((v[0] === 1 && [0, 1].includes(output)) || (v[0] === 0 && [0, 2, 3, 6, 7, 10, 11, 14, 15].includes(output))) ? Boolean(output & 1) : null,
         alarm: v?.[14] ?? null, mode: v?.[0] ?? null, speed_rpm: v?.[2] ?? null,

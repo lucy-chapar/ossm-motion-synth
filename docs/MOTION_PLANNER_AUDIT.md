@@ -1,13 +1,143 @@
-# Motion planner audit — 2026-10-03
+# Motion planner audit — October 3 and 13, 2026
+
+The October 13 continuation describes the current **local browser hardware
+planner**. It supersedes the October 3 trajectory implementation below. The new
+revision has not been deployed. Its watched 1.5 Hz sine and browser-control
+checks are recorded below.
+Historical acceptance applies only to the particular earlier version and run.
+Neither offline results nor those trials establish general smoothness or parity
+with stock firmware.
+
+## October 13 continuation: continuous commanded state
+
+The prior browser tracker already retained velocity between ordinary samples.
+The reproduced defect was acceleration chatter on a still-rising, feasible
+1.5 Hz / 70% sine: near the upper turn, commanded velocity changed from
++3.988 to -8.012 to 0 mm/s across 2 ms steps, with acceleration switching from
+-6000 to +4005.75 mm/s². Its position-only boundary fallback could invoke a
+rest-point planner too early. This proves a host-planner discontinuity; neither
+FC7b nor the vendor manual establishes that the motor resets velocity for every
+replacement target. The two issues must not be conflated.
+
+The replacement retains commanded **position, velocity and acceleration (PVA)**
+in C2 trajectories: all three state values are continuous.
+Capture and parameter transitions target a future moving PVA state, including
+its nonzero velocity and acceleration, through the local Ruckig core. Compatible
+intermediate points do not acquire a zero terminal velocity merely because a
+USB command is sent. For a fixed waveform, capture joins the continuous
+reference; modulation uses retained finite trajectories and a fixed replanning
+grid. A necessary bounded braking transition may precede capture when a new
+reference cannot be reached safely.
+
+Triangle, square and saw references use finite jerk-limited Ruckig legs. Actual
+end reversals have zero velocity and acceleration; square can dwell and saw has
+an explicit finite return leg. These replace impossible sharp ideal corners.
+The fixed sine retains its analytic PVA reference. Full trajectory extrema and
+jerk-aware stopping paths must fit the permitted rail corridor before admitting
+an output state; checking just the next point or `v²/(2a)` is insufficient.
+Commanded PVA remains a model, separate from measured encoder motion.
+
+| Budget or setting | Current local value |
+| --- | ---: |
+| Host velocity / acceleration | 1080 mm/s / 6000 mm/s², retained |
+| Host jerk | 100000 mm/s³ |
+| Reference reserve | 95% of each host V/A/J limit |
+| Reference V / A / J | 1026 mm/s / 5700 mm/s² / 95000 mm/s³ |
+| Drive profile | `servo_ramped`, register 3 = 20000 RPM/s, retained |
+| Nominal drive acceleration | 13333 mm/s² at 40 mm/revolution |
+| Connected baud for this comparison | 19200, retained; no baud commissioning |
+
+For sine half-amplitude A and frequency f, peak demands are
+`V = 2πfA`, `a = (2πf)²A`, and **`J = (2πf)³A`**. Its planned rate is bounded by
+`min(Vref/(2πA), sqrt(aref/A)/(2π), cbrt(Jref/A)/(2π))` for A > 0.
+The 95% reserve leaves capture headroom; it does not reduce the hard output
+ceilings a second time or change the drive setting. Center still contracts the
+available stroke near an end, and requested versus planned rates remain distinct.
+
+Ruckig Community 0.15.3 is pinned and bundled as a 170258-byte local WASM module.
+Browser startup asynchronously loads that sibling asset and gates motion until
+it is ready; subsequent calculations and samples are synchronous and offline.
+There is no CDN or cloud waypoint service. The C ABI corrects upstream extrema
+metadata omissions analytically and uses Time synchronization for minimum
+trajectory durations, without modifying the planner source. Source hashes,
+MIT/runtime licenses and an exact portable WASI SDK build are documented in
+[the core README](../vendor/ruckig/README.md) and [NOTICE](../NOTICE.md).
+
+A recovered guard reply or uncertain target acknowledgment during an active
+pattern now inhibits the run. It cannot freeze a moving PVA reference and then
+resume it across an unaccounted motion interval. Fresh read-only recovery and
+Stop verification remain possible; another Play requires confirmed stationary
+capture, with fault reset if needed. Missed targets are never replayed or queued.
+
+Offline verification passed **267/267 browser checks**, including **13 core
+checks**. Independent native C++/WASM comparison covered 500 varied PVA and
+minimum-duration cases, with maximum absolute output difference 1.31e-13.
+The binary rebuilt to the identical SHA-256. A local benchmark averaged 3.92 µs
+per calculation/sample/braking pair; it measures computation only.
+
+The 19200-baud comparison still has approximately 20 target updates/s, browser
+and USB timing variability, a drive ramp and only sampled encoder feedback.
+Modulated paths remain bounded finite captures; clipping, fast parameter changes
+and infeasible desired derivatives can alter phase or stroke, require braking,
+or fail closed. A fixed-sine capacity formula does not prove modulation fidelity.
+The watched fixed-sine acceptance below applies to that pattern and load. It
+does not establish modulation fidelity or parity with motor-local firmware.
+
+## October 13 connected acceptance
+
+The user explicitly authorized hardware motion. The production JavaScript
+engine, runtime, transport and serial framing ran through an exclusive native
+serial pipe, with no higher velocity/acceleration ceiling or baud change.
+The first Home cancelled on encoder movement during control-mode preparation
+and confirmed inhibition. A fresh stationary retry succeeded, measuring
+**179.691162 nominal mm**. Five separate six-second centered runs then completed
+without motion faults; each sent 119 targets (19.833/s) and confirmed Stop.
+
+| Trial | Sent span, mm | Sampled encoder span, mm | Median gap, ms | Largest gap, ms | Stop |
+| --- | ---: | ---: | ---: | ---: | --- |
+| 0.5 Hz / 30% sine | 42.166 | 42.076 | 49.95 | 68.90 | Confirmed |
+| 1 Hz / 70% sine | 97.363 | 97.162 | 50.14 | 58.63 | Confirmed |
+| 1.5 Hz / 70% sine | 98.240 | 96.058 | 49.98 | 55.33 | Confirmed |
+| 1 Hz / 70% triangle | 98.254 | 97.454 | 49.97 | 69.38 | Confirmed |
+| 2.5 Hz / 30% sine | 41.119 | 38.751 | 49.87 | 58.99 | Confirmed |
+
+The requested and planned rates matched in all five runs. The user watched the
+**1.5 Hz / 70% sine** and reported **“Smooth with useful speed.”** This is
+physical acceptance of that tested pattern and load. The triangle and 2.5 Hz
+runs establish operation and Stop; no separate visual verdict was recorded.
+At 20 target replies/s, sampled ranges can miss extrema, particularly at 2.5 Hz.
+The encoder spans do not separate sampling loss from servo following lag.
+
+The private pipe's EOF safeguard drains two replies for 200 ms each, exceeding
+the production 300 ms closure deadline. Closing reported a cleanup timeout
+rather than asserting success. A subsequent exclusive read-only check verified
+three identical CRC-valid positions with output, speed, PWM, pending demand and
+alarm all zero, then verified port release. No production Stop or closure limit
+was relaxed to accommodate the harness.
+
+The rebuilt app was then checked in desktop Chrome at
+`http://127.0.0.1:8769/`: USB adapter connection, fresh Home (about 179.7 mm),
+Play with a 0.25 Hz / 70% sine, and Stop all succeeded through the normal UI.
+The UI returned **STOPPED**, **Homed**, and **Stop verified: Confirmed**.
+The app remains connected and stopped, set to the previously accepted
+approximately 1.5 Hz / 70% sine for the user's next Play. Browser timing was
+not captured as a native-trace benchmark. Raw debugger inspection was denied;
+normal controls provided the browser acceptance evidence.
+
+Current validation: **267 browser tests and 132 Python tests pass**. The
+standalone export includes the local WASM and notices; all 14 manifest assets
+match SHA-256. Source hashes and the native trial summary are retained in
+[the machine-readable evidence](qa/2026-10-13-continuous-motion.json).
+The stopped Chrome result is shown in [the screenshot](images/continuous-motion-2026-10-13.jpg).
+
+## October 3 audit and trials (historical)
 
 The slow-sine test established visible smoothness at 0.25 Hz / 30% stroke.
 It did not establish useful speed or smoothness under demanding curves. That
 test required only about 33.5 mm/s and 52.6 mm/s². The user's subsequent report
-of slow movement and jitter on curves is the reason for this audit.
-
-This revision is local. Its new behavior has offline verification and the
-watched 1 Hz servo-ramp acceptance recorded below. More demanding rates,
-other curves and loads, and 115200 operation still need matched physical tests.
+of slow movement and jitter on curves was the reason for the first audit.
+The implementation descriptions and measurements in the remaining October 3
+sections refer to that earlier local revision, including its lack of jerk limiting.
 
 ## Where performance was lost
 
@@ -70,7 +200,7 @@ passes motion parameters to [FastAccelStepper](https://github.com/gin66/FastAcce
 which generates pulses continuously with hardware timing. Application polling
 frequency and pulse timing are different jobs.
 
-The current browser's 1200 mm/s² ramped ceiling was only 2.4% of that configured
+The earlier browser's 1200 mm/s² ramped ceiling was only 2.4% of that configured
 stock acceleration. Rest-to-rest travel over 100 mm needs at least 0.577 s at
 1200 mm/s². Stock's 1000 mm/s and 50000 mm/s² allow a theoretical 0.120 s.
 These are configured mathematical budgets, not measurements of this machine.
@@ -92,8 +222,8 @@ named comparison, not an assumed identification.
 The first audited revision selected the existing `streaming` profile. The host
 owned velocity and acceleration shaping; register 3 was 60098 to bypass the
 drive's internal acceleration ramp with 98% position feedforward. The later
-watched retest below rejected that profile for smooth curves. The local browser
-now selects `servo_ramped`, retaining host limits of 1080 mm/s and 6000 mm/s²
+watched retest below rejected that profile for smooth curves. The October 3 local browser
+then selected `servo_ramped`, retaining host limits of 1080 mm/s and 6000 mm/s²
 with a 20000 RPM/s drive ramp. That native limit has headroom above the host
 budget and shapes motion between discrete targets. The watched centered 70%
 1 Hz sine was accepted below; broader motion remains under physical evaluation.
@@ -152,8 +282,8 @@ Position patches retain bounded tracking. Full stroke/phase fidelity claims
 apply to fixed waves. Modulated center, amplitude and rate have additional
 derivatives; the trajectory's velocity, acceleration and stopping guards still
 apply, but the fixed-wave capacity formula alone does not establish fidelity.
-This planner does not yet impose a jerk limit. Adding one requires budgeting
-its stopping distance, not applying another arbitrary smoothing filter.
+That October 3 planner did not impose a jerk limit. The October 13 continuation
+above replaces it with retained PVA and jerk-aware stopping trajectories.
 
 Pause retains the planned phase, including when it differs from requested phase.
 Resume seeds the trajectory from fresh stationary motor feedback. Stop intent,
@@ -161,7 +291,7 @@ fresh status, tracking checks and inhibited stationary Stop confirmation remain.
 
 ## Serial constraints and update changes
 
-[FC7b](https://github.com/ossm-rs/ossm-rs/blob/main/ossm-rs/src/motor/m57aimxx/mod.rs#L255-L282)
+[FC7b](https://github.com/ossm-rs/ossm-rs/blob/5f4edbd085da07e18f628b88cbad0caa96db269a/ossm-rs/src/motor/m57aimxx/mod.rs#L274-L303)
 contains only an absolute position. It carries no arrival time or velocity and
 has no documented queued interpolation contract. The manual's 2 kHz internal
 position sampling does not mean a 20 Hz RS485 command stream is interpolated
@@ -192,7 +322,8 @@ node --test --test-concurrency=1 tests/*.cjs
 python3 scripts/export_web.py
 ```
 
-The capacity benchmark loads the exact prior engine at
+These capacity measurements were recorded before the October 13 replacement;
+rerunning the benchmark now exercises the current core. It loads the exact prior engine at
 `dfc0b3781dafce221a8ecccac530227a559ee336`, uses a nominal measured span, and
 compares fixed 50 ms and irregular 20–75 ms calls. It does not model the servo,
 browser event loop, force, or USB timer jitter. Planned-reference RMS for finite
@@ -295,7 +426,9 @@ user acceptance of this 1 Hz sine at the tested stroke and load; other rates,
 shapes and loads, and parity with stock firmware remain unverified. Sampled
 register-16 speed is distinct from instantaneous peak speed.
 
-Retained evidence: [watched 1 Hz servo-ramp run](/private/tmp/ossm-speed-servo_ramped-2026-10-03-watched-live-2026-10-04T01-55-14-863Z-evidence.json).
+Original watched 1 Hz servo-ramp run evidence path: `/private/tmp/ossm-speed-servo_ramped-2026-10-03-watched-live-2026-10-04T01-55-14-863Z-evidence.json`.
+This temporary capture is no longer present; the recorded trial summary above
+is retained, without claiming the raw evidence is still available.
 
 ### Watched servo-ramp 1.5 Hz trial completed; visual assessment pending
 
@@ -314,7 +447,9 @@ output, pending demand, speed, PWM and alarm. The serial port was released.
 The user's visual assessment is pending. Encoder travel and sampled speeds
 alone do not establish smooth motion or acceptance at this rate.
 
-Retained evidence: [watched 1.5 Hz servo-ramp trial](/private/tmp/ossm-speed-servo_ramped-2026-10-03-watched-live-2026-10-04T01-59-10-748Z-evidence.json).
+Original watched 1.5 Hz servo-ramp trial evidence path: `/private/tmp/ossm-speed-servo_ramped-2026-10-03-watched-live-2026-10-04T01-59-10-748Z-evidence.json`.
+This temporary capture is no longer present; the recorded trial summary above
+is retained, without claiming the raw evidence is still available.
 
 The earlier streaming retest also exposed a confirmation race when Stop cancelled
 an idle status read after a prior successful Stop had released ownership. That cancelled read
@@ -325,7 +460,7 @@ minimum settling time as normal Stop; never-owned read-only connections are not
 promoted to confirmed. Regression checks include contradictory feedback and
 gradual drift, rather than ignoring cancellation or relaxing stopped-speed checks.
 
-The current local servo-ramp revision passes 244/244 browser tests. Its web
+The October 3 local servo-ramp revision passed 244/244 browser tests. Its web
 export was rebuilt and all packaged assets match the source-manifest SHA-256.
 A separate stationary reconnect then exercised the production Stop recovery
 and repeated Stop: both confirmed inhibition, with zero speed, PWM, pending

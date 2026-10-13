@@ -7,19 +7,33 @@ const {Engine} = require("../virtual_synth/static/browser-engine.js");
 const spanMm = 181.57 - 2 * 1638 / (32768/40);
 const irregular = [.020,.031,.075,.024,.049,.061,.037,.055];
 const wrap = phase => ((phase%1)+1)%1;
+const reserve = .95, jerk = 100000;
+// Independent symmetric S-curve minimum time, including jerk ramps.
+function moveTime(distance, velocity, acceleration, maximumJerk) {
+  const tj = Math.min(acceleration / maximumJerk, Math.sqrt(velocity / maximumJerk));
+  const ta = Math.max(0, velocity / acceleration - tj), accelerating = 2 * tj + ta;
+  if (distance >= velocity * accelerating) return distance / velocity + accelerating;
+  if (distance <= 2 * acceleration ** 3 / maximumJerk ** 2) return 4 * Math.cbrt(distance / (2 * maximumJerk));
+  return acceleration / maximumJerk + Math.sqrt((acceleration / maximumJerk) ** 2 + 4 * distance / acceleration);
+}
 
 function boundedEngine(params, acceleration=6000, velocity=1080) {
-  const engine=new Engine(params);engine.reset({vmax:velocity/spanMm,amax:acceleration/spanMm});
+  const engine=new Engine(params);engine.reset({vmax:velocity/spanMm,amax:acceleration/spanMm,jmax:jerk/spanMm});
   const trajectory=engine.trajectory;
-  for(const name of ["track","update"]) {
+  for(const name of ["follow","track","update"]) {
     const method=trajectory[name].bind(trajectory);
     trajectory[name]=(target,dt,...args)=>{
       const before=trajectory.velocity, result=method(target,dt,...args);
       assert.ok(Math.abs(trajectory.velocity)<=trajectory.vmax+1e-9,"velocity bound");
       assert.ok(Math.abs(trajectory.velocity-before)<=trajectory.amax*dt+1e-8,"acceleration bound");
       assert.ok(trajectory.position>=trajectory.low-1e-9&&trajectory.position<=trajectory.high+1e-9,"position bound");
-      const stop=trajectory.position+trajectory.velocity*Math.abs(trajectory.velocity)/(2*trajectory.amax);
-      assert.ok(stop>=trajectory.low-1e-9&&stop<=trajectory.high+1e-9,"stopping bound");
+      if (name === "follow") {
+        const stop=trajectory.braking();
+        assert.ok(stop.minPosition>=trajectory.low-1e-9&&stop.maxPosition<=trajectory.high+1e-9,"jerk-aware stopping bound");
+      } else {
+        const stop=trajectory.position+trajectory.velocity*Math.abs(trajectory.velocity)/(2*trajectory.amax);
+        assert.ok(stop>=trajectory.low-1e-9&&stop<=trajectory.high+1e-9,"legacy preview stopping bound");
+      }
       return result;
     };
   }
@@ -50,7 +64,7 @@ test("1200 versus 6000 host acceleration changes feasible sine frequency without
     const a=stroke*.4*spanMm;
     for(const acceleration of [1200,6000]) {
       const engine=boundedEngine({rate_hz,stroke,shape:"sine"},acceleration),r=steady(engine);
-      const limit=Math.min(1080/(2*Math.PI*a),Math.sqrt(acceleration/a)/(2*Math.PI));
+      const limit=Math.min(reserve*1080/(2*Math.PI*a),Math.sqrt(reserve*acceleration/a)/(2*Math.PI),Math.cbrt(reserve*jerk/a)/(2*Math.PI));
       const expected=Math.min(rate_hz,limit);
       assert.ok(Math.abs(r.signal.planned_rate_hz-expected)<1e-9,"analytic feasible rate");
       assert.equal(r.signal.rate_limited,acceleration===1200);
@@ -62,7 +76,7 @@ test("1200 versus 6000 host acceleration changes feasible sine frequency without
 
 test("an infeasible 4 Hz sine retimes its reference while the ideal requested phase continues",()=>{
   const engine=boundedEngine({rate_hz:4,stroke:.7,shape:"sine"}),r=steady(engine);
-  const a=.7*.4*spanMm,expected=Math.sqrt(6000/a)/(2*Math.PI);
+  const a=.7*.4*spanMm,expected=Math.sqrt(reserve*6000/a)/(2*Math.PI);
   assert.equal(r.signal.rate_limited,true);assert.ok(Math.abs(r.signal.planned_rate_hz-expected)<1e-9);
   assert.ok(Math.abs(r.span-r.nominalSpan)<r.nominalSpan*.01);assert.ok(r.rms<.5);
   assert.ok(Math.abs(engine.phase-wrap(4*r.elapsed))<1e-9,"requested oscillator keeps its original rate");
@@ -76,11 +90,11 @@ test("square transitions reach both endpoints at 1.5 Hz within all motion bounds
   assert.ok(Math.abs(r.span-r.nominalSpan)<.001,"exact point planner reaches both endpoints");
 });
 
-test("square rate is bounded by a full rest-to-rest move in each half-cycle",()=>{
+test("square rate fits a jerk-bounded physical reversal in each half-cycle",()=>{
   for(const [velocity,acceleration] of [[1080,6000],[300,6000]]) {
     const engine=boundedEngine({rate_hz:4,stroke:.7,shape:"square"},acceleration,velocity),r=steady(engine);
     const distance=.7*.8*spanMm;
-    const move=distance<=velocity*velocity/acceleration?2*Math.sqrt(distance/acceleration):distance/velocity+velocity/acceleration;
+    const move=moveTime(distance,velocity*reserve,acceleration*reserve,jerk*reserve);
     assert.ok(Math.abs(r.signal.planned_rate_hz-1/(2*move))<1e-9);
     assert.equal(r.signal.rate_limited,true);
     assert.ok(Math.abs(r.span-r.nominalSpan)<r.nominalSpan*.01,"full stroke after frequency governing");
@@ -107,8 +121,8 @@ test("finite triangle and saw corners respect reference velocity and acceleratio
       assert.ok(x>=.22-1e-10&&x<=.78+1e-10,shape+" reference endpoint bound");
       if(previous!==null) {
         const velocity=(x-previous)/dt;
-        assert.ok(Math.abs(velocity)<=engine.trajectory.vmax*.9+1e-8,shape+" reserved reference velocity");
-        if(previousVelocity!==null)assert.ok(Math.abs(velocity-previousVelocity)/dt<=engine.trajectory.amax*.9+1e-7,shape+" reserved reference acceleration at corners");
+        assert.ok(Math.abs(velocity)<=engine.trajectory.vmax*reserve+1e-8,shape+" reserved reference velocity");
+        if(previousVelocity!==null)assert.ok(Math.abs(velocity-previousVelocity)/dt<=engine.trajectory.amax*reserve+1e-7,shape+" reserved reference acceleration at corners");
         previousVelocity=velocity;
       }
       previous=x;
@@ -120,8 +134,8 @@ test("high-frequency finite triangle and saw paths govern their rate instead of 
   for(const shape of ["triangle","saw"])for(const [velocity,acceleration] of [[1080,6000],[300,6000]]) {
     const engine=boundedEngine({rate_hz:4,stroke:.7,shape},acceleration,velocity),r=steady(engine);
     const distance=.7*.8*spanMm;
-    const pathVelocity=velocity*.9,pathAcceleration=acceleration*.9;
-    const move=distance<=pathVelocity*pathVelocity/pathAcceleration?2*Math.sqrt(distance/pathAcceleration):distance/pathVelocity+pathVelocity/pathAcceleration;
+    const pathVelocity=velocity*reserve,pathAcceleration=acceleration*reserve;
+    const move=moveTime(distance,pathVelocity,pathAcceleration,jerk*reserve);
     assert.ok(Math.abs(r.signal.planned_rate_hz-1/(2*move))<1e-9,shape+" feasible rate");
     assert.equal(r.signal.rate_limited,true);
     assert.ok(Math.abs(r.span-r.nominalSpan)<r.nominalSpan*.01,shape+" full stroke when governed");
@@ -161,7 +175,7 @@ test("capacity reporting makes center attenuation explicit without changing its 
   assert.equal(signal.center_limited_stroke,true);
   assert.ok(Math.abs(signal.requested_span_normalized/.8-.62*2*.08)<1e-12,"9.92% of working window");
   const a=signal.requested_span_normalized*spanMm/2;
-  assert.ok(Math.abs(signal.max_sine_rate_hz-Math.min(1080/(2*Math.PI*a),Math.sqrt(6000/a)/(2*Math.PI)))<1e-9);
+  assert.ok(Math.abs(signal.max_sine_rate_hz-Math.min(reserve*1080/(2*Math.PI*a),Math.sqrt(reserve*6000/a)/(2*Math.PI),Math.cbrt(reserve*jerk/a)/(2*Math.PI)))<1e-9);
 });
 
 test("hardware reset clears both oscillator phases and planned rate state",()=>{

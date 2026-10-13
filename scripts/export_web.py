@@ -10,8 +10,9 @@ import shutil
 
 
 ROOT = Path(__file__).resolve().parents[1]
-ASSETS = ("style.css", "app.js", "audio.js", "tooltips.js", "browser-engine.js",
-          "browser-runtime.js", "web-serial-io.js", "web-serial-transport.js")
+ASSETS = ("style.css", "app.js", "audio.js", "tooltips.js", "ruckig-core.js",
+          "ruckig-core.wasm", "ruckig-LICENSE.txt", "browser-engine.js", "browser-runtime.js",
+          "web-serial-io.js", "web-serial-transport.js")
 
 
 def export(destination):
@@ -29,7 +30,7 @@ def export(destination):
         html = html.replace(f'src="/{name}"', f'src="./{name}"')
     html = html.replace('href="/" aria-label="OSSM', 'href="./" aria-label="OSSM')
     runtime = "\n".join(f'  <script src="./{name}" defer></script>' for name in (
-        "browser-engine.js", "web-serial-io.js", "web-serial-transport.js", "browser-runtime.js"))
+        "ruckig-core.js", "browser-engine.js", "web-serial-io.js", "web-serial-transport.js", "browser-runtime.js"))
     html = html.replace('  <script src="./app.js" defer></script>', runtime + '\n  <script src="./app.js" defer></script>')
     html = html.replace("Connecting to local app", "Starting browser synth")
     # A new export must not reuse a visitor's cached scripts or styles.

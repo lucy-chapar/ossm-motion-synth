@@ -3,8 +3,9 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-// Offline port of virtual_synth/engine.py. This module has no device or network
-// access. Position and velocity describe a normalized preview, not motor state.
+// Python-compatible normalized preview plus continuous commanded PVA for the
+// browser hardware path. Commanded state is not measured motor state; this
+// module never opens a device. Hardware planning uses the local Ruckig core.
 (function (root, factory) {
   "use strict";
   const api = factory();
@@ -29,6 +30,13 @@
   const MAX_VELOCITY = 3822 / 8192;
   const MAX_ACCELERATION = 1;
   const MAX_DT = .25;
+  const REFERENCE_RESERVE = .95;
+  const defaultJerk = acceleration => acceleration * (100000 / 6000);
+  function ruckigAPI() {
+    const api = typeof module === "object" && module.exports ? require("./ruckig-core.js") : globalThis.MotionRuckig;
+    if (!api?.loaded) throw new Error("Local continuous motion core is not ready");
+    return api;
+  }
 
   function number(value, name, low, high) {
     if (typeof value !== "number" || !Number.isFinite(value) || value < low || value > high) {
@@ -116,13 +124,21 @@
   class Trajectory {
     constructor(configuration = {}) {
       const {low = 0, high = 1, position = .5,
-        vmax = MAX_VELOCITY, amax = MAX_ACCELERATION} = options(configuration,
-        ["low", "high", "position", "vmax", "amax"], "Trajectory options");
+        vmax = MAX_VELOCITY, amax = MAX_ACCELERATION, jmax = null} = options(configuration,
+        ["low", "high", "position", "vmax", "amax", "jmax"], "Trajectory options");
       this.low = number(low, "lower trajectory bound", 0, 1);
       this.high = number(high, "upper trajectory bound", 0, 1);
       if (this.low >= this.high) throw new RangeError("Trajectory bounds must be increasing");
       this.vmax = number(vmax, "maximum velocity", 1e-12, 1e6);
       this.amax = number(amax, "maximum acceleration", 1e-12, 1e6);
+      this.jmax = number(jmax === null ? defaultJerk(amax) : jmax, "maximum jerk", 1e-12, 1e9);
+      Object.defineProperties(this, {
+        _planner: {value: null, writable: true}, _capture: {value: null, writable: true},
+        _safetyPlanner: {value: null, writable: true},
+        _generation: {value: null, writable: true}, _following: {value: false, writable: true},
+        _continuous: {value: false, writable: true},
+        _captureWait: {value: 0, writable: true},
+      });
       this.reset(position);
     }
 
@@ -130,7 +146,11 @@
       position = number(position, "reset position", this.low, this.high);
       this.position = this.command = position;
       this.velocity = 0;
+      this.acceleration = 0;
       this.trackingTarget = position;
+      this._capture?.plan.dispose(); this._capture = null;
+      this._following = this._continuous = false; this._generation = null;
+      this._captureWait = 0;
     }
 
     configure_bounds(low, high) {
@@ -138,11 +158,123 @@
       high = number(high, "upper trajectory bound", 0, 1);
       const stop = this.position + this.velocity * Math.abs(this.velocity) / (2 * this.amax);
       if (low >= high || this.position < low || this.position > high
-          || stop < low - 1e-10 || stop > high + 1e-10) {
+          || (this._continuous ? !this._brakeFits(this.pva(), low, high)
+            : stop < low - 1e-10 || stop > high + 1e-10)) {
         throw new RangeError("Travel window must contain the current command and stopping point");
       }
       this.low = low;
       this.high = high;
+    }
+
+    pva() { return {position: this.position, velocity: this.velocity, acceleration: this.acceleration}; }
+    limits() { return {vmax: this.vmax, amax: this.amax, jmax: this.jmax}; }
+    _core() { return this._planner ||= new (ruckigAPI().Planner)({cycleTime: .002}); }
+    _fits(plan, low, high) { return plan.minPosition >= low - 1e-10 && plan.maxPosition <= high + 1e-10; }
+    _safeBrake(state, low, high) {
+      const planner = this._safetyPlanner ||= new (ruckigAPI().Planner)({cycleTime: .002});
+      const brake = planner.brake(state, this.limits());
+      if (this._fits(brake, low, high)) return brake;
+      // The shortest velocity-control stop can overshoot a nearby position
+      // boundary while removing acceleration. Search bounded position-control
+      // stops too; only complete analytic extrema prove an admissible stop.
+      for (const position of [state.velocity < 0 ? low : high, (low + high) / 2, state.position]) {
+        try {
+          const plan = planner.calculate(state, {position, velocity: 0, acceleration: 0}, this.limits());
+          if (this._fits(plan, low, high)) return plan;
+        } catch (_) { /* This candidate is not a feasible stopping trajectory. */ }
+      }
+      return null;
+    }
+    _brakeFits(state, low, high) { return this._safeBrake(state, low, high) !== null; }
+    braking() {
+      const plan = this._safeBrake(this.pva(), this.low, this.high);
+      if (!plan) throw new Error("No bounded jerk-limited stopping trajectory fits the travel window");
+      return plan;
+    }
+
+    follow(reference, dt, strokeBounds, generation, exact = true) {
+      dt = number(dt, "Continuous dt", 0, MAX_DT);
+      // Replan modulated references on a fixed time grid, independent of USB
+      // callback partitioning. Split at the exact grid crossing, carrying PVA.
+      if (!exact && this._capture && !this._capture.braking && this._capture.elapsed < .02 - 1e-10 && this._capture.elapsed + dt > .02 + 1e-10) {
+        const first = .02 - this._capture.elapsed, remaining = dt - first;
+        this.follow({sample: offset => reference.sample(offset - remaining)}, first, strokeBounds, generation, false);
+        return this.follow(reference, remaining, strokeBounds, generation, false);
+      }
+      this._continuous = true;
+      if (!dt) return this.command;
+      let low = this.low, high = this.high;
+      const current = this.pva();
+      if (!this._brakeFits(current, low, high)) throw new Error("Current jerk-limited stopping trajectory exceeds the travel window");
+      if (strokeBounds && strokeBounds[0] < strokeBounds[1]
+          && this._brakeFits(current, strokeBounds[0], strokeBounds[1])
+          && (!this._capture || this._fits(this._capture.plan, strokeBounds[0], strokeBounds[1]))) [low, high] = strokeBounds;
+      if (generation !== this._generation || (!exact && !this._capture?.braking && this._capture?.elapsed >= .02 - 1e-10)) {
+        this._capture?.plan.dispose(); this._capture = null; this._following = false;
+        if (generation !== this._generation) this._captureWait = 0;
+        this._generation = generation;
+      }
+      if (!this._following && !this._capture) {
+        // Capture a future moving state. A reference sample is not a rest
+        // endpoint: its nonzero velocity and acceleration pass into Ruckig.
+        const horizons = [.05, .075, .1, .15, .225, .35, .5, .75, 1, 1.5, 2, 3];
+        let reason = "no bounded future state", adaptive = 0, feasibleDestination = false;
+        for (let index = 0; index < horizons.length && index < 24; index++) {
+          const horizon = horizons[index];
+          try {
+            const target = reference.sample(horizon - dt);
+            const plan = this._core().calculate(current, target, {...this.limits(), minimumDuration: horizon});
+            if (this._fits(plan, this.low, this.high) && this._brakeFits(target, this.low, this.high)) feasibleDestination = true;
+            if (plan.duration > horizon + 1e-8) {
+              if (exact && plan.duration < 3 && adaptive++ < 4) horizons.splice(index + 1, 0, plan.duration + .001);
+              continue;
+            }
+            if (!this._fits(plan, low, high) || !this._brakeFits(target, low, high)) continue;
+            this._capture = {plan: plan.snapshot(), elapsed: 0}; break;
+          } catch (error) { reason = error.message || String(error); }
+        }
+        if (!this._capture) {
+          // An infeasible parameter transition may need a bounded braking
+          // segment before capture. This is a retained exceptional profile,
+          // never a rest-to-rest plan for each ordinary wire sample.
+          const brake = this._safeBrake(current, this.low, this.high);
+          if (!brake || (brake.duration <= 1e-10 && !feasibleDestination)) throw new Error("No jerk-safe continuous capture fits the travel window: " + reason);
+          if (brake.duration <= 1e-10) {
+            this._captureWait += dt;
+            if (this._captureWait > 3) throw new Error("No continuous capture reached a feasible reference within three seconds");
+          }
+          this._capture = {plan: brake.snapshot(), elapsed: 0, braking: true};
+          low = this.low; high = this.high;
+        } else this._captureWait = 0;
+      }
+      let next;
+      if (this._capture) {
+        const capture = this._capture;
+        capture.elapsed += dt;
+        next = capture.plan.sample(Math.min(capture.elapsed, capture.plan.duration));
+        if (capture.elapsed >= capture.plan.duration - 1e-10) {
+          if (!capture.braking && capture.elapsed > capture.plan.duration + 1e-10) next = reference.sample(0);
+          capture.plan.dispose(); this._capture = null; this._following = exact && !capture.braking;
+        }
+      } else next = reference.sample(0);
+      // The requested stroke is an optional stop corridor. A periodic reversal
+      // can stay inside it while a v=0/a=0 emergency trajectory needs a little
+      // more space; retain the independently verified rail corridor in that
+      // case instead of changing the continuous waveform's velocity.
+      if ((low !== this.low || high !== this.high) && !this._brakeFits(next, low, high)) {
+        low = this.low; high = this.high;
+      }
+      if (![next.position, next.velocity, next.acceleration].every(Number.isFinite)) throw new Error("Continuous motion produced nonfinite state");
+      if (Math.abs(next.velocity) > this.vmax + 1e-8 || Math.abs(next.acceleration) > this.amax + 1e-8) throw new Error("Continuous motion exceeds its velocity or acceleration limit");
+      if (Math.abs(next.acceleration - current.acceleration) > this.jmax * dt + 1e-8) throw new Error("Continuous motion acceleration changed faster than the jerk limit");
+      if (next.position < low - 1e-10 || next.position > high + 1e-10) throw new Error("Continuous motion exceeds its position corridor");
+      if (!this._brakeFits(next, low, high)) throw new Error("Proposed jerk-limited stopping trajectory exceeds the travel window");
+      // Normalize only floating-point endpoint roundoff, after the complete
+      // state and stop corridor have passed. Velocity/acceleration are retained.
+      this.position = this.command = clamp(next.position, this.low, this.high);
+      this.velocity = next.velocity; this.acceleration = next.acceleration;
+      this.trackingTarget = reference.sample(0).position;
+      return this.command;
     }
 
     _segments(target) {
@@ -171,6 +303,8 @@
     }
 
     track(target, dt, strokeBounds = null) {
+      // Legacy position-only compatibility API. Hardware Engine.step uses
+      // follow() with future PVA and never enters this rest-point fallback.
       dt = number(dt, "Tracking dt", 0, MAX_DT);
       target = number(target, "Tracking target", this.low, this.high);
       if (!dt) return this.command;
@@ -246,19 +380,17 @@
     }
   }
 
-  function restMoveTime(distance, vmax, amax) {
-    return distance <= vmax * vmax / amax ? 2 * Math.sqrt(distance / amax) : distance / vmax + vmax / amax;
-  }
-
-  function restMovePosition(distance, duration, elapsed, amax) {
-    // Symmetric trapezoid that uses the available duration, rather than
-    // chasing a moving point with an arbitrary proportional response gain.
-    const speed = 2 * distance / (duration + Math.sqrt(Math.max(0, duration * duration - 4 * distance / amax)));
-    const ramp = speed / amax;
-    if (elapsed < ramp) return .5 * amax * elapsed * elapsed;
-    if (elapsed > duration - ramp) return distance - .5 * amax * (duration - elapsed) ** 2;
-    return .5 * amax * ramp * ramp + speed * (elapsed - ramp);
-  }
+  const constant = value => ({value, first: 0, second: 0});
+  const scaled = (value, factor) => ({value: value.value * factor, first: value.first * factor, second: value.second * factor});
+  const added = (a, b) => ({value: a.value + b.value, first: a.first + b.first, second: a.second + b.second});
+  const multiplied = (a, b) => ({value: a.value * b.value,
+    first: a.first * b.value + a.value * b.first,
+    second: a.second * b.value + 2 * a.first * b.first + a.value * b.second});
+  const clipped = (value, low = 0, high = 1) => value.value <= low ? constant(low) : value.value >= high ? constant(high) : value;
+  const powered = (value, exponent, factor) => ({value: factor * value.value ** exponent,
+    first: factor * exponent * value.value ** (exponent - 1) * value.first,
+    second: factor * exponent * value.value ** (exponent - 1) * value.second
+      + factor * exponent * (exponent - 1) * value.value ** (exponent - 2) * value.first ** 2});
 
   class Engine {
     constructor(params = null) {
@@ -267,6 +399,11 @@
       this.phase = this.lfo_phase = this.envelope = 0;
       this.reference_phase = 0;
       this._planned_rate = null;
+      this._explicit_jerk = false;
+      Object.defineProperties(this, {
+        _referencePlanner: {value: null, writable: true},
+        _referencePlans: {value: null, writable: true},
+      });
     }
 
     configure(full_or_changes) {
@@ -277,17 +414,136 @@
     }
 
     reset(configuration = {}) {
-      const {position = .5, vmax = null, amax = null} = options(configuration,
-        ["position", "vmax", "amax"], "Reset options");
+      const {position = .5, vmax = null, amax = null, jmax = null} = options(configuration,
+        ["position", "vmax", "amax", "jmax"], "Reset options");
       const trajectory = new Trajectory({
         low: this.params.lower, high: this.params.upper, position,
         vmax: vmax === null ? this.trajectory.vmax : vmax,
         amax: amax === null ? this.trajectory.amax : amax,
+        jmax: jmax === null ? (this._explicit_jerk ? this.trajectory.jmax : null) : jmax,
       });
+      this.trajectory._capture?.plan.dispose(); this.trajectory._planner?.dispose(); this.trajectory._safetyPlanner?.dispose();
+      if (jmax !== null) this._explicit_jerk = true;
       this.trajectory = trajectory;
       this.phase = this.lfo_phase = this.envelope = 0;
       this.reference_phase = 0;
       this._planned_rate = null;
+      this._referencePlans?.forward.dispose(); this._referencePlans?.backward?.dispose(); this._referencePlans = null;
+    }
+
+    _futureGeometry(offset, gate) {
+      const p = this.params, omega = 2 * Math.PI * p.lfo_rate_hz;
+      const angle = 2 * Math.PI * this.lfo_phase + omega * offset;
+      const lfo = {value: Math.sin(angle), first: omega * Math.cos(angle), second: -omega * omega * Math.sin(angle)};
+      const slope = gate ? 1 / p.attack_s : -1 / p.release_s;
+      const envelope = clipped({value: this.envelope + slope * offset, first: slope, second: 0});
+      let rate = constant(p.rate_hz), stroke = constant(p.stroke), center = constant(p.center), direct = null;
+      for (const patch of p.patches) {
+        const source = patch.source === "lfo" ? lfo : patch.target === "stroke" ? envelope : added(scaled(envelope, 2), constant(-1));
+        if (patch.target === "rate") {
+          const k = 2 * Math.LN2 * patch.depth, value = p.rate_hz * Math.exp(k * source.value);
+          rate = {value, first: value * k * source.first, second: value * (k * source.second + k * k * source.first * source.first)};
+        } else if (patch.target === "stroke") stroke = added(stroke, scaled(source, patch.depth));
+        else if (patch.target === "center") center = added(center, scaled(source, .5 * patch.depth));
+        else direct = scaled(source, patch.depth);
+      }
+      rate = clipped(rate, .02, 4); stroke = clipped(stroke); center = clipped(center);
+      if (p.env_to_stroke && direct === null) stroke = multiplied(stroke, envelope);
+      const midpoint = added(constant(p.lower), scaled(center, p.upper - p.lower));
+      const room = center.value <= .5 ? added(midpoint, constant(-p.lower)) : added(constant(p.upper), scaled(midpoint, -1));
+      let amplitude = multiplied(stroke, room);
+      if (midpoint.value - amplitude.value === midpoint.value + amplitude.value) amplitude = constant(0);
+      return {rate, midpoint, amplitude, direct};
+    }
+
+    _sineRate(geometry, limits) {
+      const amplitude = geometry.amplitude;
+      if (!(amplitude.value > 0)) return geometry.rate;
+      const caps = [geometry.rate, powered(amplitude, -1, limits.vmax / (2 * Math.PI)),
+        powered(amplitude, -.5, Math.sqrt(limits.amax) / (2 * Math.PI)),
+        powered(amplitude, -1 / 3, Math.cbrt(limits.jmax) / (2 * Math.PI))];
+      return caps.reduce((a, b) => a.value <= b.value ? a : b);
+    }
+
+    _continuousReference(dt, gate) {
+      const p = this.params, trajectory = this.trajectory;
+      const limits = {vmax: trajectory.vmax * REFERENCE_RESERVE,
+        amax: trajectory.amax * REFERENCE_RESERVE, jmax: trajectory.jmax * REFERENCE_RESERVE};
+      const geometry = this._futureGeometry(0, gate), amplitude = geometry.amplitude.value;
+      const dynamic = p.env_to_stroke && geometry.direct === null || p.patches.some(patch => patch.depth !== 0);
+      let rate = geometry.rate.value, maximumSineRate = null, plans = null;
+      if (geometry.direct === null && p.shape === "sine") {
+        rate = this._sineRate(geometry, limits).value;
+        maximumSineRate = amplitude > 0 ? Math.min(limits.vmax / (2 * Math.PI * amplitude),
+          Math.sqrt(limits.amax) / Math.sqrt(amplitude) / (2 * Math.PI), Math.cbrt(limits.jmax) / Math.cbrt(amplitude) / (2 * Math.PI)) : null;
+      } else if (geometry.direct === null && amplitude > 0) {
+        const key = JSON.stringify([p.shape, amplitude, rate, limits.vmax, limits.amax, limits.jmax]);
+        if (this._referencePlans?.key !== key) {
+          const planner = this._referencePlanner ||= new (ruckigAPI().Planner)({cycleTime: .002});
+          const distance = 2 * amplitude, start = {position: 0, velocity: 0, acceleration: 0};
+          const end = {position: distance, velocity: 0, acceleration: 0};
+          const minimum = planner.calculate(start, end, limits).duration;
+          rate = Math.min(rate, 1 / (2 * minimum));
+          const half = .5 / rate;
+          const forwardDuration = p.shape === "triangle" ? half : p.shape === "saw" ? 2 * half - minimum : minimum;
+          const forward = planner.calculate(start, end, {...limits, minimumDuration: forwardDuration}).snapshot();
+          const backward = p.shape === "saw" ? planner.calculate(start, end, limits).snapshot() : null;
+          this._referencePlans?.forward.dispose(); this._referencePlans?.backward?.dispose();
+          this._referencePlans = {key, forward, backward, minimum, rate};
+        }
+        plans = this._referencePlans; rate = plans.rate;
+      }
+      if (geometry.direct === null) this.reference_phase = wrapped(this.reference_phase + .5 * ((this._planned_rate ?? rate) + rate) * dt);
+      this._planned_rate = geometry.direct === null ? rate : null;
+      const phase = this.reference_phase;
+      const sample = offset => {
+        const future = dynamic ? this._futureGeometry(offset, gate) : geometry;
+        const midpoint = future.midpoint, a = future.amplitude;
+        if (future.direct !== null) {
+          const value = added(midpoint, multiplied(a, future.direct));
+          return {position: value.value, velocity: value.first, acceleration: value.second};
+        }
+        if (!(amplitude > 0)) return {position: midpoint.value, velocity: midpoint.first, acceleration: midpoint.second};
+        if (p.shape === "sine") {
+          const futureRate = dynamic ? this._sineRate(future, limits) : constant(rate);
+          let advance = rate * offset;
+          if (dynamic && offset > 0) {
+            const count = Math.ceil(offset / .01), h = offset / count; advance = 0;
+            let previous = rate;
+            for (let i = 1; i <= count; i++) {
+              const next = this._sineRate(this._futureGeometry(i * h, gate), limits).value;
+              advance += .5 * (previous + next) * h; previous = next;
+            }
+          }
+          const angle = 2 * Math.PI * (phase + advance), omega = 2 * Math.PI * futureRate.value;
+          const omegaPrime = 2 * Math.PI * futureRate.first, sin = Math.sin(angle), cos = Math.cos(angle);
+          return {position: midpoint.value + a.value * sin,
+            velocity: midpoint.first + a.first * sin + a.value * omega * cos,
+            acceleration: midpoint.second + a.second * sin + 2 * a.first * omega * cos
+              + a.value * omegaPrime * cos - a.value * omega * omega * sin};
+        }
+        const cyclePhase = wrapped(phase + rate * offset + (p.shape === "triangle" ? .25 : 0));
+        const elapsed = cyclePhase / rate, half = .5 / rate;
+        let forward, profile, time;
+        if (p.shape === "saw") {
+          forward = elapsed < 1 / rate - plans.minimum;
+          profile = forward ? plans.forward : plans.backward;
+          time = forward ? elapsed : elapsed - (1 / rate - plans.minimum);
+        } else {
+          forward = elapsed < half; profile = plans.forward;
+          time = forward ? elapsed : elapsed - half;
+        }
+        const state = profile.sample(Math.min(time, profile.duration)), direction = forward ? 1 : -1;
+        const progress = forward ? state.position / (2 * amplitude) : 1 - state.position / (2 * amplitude);
+        const speed = time >= profile.duration ? 0 : direction * state.velocity / (2 * amplitude);
+        const acceleration = time >= profile.duration ? 0 : direction * state.acceleration / (2 * amplitude);
+        return {position: midpoint.value - a.value + 2 * a.value * progress,
+          velocity: midpoint.first - a.first + 2 * (a.first * progress + a.value * speed),
+          acceleration: midpoint.second - a.second + 2 * (a.second * progress + 2 * a.first * speed + a.value * acceleration)};
+      };
+      const envelopeConnected = p.env_to_stroke || p.patches.some(patch => patch.source === "envelope" && patch.depth !== 0);
+      const generation = JSON.stringify([p, envelopeConnected ? gate : null]);
+      return {sample, rate, maximumSineRate, generation, exact: !dynamic};
     }
 
     _source(patch, bipolar = true) {
@@ -343,65 +599,32 @@
       const carrier = waveform(this.params.shape, this.phase);
       const wave = direct_position === null ? carrier : direct_position;
       const requested = clamp(midpoint + amplitude * wave, low, high);
-      let plannedRate = rate, maximumSineRate = null, reference = requested, moveTime = 0;
-      // A minimum-time continuous reference using every bit of acceleration
-      // cannot be caught after starting at rest or changing parameters. Reserve
-      // 10% for capture by the same tracker; its output still has one hard V/A
-      // budget. Square point moves need no separate reference capture.
-      const referenceVmax = this.trajectory.vmax * .9;
-      const referenceAmax = this.trajectory.amax * .9;
-      if (tracking && running && direct_position === null) {
-        // One physical budget owns the streamed trajectory. A clock that keeps
-        // outrunning that budget makes a pursuit limiter shrink the stroke.
-        // Retiming a sine preserves its geometry: v_peak=2*pi*f*A and
-        // a_peak=(2*pi*f)^2*A, in the same normalized units as the trajectory.
-        if (amplitude > 0) {
-          maximumSineRate = Math.min(this.trajectory.vmax / (2 * Math.PI * amplitude),
-            Math.sqrt(this.trajectory.amax) / Math.sqrt(amplitude) / (2 * Math.PI));
-          if (this.params.shape === "sine") plannedRate = Math.min(rate, maximumSineRate);
-          else {
-            // Each non-sine stroke needs a finite rest-to-rest transition.
-            // Ideal triangle corners and saw/square jumps demand infinite
-            // acceleration; their bounded references allocate real time.
-            const distance = 2 * amplitude;
-            const vmax = this.params.shape === "square" ? this.trajectory.vmax : referenceVmax;
-            const amax = this.params.shape === "square" ? this.trajectory.amax : referenceAmax;
-            moveTime = restMoveTime(distance, vmax, amax);
-            plannedRate = Math.min(rate, 1 / (2 * moveTime));
-          }
-        }
-        this.reference_phase = wrapped(this.reference_phase
-          + .5 * ((this._planned_rate ?? plannedRate) + plannedRate) * dt);
-        this._planned_rate = plannedRate;
-        reference = clamp(midpoint + amplitude * waveform(this.params.shape, this.reference_phase), low, high);
-        if (amplitude > 0 && this.params.shape === "triangle") {
-          const phase = wrapped(this.reference_phase + .25), forward = phase < .5;
-          const elapsed = (forward ? phase : phase - .5) / plannedRate;
-          const position = restMovePosition(2 * amplitude, .5 / plannedRate, elapsed, referenceAmax);
-          reference = midpoint - amplitude + (forward ? position : 2 * amplitude - position);
-        } else if (amplitude > 0 && this.params.shape === "saw") {
-          const elapsed = this.reference_phase / plannedRate, forwardTime = 1 / plannedRate - moveTime;
-          const position = elapsed < forwardTime
-            ? restMovePosition(2 * amplitude, forwardTime, elapsed, referenceAmax)
-            : 2 * amplitude - restMovePosition(2 * amplitude, moveTime, elapsed - forwardTime, referenceAmax);
-          reference = midpoint - amplitude + position;
-        }
-        reference = clamp(reference, low, high);
-      } else if (!tracking) {
-        this.reference_phase = this.phase;
-        this._planned_rate = null;
-      } else if (!running) this._planned_rate = null;
-      let command;
-      if (running) {
-        // A square requests endpoints, rather than a continuously moving
-        // reference. The exact point planner reaches them at the available
-        // velocity/acceleration; a fixed pursuit gain approaches them slowly.
-        const pointMove = tracking && direct_position === null && this.params.shape === "square";
-        const strokeLow = clamp(midpoint - amplitude, low, high), strokeHigh = clamp(midpoint + amplitude, low, high);
-        const strokeBounds = strokeLow < strokeHigh ? [strokeLow, strokeHigh] : null;
-        reference = clamp(reference, strokeLow, strokeHigh);
-        command = tracking && !pointMove ? this.trajectory.track(reference, dt, strokeBounds) : this.trajectory.update(reference, dt);
+      if (tracking && running) {
+        const reference = this._continuousReference(dt, gate);
+        const strokeLow = midpoint - amplitude, strokeHigh = midpoint + amplitude;
+        const command = this.trajectory.follow(reference, dt,
+          reference.exact && strokeLow < strokeHigh ? [strokeLow, strokeHigh] : null, reference.generation, reference.exact);
+        const planned = reference.sample(0);
+        return {
+          requested, command, velocity: this.trajectory.velocity, acceleration: this.trajectory.acceleration,
+          envelope: this.envelope, lfo: Math.sin(2 * Math.PI * this.lfo_phase), phase: this.phase,
+          limited: Math.abs(command - requested) > 1e-7,
+          effective_rate_hz: rate, effective_stroke: stroke, effective_center: center, carrier,
+          position_patched: direct_position !== null, envelope_bypassed: Boolean(env_bypassed),
+          reference_phase: this.reference_phase, planned_reference: planned.position,
+          planned_reference_velocity: planned.velocity, planned_reference_acceleration: planned.acceleration,
+          planned_rate_hz: direct_position === null ? reference.rate : null,
+          rate_limited: direct_position === null && reference.rate < rate - 1e-10,
+          requested_span_normalized: 2 * amplitude * (direct_position === null ? 1
+            : Math.abs(this.params.patches.find(patch => patch.target === "position").depth)),
+          center_limited_stroke: stroke > 0 && 2 * amplitude < stroke * (high - low) - 1e-10,
+          max_sine_rate_hz: direct_position === null && this.params.shape === "sine" ? reference.maximumSineRate : null,
+        };
       }
+      if (!tracking) this.reference_phase = this.phase;
+      this._planned_rate = null;
+      let command;
+      if (running) command = this.trajectory.update(requested, dt);
       else {
         this.trajectory.reset(this.trajectory.position);
         command = this.trajectory.command;
@@ -414,19 +637,21 @@
         position_patched: direct_position !== null, envelope_bypassed: Boolean(env_bypassed),
       };
       if (tracking) Object.assign(signal, {
+        acceleration: this.trajectory.acceleration,
         reference_phase: this.reference_phase,
-        planned_reference: reference,
-        planned_rate_hz: running && direct_position === null ? plannedRate : null,
-        rate_limited: running && direct_position === null && plannedRate < rate - 1e-10,
+        planned_reference: requested,
+        planned_rate_hz: null,
+        rate_limited: false,
         requested_span_normalized: 2 * amplitude * (direct_position === null ? 1
           : Math.abs(this.params.patches.find(patch => patch.target === "position").depth)),
         center_limited_stroke: stroke > 0 && 2 * amplitude < stroke * (high - low) - 1e-10,
-        max_sine_rate_hz: direct_position === null && this.params.shape === "sine" ? maximumSineRate : null,
+        max_sine_rate_hz: null,
       });
       return signal;
     }
   }
 
+  const motionCore = typeof module === "object" && module.exports ? require("./ruckig-core.js") : globalThis.MotionRuckig;
   return Object.freeze({Engine, Trajectory, DEFAULT_PARAMS, MAX_VELOCITY, MAX_ACCELERATION,
-    validateParams, waveform});
+    validateParams, waveform, ready: motionCore?.ready || Promise.resolve(false), motionReady: () => Boolean(motionCore?.loaded)});
 });

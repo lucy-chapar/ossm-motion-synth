@@ -46,6 +46,21 @@ required. Keep the terminal open while using the app; **Ctrl-C** stops the serve
 Run the same command again after a reboot. If the port is occupied, stop the
 existing server or use `./synth-web --port 8770 --open`.
 
+The October 13 browser hardware planner is **local and not deployed**. It carries
+position, velocity and acceleration between commands, uses finite jerk-limited
+transitions and preserves nonzero derivatives through intermediate moving
+points. It retains the 1080 mm/s / 6000 mm/s² host ceilings and 20000 RPM/s drive
+ramp, with a new 100000 mm/s³ host jerk limit. References reserve 95% of those
+host budgets. The watched 1.5 Hz / 70% sine was accepted as smooth with useful
+speed, and browser Home/Play/Stop passed; see the
+[motion planner audit](docs/MOTION_PLANNER_AUDIT.md) for evidence and limitations.
+
+The bundled Ruckig WASM asset loads locally before Home or Play becomes available;
+all later planning is synchronous and offline. A recovered communication error
+during a pattern now stops the run and requires stationary recapture before
+another Play. Simulation and the optional Python bridge keep their original
+planner.
+
 Use the same URL and browser profile to retain adapter permission. A previously
 permitted adapter may reconnect automatically; **Home → Play** are explicit
 actions after each connection. If needed, click **Connect** and select the
@@ -106,8 +121,12 @@ node --test tests/*.cjs
 
 Tests use fake serial devices and require no motor. Node.js 22 or later runs the
 audio, browser engine, controller and Web Serial tests, including comparisons
-against the Python engine. There is no frontend build step. All browser assets
-are included and run without a CDN.
+against the Python engine for the shared preview behavior. All browser assets,
+including the prebuilt local Ruckig WASM core, are bundled and run without a CDN.
+Normal use and export need no frontend build. The pinned source, portable build
+recipe and numerical checks are documented in [vendor/ruckig](vendor/ruckig/README.md).
+The October 13 revision passed 267/267 browser checks, including 13 core checks;
+these software checks do not establish physical smoothness or firmware parity.
 
 The optional Python bridge binds to loopback and accepts only same-origin
 control requests. The website edition connects directly to a USB–RS485 adapter
@@ -136,4 +155,6 @@ identity, but never automatically homes or starts motion. See the
 
 ## License
 
-[MPL-2.0](LICENSE). See [NOTICE.md](NOTICE.md) for provenance and acknowledgements.
+Project integration: [MPL-2.0](LICENSE). The bundled Ruckig core retains MIT
+licensing and its runtime notices; see [NOTICE.md](NOTICE.md) and
+[ruckig-LICENSE.txt](virtual_synth/static/ruckig-LICENSE.txt).

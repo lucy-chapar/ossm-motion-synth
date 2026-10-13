@@ -73,7 +73,9 @@ test("browser global works without require, network, DOM, or device APIs", () =>
   near(result.envelope, .05 / .8);
   assert.equal(result.position_patched, false);
   assert.deepEqual(Object.keys(context.MotionBrowserEngine),
-    ["Engine", "Trajectory", "DEFAULT_PARAMS", "MAX_VELOCITY", "MAX_ACCELERATION", "validateParams", "waveform"]);
+    ["Engine", "Trajectory", "DEFAULT_PARAMS", "MAX_VELOCITY", "MAX_ACCELERATION", "validateParams", "waveform", "ready", "motionReady"]);
+  assert.equal(context.MotionBrowserEngine.motionReady(), false,
+    "preview works without a core, while hardware cannot silently fall back to rest-point planning");
 });
 
 test("parameter validation rejects coercions, nonfinite values, unknown keys and invalid cables", () => {

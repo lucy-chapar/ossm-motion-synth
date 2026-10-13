@@ -4,9 +4,16 @@ The [website edition](https://lucychapar.com/ossm-motion-synth/) runs the engine
 audio and USB–RS485 control directly in the browser using Web Serial. In desktop
 Chrome or Edge, expand **Motor connection** and click **Connect**. The browser
 asks you to choose your USB–RS485 adapter, then connects to it.
-No adapter opens automatically. The controls and rail measurement sequence
-are shared with the optional Python edition; drive startup handling differs
-as noted below.
+A previously permitted adapter can reconnect when exactly one saved USB identity
+matches; connection does not Home or Play automatically. The controls and rail
+measurement sequence are shared with the optional Python edition. The local
+browser hardware planner now differs from that edition as noted below.
+
+The October 13 continuous-planner revision is **local and not deployed**. Use
+`./synth-web --open` from the repository to rebuild and serve it at
+`http://127.0.0.1:8769/`. Its watched 1.5 Hz / 70% sine was accepted as smooth with useful speed;
+[the audit](MOTION_PLANNER_AUDIT.md) separates current software checks from
+historical connected trials.
 
 **Wiring:** With power off, disconnect the 4-pin signal cable that runs to the
 OSSM motherboard. This setup only needs 24 V power and USB–RS485 wired directly
@@ -24,7 +31,7 @@ enumerate or connect a USB–RS485 adapter.
 ## Play in simulation
 
 1. Choose a preset or set RATE, STROKE, CENTER and waveform.
-2. ARM, then RUN. No serial device is opened in simulation.
+2. Click **Play**. No serial device is opened in simulation.
 3. Set ATTACK/RELEASE and enable envelope-to-stroke to grow/fade the motion with
    GATE. Holding the gate sustains full envelope; closing it starts release.
 4. Add a virtual cable from LFO or ENVELOPE to RATE, STROKE, CENTER or POSITION.
@@ -34,9 +41,9 @@ enumerate or connect a USB–RS485 adapter.
 
 The scope separates the **requested** waveform and the **planned command**.
 The browser shows the resulting requested travel and planned phase rate. A
-fixed wave that exceeds the velocity/acceleration budget runs at a feasible
-planned rate to preserve stroke. Square transitions, triangle corners and saw
-flyback receive finite acceleration time. Position patches show their own
+fixed hardware wave that exceeds the velocity/acceleration/jerk budget runs at
+a feasible planned rate to preserve stroke. Square transitions, triangle corners
+and saw flyback receive finite jerk-limited time. Position patches show their own
 control mode. See the [motion planner audit](MOTION_PLANNER_AUDIT.md).
 In hardware mode, a third trace is actual encoder feedback. Simulation does
 not invent measured motor feedback. Normalized travel is a fraction of the
@@ -63,7 +70,7 @@ instead of waiting for release.
 ## Listen to the waveform
 
 Expand **Audio preview** at the bottom of the interface. Audio starts muted.
-Click **Enable audio**, then ARM and RUN in simulation. Collapsing the panel
+Click **Enable audio**, then **Play** in simulation. Collapsing the panel
 keeps audio playing; its status stays visible in the header.
 Sound follows the synth while RUN is active; enabling audio never arms, starts
 or connects the motor. Volume affects your speakers only. The audio is a guide
@@ -102,15 +109,16 @@ node --test tests/test_virtual_synth_audio.cjs
 
 On the website, choose your USB–RS485 adapter and click **Connect**. With the
 optional Python bridge, first launch `./synth --allow-motion --open` and select
-the USB–RS485 port. The **Home** button beside Arm and Run stays greyed out until a
-motor is connected. Click it to find both ends, measure the rail travel, and
-park halfway between the measured endpoints. Successful homing leaves output
-disabled, ready for **ARM**, then **RUN**. **Stop output** cancels homing.
+the USB–RS485 port. **Home** below the motion monitor stays greyed out until a motor
+is connected and the motion core is ready. Click it to find both ends, measure
+the rail travel, and park halfway between the measured endpoints. Successful
+homing leaves output disabled, ready for **Play**. **Stop output** cancels homing.
 The progress message reports which end is being found or when the motor is
 moving to center.
 
 The browser measures both ends directly in the existing encoder coordinate,
-at 35 RPM / 75 RPM/s with output/stall setting 89. It does not invoke the
+using 70 RPM / 150 RPM/s for long searches and 35 RPM / 75 RPM/s for short
+retreat, repeated contact and centering moves, with output/stall setting 89. It does not invoke the
 native coordinate-reset command. Each search is bounded to 500 nominal mm.
 The optional Python bridge retains its native reference stage.
 
@@ -130,16 +138,18 @@ The working window is inset 2 mm from each measured endpoint. The motor parks
 at the midpoint of the two contacts, verifies arrival, then inhibits output
 and restores the previous output/stall setting. The waveform planner uses
 this measured working span, keeping its existing physical velocity and
-acceleration limits when converting normalized positions to encoder counts.
+acceleration and jerk limits when converting normalized positions to encoder counts.
 After parking, browser Home restores a 1800 RPM ceiling and the selected
-profile. The provisional local browser default is `servo_ramped`: a 20000 RPM/s drive ramp
-(nominal 13333 mm/s²), with host ceilings of nominal 1080 mm/s and 6000 mm/s².
+profile. The local browser default is `servo_ramped`: a 20000 RPM/s drive ramp
+(nominal 13333 mm/s²), with nominal host ceilings of 1080 mm/s, 6000 mm/s²
+and 100000 mm/s³.
 This retains drive headroom while shaping the gaps between discrete targets.
 The `streaming` comparison profile uses 60098 (98% position feedforward, no
 internal ramp); its watched 1 Hz test was visibly pulsing. The older `ramped`
 profile retains 2000 RPM/s and a 1200 mm/s² host ceiling. Faster requested fixed
-waves are retimed to fit their selected budget. The servo-ramped 1 Hz trial
-reduced sampled speed bursts, but fast physical smoothness is still being evaluated.
+waves are retimed to fit their selected budget. The historical servo-ramped
+1 Hz trial reduced sampled speed bursts; the October 13 planner has separate
+watched 1.5 Hz / 70% sine acceptance recorded in the audit.
 These local changes have not been deployed.
 Centering uses the slower
 35 RPM / 75 RPM/s calibration profile. The Python bridge retains its earlier
@@ -186,8 +196,10 @@ one connected drive, not every motor or adapter. The subsequent 35 RPM /
 ## USB–RS485 connection
 
 The laptop connects to the existing motor through a **USB–RS485 adapter** and
-the separately powered motor drive. Select the exact device in the interface;
-the application never guesses a port or opens one on startup. Connect sends
+the separately powered motor drive. First use requires the browser chooser;
+subsequent automatic connection is limited to one previously permitted adapter
+matching the saved USB identity. The optional Python bridge still requires
+manual port selection. Connect sends
 FC03 status reads only, with 8N1 and slave 1. The local browser first checks
 19200 baud, then 115200 and 38400 only if the previous rate times out. Each
 attempt closes before the next opens. Any valid status ends discovery, including
@@ -216,19 +228,39 @@ fixed working window described above. The window persists across stopped runs
 on that connection. ARM verifies three fresh stationary, inhibited readbacks
 before accepting it. Reconnecting requires Home again.
 
-RUN clears pending motion, checks stationary disabled readback, enables the
-drive and checks the enabled hold before sending bounded targets. The planner
-uses a browser maximum velocity of 884736 counts/s (1080 nominal mm/s) and
-maximum acceleration of 983040 counts/s² (1200 nominal mm/s²), with ten percent
-speed headroom below the drive's 1800 RPM setting. The optional Python bridge
-retains 3822 counts/s and 8192 counts/s². It bounds position, speed and acceleration;
-**jerk limiting is not implemented**. Waveforms with abrupt corners therefore
-produce different requested and planned traces, and drive interpolation is
-not modeled. Physical performance is not established by the simulation.
+Play clears pending motion, checks stationary disabled readback, enables the
+drive and checks the enabled hold before sending bounded targets. The current
+local browser retains host limits of **1080 nominal mm/s** and **6000 mm/s²**
+and adds **100000 mm/s³ jerk**. These are 884736 counts/s, 4915200 counts/s²
+and 81920000 counts/s³ at the assumed 819.2 counts/mm. The `servo_ramped`
+drive setting remains 1800 RPM and 20000 RPM/s; no higher acceleration or
+baud commissioning is part of this planner change.
+
+The hardware planner carries commanded position, velocity and acceleration
+between updates. Startup and changes capture a future moving state through the
+local Ruckig core. Intermediate same-direction samples keep their derivatives;
+actual reversals use zero velocity and acceleration. Triangle, square and saw
+use finite jerk-limited legs, and fixed sines are retimed against velocity,
+acceleration and jerk demand. Their references reserve 95% of each host limit
+for capture headroom. Full trajectory extrema and jerk-aware stopping paths
+must fit the permitted rail corridor. This planned state is distinct from
+actual encoder motion and does not establish the drive's interpolation behavior.
+
+The local WASM asset loads asynchronously at browser startup; Home and Play
+remain unavailable until it is ready. Planning then runs synchronously offline,
+without a CDN or cloud trajectory service. See [core build and API notes](../vendor/ruckig/README.md)
+and [licensing](../NOTICE.md). Simulation and the optional Python bridge retain
+the original point planner; the bridge still uses 3822 counts/s and 8192
+counts/s² and has no jerk limit.
+
+Fixed-wave rate formulas do not prove fidelity for modulation. Modulated motion
+uses finite PVA captures; clipping or infeasible changes can alter the planned
+stroke or phase, require a bounded braking transition, or fault. The scope's
+commanded trace and planned rate describe the model, not achieved servo speed.
 
 Browser target cycles use 50 ms wall-clock deadlines (20 Hz) at 19200/38400 baud.
-A verified 115200 connection selects a local 25 ms trial deadline (40 Hz), still
-limited by actual serial completion. This finer cadence has not been physically
+A verified 115200 connection selects a local 20 ms deadline (50 Hz requested),
+still limited by actual serial completion. This finer cadence has not been physically
 validated. Each cycle reads one short group of status registers before generating
 the current position target; the four groups cover every register checked by the
 earlier full snapshots. A guard group older than 250 ms prevents the next target.
@@ -252,7 +284,7 @@ armed a run may keep it alive or change its controls; another authenticated
 local tab may request a stop. Backgrounding the control tab stops its heartbeat.
 
 STOP, a fault, or normal run completion independently attempts clear and inhibit,
-then allows up to 1.5 seconds to settle and checks three stationary disabled
+then allows up to three seconds to settle and checks three stationary disabled
 readbacks. Normal browser runs have no elapsed-time limit; the optional Python bridge retains its 20-second
 transport deadline. A failed clear acknowledgment
 does not prevent an inhibit attempt. Failure remains **stop unconfirmed**;
@@ -294,18 +326,20 @@ a fault. Encoder feedback covered approximately 98 mm against approximately
 Stop also completed without a fault. Stop readbacks confirmed output
 inhibited, zero PWM and stationary encoder feedback. This verifies one drive
 and adapter through a direct serial harness, not the deployed Chrome session.
-Intermittent response timeouts were also observed during this session; they
-are now eligible for the bounded reply recovery described below; uncertain motion targets are never resent.
+Intermittent response timeouts were also observed during that session. Its
+recovery behavior predates the current continuous planner; the fail-closed
+active-pattern policy is described below. Uncertain motion targets are never resent.
 
 ### Brief glitches and reconnecting
 
-The browser retries a missing or corrupt status reply once after clearing late
-bytes. A lost waveform-target acknowledgement triggers fresh, validated status
-feedback rather than retransmitting the target. The planner pauses during this
-recovery and resumes from its current phase without catch-up targets. Three
-consecutive target cycles requiring recovery stop the run. A failed write,
-closed stream, drive alarm, changed configuration or out-of-range position still
-stops immediately. Travel bounds and the run time limit remain in effect.
+During an active browser pattern, a recovered guard reply or uncertain target
+acknowledgment now **stops and inhibits the run**. A moving PVA reference cannot
+be frozen during an uncertain interval and resumed as if it stayed on its path.
+Recovery can read fresh status; it never retransmits an uncertain target or
+queues missed points. After confirmed Stop, reset the fault if needed, then
+Play again from fresh stationary feedback. Bounded read-only recovery remains
+available for connection and Stop verification. Failed writes, closed streams,
+drive alarms, changed configuration and out-of-range feedback still fault.
 
 After a confirmed stop from a communication fault, **Reset fault** checks three
 fresh stationary readings and lets you Arm again on the same connection,
@@ -314,10 +348,11 @@ Reconnect checks the drive and, if the previous stop was unconfirmed and output
 is still enabled, inhibits it and verifies stationary feedback. A new USB
 connection requires Home again. Reconnection never starts motion automatically.
 
-A connected-drive test discarded one status reply and one target acknowledgement
-while the motor ran a 20-second sine. Both recovered, the run completed without
-a fault, and output inhibition was confirmed. This tested deliberately discarded
-responses through the serial harness, not a physical USB unplug during motion.
+Historically, an October 1 connected-drive test discarded one status reply and
+one target acknowledgment during a 20-second sine. Both recovered and the run
+completed with confirmed inhibition under the earlier resume policy. That result
+is retained as historical evidence, not acceptance of the current fail-closed
+continuous-motion policy or a test of physical USB unplug during motion.
 
 After a confirmed stop, disabled encoder position may settle up to 1 nominal mm
 from that fixed stop position. The reference does not move with later readings,
@@ -326,7 +361,7 @@ changed configuration and travel-bound violations are still rejected. Stop and
 Arm still require three stable readings. A stopped-feedback error now reports
 the position displacement, pending counts, speed, PWM and output word.
 
-The browser's everyday slider ranges are 0.02–0.3 Hz for Rate, 0.01–0.3 Hz for
+The browser's everyday slider ranges are 0.02–2.5 Hz for Rate, 0.01–0.3 Hz for
 LFO, and 0.2–5 seconds for Attack and Release. Stroke and Center retain their
 full percentage ranges. The underlying engine accepts the previous parameter
 range for compatibility. These control ranges improve adjustment resolution;
@@ -342,8 +377,8 @@ restarts motion. The fault banner retains the original fault and cleanup error.
 
 Play changes to Pause while running. Pause inhibits output and verifies the stop,
 then freezes the carrier, LFO and envelope phase. Resume takes fresh stationary
-encoder feedback, enables the drive, and approaches the paused pattern through
-the trajectory acceleration limiter. Stop output ends the paused session.
+encoder feedback, enables the drive, and captures the paused pattern through
+a continuous PVA trajectory with velocity, acceleration and jerk limits. Stop output ends the paused session.
 
 After a successful connection, the browser remembers the adapter USB identity.
 On page load or USB attachment it reconnects only if exactly one previously
@@ -370,7 +405,7 @@ to Pause while running and Resume while paused. Stop ends the session and
 inhibits output. Connecting and homing never automatically start a pattern.
 
 
-### Faster browser streaming profile
+### Current local browser hardware planner
 
 The browser uses the same dedicated `0x7b` absolute-position command as the
 upstream OSSM-alt motor library. Its eight-byte reply carries the current encoder
@@ -382,17 +417,22 @@ Homing retains the established bulk-register position commands.
 The stream uses the baud-dependent deadlines above, subject to serial timing, with no catch-up
 queue. Successful exchanges use a 3 ms quiet gap at 19200 baud; startup/error
 recovery retains the longer quiet boundary. Hardware waveforms use continuous
-velocity tracking within the browser acceleration and rail bounds. Simulation
-and the optional Python bridge retain their original point planner.
+PVA planning within the browser velocity, acceleration, jerk and rail bounds.
+An active-pattern recovery stops rather than automatically resuming motion.
+Simulation and the optional Python bridge retain their original point planner.
 The immediate encoder reply is checked against the preceding accepted target,
 matching the connected drive's observed response timing. A stuck or excessively
 lagging encoder still faults after three fresh samples.
 
-The local browser attempt selects the fixed `ramped` profile, with internal
-acceleration at 2000 RPM/s and a corresponding 1200 nominal mm/s² planner ceiling.
-Ten-second slow and moderate sine trials completed with confirmed Stop. This
-ramp adds following lag and limits faster patterns; improved perceived
-smoothness is still being assessed. See [motion results](MOTION_SMOOTHING.md).
+The current local browser selects `servo_ramped`, with internal acceleration
+at 20000 RPM/s (nominal 13333 mm/s²) and the retained 6000 mm/s² host ceiling.
+The earlier 2000 RPM/s / 1200 mm/s² and ramp-bypass trials are historical.
+The October 13 revision passed 267/267 browser checks, including 13 core checks;
+500 independent native/WASM trajectories agreed within 1.31e-13. These are
+software checks. The watched 1.5 Hz / 70% sine was accepted as smooth with useful
+speed, and browser Home/Play/Stop passed. Other patterns, loads and stock-firmware
+parity remain unverified. See the
+[current audit](MOTION_PLANNER_AUDIT.md) and [historical motion results](MOTION_SMOOTHING.md).
 
 Stop confirmation observes at least 600 ms and requires three fresh stationary,
 inhibited readings within 0.1 mm. Following a confirmed stop, speed/demand-only
