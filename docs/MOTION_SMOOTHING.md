@@ -1,6 +1,6 @@
 # Browser motion smoothing — historical trials and October 13 continuation
 
-The current **local, not deployed** defaults and guarded physical results are
+The current browser defaults and guarded physical results are
 recorded in the [serial throughput audit](SERIAL_THROUGHPUT_AUDIT.md). The
 [October 13 motion planner audit](MOTION_PLANNER_AUDIT.md) describes the C2
 planner and earlier 20000 RPM/s trials, superseding the position-only tracker

@@ -1,6 +1,6 @@
 # Serial throughput audit — October 13, 2026
 
-This revision is local and not deployed. AJ's observation that communication
+This audit records the tested October 13 revision. AJ's observation that communication
 can approach 500 Hz prompted a separate audit of the serial path. The
 continuous C2 planner is unchanged: host ceilings remain 1080 nominal mm/s,
 6000 mm/s² and 100000 mm/s³. The current `servo_ramped` drive profile is

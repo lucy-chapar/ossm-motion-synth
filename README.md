@@ -46,7 +46,7 @@ required. Keep the terminal open while using the app; **Ctrl-C** stops the serve
 Run the same command again after a reboot. If the port is occupied, stop the
 existing server or use `./synth-web --port 8770 --open`.
 
-The October 13 browser hardware planner is **local and not deployed**. It carries
+The October 13 browser hardware planner carries
 position, velocity and acceleration between commands, uses finite jerk-limited
 transitions and preserves nonzero derivatives through intermediate moving
 points. It retains the 1080 mm/s / 6000 mm/s² host ceilings and 100000 mm/s³ host
@@ -56,16 +56,16 @@ jerk limit. References reserve 95% of those host budgets. The current
 earlier 20000 RPM/s trials; the latest results are in the
 [serial throughput audit](docs/SERIAL_THROUGHPUT_AUDIT.md).
 
-The current local serial path sends the next fresh target after the previous
+The browser serial path sends the next fresh target after the previous
 transaction completes, with one exchange outstanding and no queue of missed
 positions. It no longer imposes the earlier 20/50 Hz target cadence. On the
 tested drive, separate persistent commissioning and a power cycle established
 115200 baud; normal Connect still reads status without changing drive settings.
 A stationary, inhibited 100-command link test reached **177.746 completed
 replies/s**, which measures communication rather than pattern frequency or
-physical smoothness. It does not establish 500 Hz delivery. Three six-second
-guarded physical trials using the production browser modules completed
-119–134.833 target replies/s with confirmed Stop after each. Those used an
+physical smoothness. It does not establish 500 Hz delivery. The final three
+six-second guarded trials using the exact production browser modules completed
+102–107.833 target replies/s with confirmed Stop after each, through an
 exclusive Node serial harness. The final Chrome Home → Play → Stop check
 also passed at 115200; its saw trial displayed 80–85 command updates/s and
 confirmed Stop. The browser shows measured command cadence in Motor connection.
@@ -140,7 +140,7 @@ against the Python engine for the shared preview behavior. All browser assets,
 including the prebuilt local Ruckig WASM core, are bundled and run without a CDN.
 Normal use and export need no frontend build. The pinned source, portable build
 recipe and numerical checks are documented in [vendor/ruckig](vendor/ruckig/README.md).
-The October 13 continuous-planner revision passed 267/267 browser checks, including 13 core checks;
+The current revision passes 290 browser tests and 132 Python tests, including 13 core checks;
 these software checks do not establish physical smoothness or firmware parity.
 
 The optional Python bridge binds to loopback and accepts only same-origin

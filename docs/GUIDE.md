@@ -6,16 +6,15 @@ Chrome or Edge, expand **Motor connection** and click **Connect**. The browser
 asks you to choose your USB–RS485 adapter, then connects to it.
 A previously permitted adapter can reconnect when exactly one saved USB identity
 matches; connection does not Home or Play automatically. The controls and rail
-measurement sequence are shared with the optional Python edition. The local
-browser hardware planner now differs from that edition as noted below.
+measurement sequence are shared with the optional Python edition. The browser hardware planner differs from that edition as noted below.
 
-The October 13 continuous-planner revision is **local and not deployed**. Use
+The October 13 revision uses continuous jerk-limited trajectories. Use
 `./synth-web --open` from the repository to rebuild and serve it at
 `http://127.0.0.1:8769/`. The
 [planner audit](MOTION_PLANNER_AUDIT.md) records the continuous-state design and
 earlier 19200-baud / 20000 RPM/s drive trials.
 
-The current local serial path is completion driven, with no fixed 20/50 Hz
+The browser serial path is completion driven, with no fixed 20/50 Hz
 target cap. The tested drive was separately commissioned to 115200 baud and
 power cycled; normal Connect does not change baud. Two series of three guarded physical
 trials with the 50000 RPM/s native ramp passed through a Node harness using
@@ -149,7 +148,7 @@ and restores the previous output/stall setting. The waveform planner uses
 this measured working span, keeping its existing physical velocity and
 acceleration and jerk limits when converting normalized positions to encoder counts.
 After parking, browser Home restores a 1800 RPM ceiling and the selected
-profile. The local browser default is `servo_ramped`: a 50000 RPM/s drive ramp
+profile. The browser default is `servo_ramped`: a 50000 RPM/s drive ramp
 (nominal 33333 mm/s²), with nominal host ceilings of 1080 mm/s, 6000 mm/s²
 and 100000 mm/s³.
 This retains drive headroom while shaping the gaps between discrete targets.
@@ -449,7 +448,7 @@ is checked against the preceding accepted target,
 matching the connected drive's observed response timing. A stuck or excessively
 lagging encoder still faults after three fresh samples.
 
-The current local browser selects `servo_ramped`, with internal acceleration
+The browser selects `servo_ramped`, with internal acceleration
 at 50000 RPM/s (nominal 33333 mm/s²) and the retained 6000 mm/s² host ceiling.
 The earlier 20000 RPM/s trials, 2000 RPM/s / 1200 mm/s² profile and ramp-bypass
 trials are historical.
